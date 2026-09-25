@@ -1,0 +1,119 @@
+# -----------------------------------------------------------------------------
+# analysis.yaml - representation, fingerprint, geometry and control settings.
+#
+# This file drives scripts/extract_representations.py,
+# scripts/run_geometry_analysis.py and scripts/make_figures.py. It must be
+# compatible with the checkpoint produced by a baseline.yaml run (the model block
+# below is used to rebuild the architecture when loading a checkpoint).
+#
+# The primary, pre-registered metric is the Spearman Mantel correlation between
+# the representation-space distance matrix and the functional-fingerprint
+# distance matrix (see README "Hypothesis").
+# -----------------------------------------------------------------------------
+
+seed: 0
+
+paths:
+  data_dir: data
+  checkpoint_dir: checkpoints
+  results_dir: results
+  figures_dir: figures
+
+run:
+  tag: baseline
+  device: auto
+  verbose: true
+  synthetic: false
+  synthetic_n_samples: 600
+  synthetic_n_classes: 5
+  synthetic_n_channels: 40
+
+data:
+  download: true
+  layout: auto
+  val_fraction: 0.1
+  prefer_speaker_aware: true
+  split_seed: 0          # FIXED across seeds so only init/optimisation varies.
+  debug: false
+  max_per_class: null
+
+# Model block: MUST match the checkpoint (used to instantiate the architecture).
+model:
+  n_input: 700
+  n_hidden: 256
+  n_output: 20
+  n_bins: 500
+  bin_ms: 2.0
+  tau_mem_ms: 20.0
+  tau_syn_ms: 5.0
+  threshold: 1.0
+  reset: subtract
+  readout_leak: 0.0
+  surrogate_beta: 5.0
+  surrogate_gamma: 0.3
+  input_weight_scale: 10.0
+  recurrent_weight_scale: 2.0
+  recurrent_density: 1.0
+  zero_self_connection: false
+  signed_input_weights: true
+  signed_recurrent_weights: true
+  neuron_param_mode: bias
+train:
+  n_classes: 20
+
+# ---------------------------------------------------------------------------
+# Neuron representation (the object under study). Feature blocks:
+#   intrinsic | input_conn | recurrent_in | recurrent_out | activity
+# ---------------------------------------------------------------------------
+representations:
+  weighting: equal           # "equal" (per-block) | "uniform" (per-feature)
+  normalize_rows: false
+  primary_blocks: [intrinsic, input_conn, recurrent_in, recurrent_out]
+  # where the label-free activity features are measured (never the test set)
+  activity_split: train
+
+# ---------------------------------------------------------------------------
+# Functional fingerprint (the independent evaluation target; USES LABELS).
+# ---------------------------------------------------------------------------
+fingerprint:
+  feature_sets: [class_rate, class_count, class_latency]
+  standardize: column        # "column" | "none"
+  normalize_rows: false
+  metric: euclidean          # "euclidean" | "correlation"
+  min_spikes_for_latency: 1.0
+  # held-out split the fingerprint is measured on (never the official test set)
+  eval_split: val
+
+# ---------------------------------------------------------------------------
+# Geometry-function analysis
+# ---------------------------------------------------------------------------
+geometry:
+  n_perm: 1000
+  k_values: [3, 5, 10, 20]
+  representation_metric: euclidean
+  fingerprint_metric: euclidean
+  n_curve_bins: 20
+  random_repeats: 5          # repeats of the random_null control
+
+controls:
+  include_before_after: true # compare untrained vs trained network
+
+# ---------------------------------------------------------------------------
+# Figures
+# ---------------------------------------------------------------------------
+figures:
+  dpi: 200
+  formats: [png, pdf]
+  n_pca_components: 2
+
+# ---------------------------------------------------------------------------
+# Multi-seed robustness study (scripts/run_multiseed.py)
+# ---------------------------------------------------------------------------
+multiseed:
+  # seeds to run the full pipeline (train -> extract -> geometry) over; seed 0
+  # reuses the existing "baseline" tag, further seeds use tag "<base>_s<seed>".
+  seeds: [0, 1, 2]
+  train_config: configs/baseline.yaml
+  analysis_config: configs/analysis.yaml
+  skip_existing: true     # resume: reuse any stage whose outputs already exist
+  forest_plot: true       # write a forest plot of the primary metric across seeds

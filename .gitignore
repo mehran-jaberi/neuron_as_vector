@@ -1,0 +1,29 @@
+# Environments
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Data (large, downloaded)
+data/
+*.h5
+*.h5.zip
+
+# Locally cached wheels (e.g. the ~2.6 GB CUDA torch wheel fetched to bypass
+# a flaky index). Not source; regenerate with the commands in the README.
+.wheels/
+
+# Artefacts
+checkpoints/
+results/
+figures/
+*.pt
+*.ckpt
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

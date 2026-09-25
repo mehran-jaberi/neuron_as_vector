@@ -1,0 +1,63 @@
+[project]
+name = "neuron-as-vector"
+version = "0.1.0"
+description = "Do structured representations of individual hidden neurons in a trained recurrent SNN capture functional organization? (SHD proof-of-concept)"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+license = { text = "MIT" }
+authors = [{ name = "Computational Neuroscience Project" }]
+
+dependencies = [
+    "torch>=2.4",
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "pandas>=2.1",
+    "matplotlib>=3.8",
+    "h5py>=3.10",
+    "scikit-learn>=1.4",
+    "pyyaml>=6.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+# NOTE: no [project.scripts] / build backend on purpose. The project is an
+# analysis code-base, not an installable library: everything is driven through
+# `uv run python scripts/<name>.py ...`.
+
+[tool.uv]
+package = false
+default-groups = ["dev"]
+
+# ---------------------------------------------------------------------------
+# CUDA-enabled PyTorch.
+#
+# PyTorch CUDA wheels live on a dedicated index. We declare it as an *explicit*
+# index and route only `torch` to it, so every other dependency still resolves
+# from PyPI. This guarantees a CUDA build on Linux/WSL (RTX 3060) instead of
+# silently pulling the CPU-only wheel that `pip install torch` can select.
+#
+# If your driver cannot run CUDA 12.6 wheels, switch the URL to
+#   https://download.pytorch.org/whl/cu121
+# and re-run `uv lock && uv sync`.
+# ---------------------------------------------------------------------------
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+addopts = "-q"
+testpaths = ["tests"]
+pythonpath = ["."]
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"

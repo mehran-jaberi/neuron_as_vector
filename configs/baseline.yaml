@@ -1,0 +1,100 @@
+# -----------------------------------------------------------------------------
+# baseline.yaml - training configuration for the recurrent LIF SNN on SHD.
+#
+# Every scientifically important choice is exposed here. The defaults reproduce
+# the "baseline experiment" described in the README: a 256-neuron recurrent LIF
+# network trained on the official SHD training split with a speaker-aware
+# validation split for model selection. The official test set is NEVER used for
+# any decision made in this file.
+#
+# Override any leaf from the command line, e.g.
+#     uv run python scripts/train.py --config configs/baseline.yaml \
+#         --override train.epochs=5 --override model.n_hidden=128
+# -----------------------------------------------------------------------------
+
+seed: 0
+
+paths:
+  data_dir: data
+  checkpoint_dir: checkpoints
+  results_dir: results
+  figures_dir: figures
+
+run:
+  tag: baseline          # used to name checkpoint / result files
+  device: auto           # "auto" | "cpu" | "cuda"
+  verbose: true
+  synthetic: false       # true -> use the built-in synthetic dataset (no download)
+  synthetic_n_samples: 600
+  synthetic_n_classes: 5
+  synthetic_n_channels: 40
+
+data:
+  download: true         # download SHD if missing
+  layout: auto           # "auto" | "flat" | "grouped"
+  val_fraction: 0.1
+  prefer_speaker_aware: true   # whole-speaker validation split when metadata exists
+  split_seed: null       # seed for the train/val split; null -> follow `seed`.
+                         # Fix it (e.g. 0) to hold the split constant across a
+                         # multi-seed robustness study (see scripts/run_multiseed.py).
+  debug: false           # tiny dataset mode for smoke tests
+  max_per_class: null    # e.g. 40 -> subsample training set for a quick run
+
+# ---------------------------------------------------------------------------
+# Model: discrete-time current-based LIF, recurrent hidden layer, linear leaky
+# readout. See src/model.py for the exact update equations.
+# ---------------------------------------------------------------------------
+model:
+  n_input: 700
+  n_hidden: 256          # 128 / 256 / 512 supported
+  n_output: 20
+
+  # temporal discretisation (2 ms bins -> 1000 ms window; use 1.0 ms / 1000 bins
+  # for the higher-resolution variant)
+  n_bins: 500
+  bin_ms: 2.0
+
+  # neuron dynamics
+  tau_mem_ms: 20.0
+  tau_syn_ms: 5.0
+  threshold: 1.0
+  reset: subtract        # "subtract" (soft reset) | "zero" (hard reset)
+  readout_leak: 0.0      # rho; 0 => pure mean-rate readout
+
+  # surrogate gradient (SuperSpike fast-sigmoid)
+  surrogate_beta: 5.0
+  surrogate_gamma: 0.3
+
+  # initialisation
+  input_weight_scale: 10.0
+  recurrent_weight_scale: 2.0
+  recurrent_density: 1.0
+  zero_self_connection: false
+  signed_input_weights: true
+  signed_recurrent_weights: true
+
+  # learnable per-neuron parameters: makes the intrinsic feature block informative
+  neuron_param_mode: bias   # "none" | "bias" | "bias_tau"
+
+# ---------------------------------------------------------------------------
+# Optimisation
+# ---------------------------------------------------------------------------
+train:
+  lr: 0.001
+  optimizer: adam        # "adam" | "adamw" | "sgd"
+  weight_decay: 0.0
+  epochs: 20
+  batch_size: 128
+  l2_in: 0.0
+  l2_rec: 0.0
+  l2_out: 0.0
+  l2_spikes: 0.0         # homeostatic firing-rate penalty
+  target_rate_hz: 5.0
+  grad_clip: 1.0
+  scheduler: cosine      # "none" | "cosine" | "step"
+  min_lr_factor: 0.01
+  warmup_epochs: 0
+  early_stopping_patience: 0   # 0 disables early stopping
+  select_by: val_accuracy      # "val_accuracy" | "val_loss"
+  eval_batch_size: 256
+  n_classes: 20
