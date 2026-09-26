@@ -69,6 +69,12 @@ class SNNConfig:
     threshold: float = 1.0
     reset: str = "subtract"  # "subtract" (soft) or "zero" (hard)
     readout_leak: float = 0.0  # rho; 0 => pure mean-rate readout
+    # How the time axis of the readout is aggregated into class logits:
+    #   "mean" -> (1/T) sum_t O_t   (time-averaged; the historical default)
+    #   "last" -> O_T              (final readout state only)
+    #   "sum"  -> sum_t O_t        (accumulated; equals T x "mean" for a linear
+    #                               readout, i.e. a reparameterisation of "mean")
+    readout_mode: str = "mean"
 
     # surrogate gradient
     surrogate_beta: float = 5.0
@@ -157,6 +163,10 @@ class RecurrentLIFSNN(nn.Module):
 
     def __init__(self, cfg: SNNConfig):
         super().__init__()
+        if cfg.readout_mode not in ("mean", "last", "sum"):
+            raise ValueError(
+                f"Unknown readout_mode {cfg.readout_mode!r}; use 'mean', 'last' or 'sum'"
+            )
         self.cfg = cfg
 
         self.w_in = nn.Parameter(torch.empty(cfg.n_input, cfg.n_hidden))
@@ -336,7 +346,12 @@ class RecurrentLIFSNN(nn.Module):
                 rec_o[:, t, :] = o
                 rec_i[:, t, :] = i_syn
 
-        logits = o_sum / float(max(T, 1))
+        if cfg.readout_mode == "mean":
+            logits = o_sum / float(max(T, 1))
+        elif cfg.readout_mode == "last":
+            logits = o
+        else:  # "sum" - accumulated readout state
+            logits = o_sum
 
         out: dict[str, Any] = {
             "logits": logits,

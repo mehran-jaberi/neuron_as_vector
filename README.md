@@ -637,6 +637,16 @@ one (0.492 vs 0.472), so the structural blocks are not yet shown to beat firing 
 (iii) the voltage tails remain large (heavy negative excursions) because the synaptic
 DC gain is ~3, which a future fix should address by rescaling weights or τ_syn.
 
+> **Baseline repair is still in progress — see [`LIF_BASELINE_REPORT.md`](LIF_BASELINE_REPORT.md).**
+> A controlled DEV-selected sweep found that the 160 Hz saturation was caused by a
+> **readout-scale defect**, not by a missing spike penalty: the historical
+> time-averaged readout `logits = (1/T)Σ O_t` makes the logit scale ≈T× too small,
+> so cross-entropy is cheapest to reduce by raising hidden firing rates. Using the
+> accumulated readout (`model.readout_mode: sum`, mathematically `T × mean`) gives
+> ~5 Hz healthy hidden activity **with no spike regulariser at all**. The neuron-space
+> numbers quoted above are **not** re-interpreted yet; they will be recomputed only
+> once a single defensible baseline is fixed on DEV.
+
 ---
 
 ## 8. Controls
