@@ -242,3 +242,51 @@ controlling for firing rate.
 Empty-selection variants (e.g. `dynamical_only` for a `bias`-mode model) are
 recorded with `skipped: true` and a reason, rather than silently dropped or
 crashing.
+
+---
+
+## 9. Companion — functional fingerprint and primary analysis
+
+The representation is only meaningful against an **independent** measurement of
+what a neuron does. That target is built in `src/functional_fingerprint.py` from
+class-conditioned, held-out responses and is **never** an input to the
+representation.
+
+### 9.1 Fingerprint families
+
+| Family | Feature set(s) | Notes |
+| ------ | -------------- | ----- |
+| A. class tuning | `class_rate` | 20-dim class response profile (the primary target) |
+| B. rate-normalized tuning | `class_rate_norm` | class profile ÷ per-neuron class-mean rate, so overall magnitude cannot dominate similarity |
+| C. temporal | `class_psth`, `class_temporal_center`, `class_temporal_dispersion`, `class_latency` | coarse PSTH + temporal centre/dispersion + first-spike timing |
+
+**Fixed from the earlier audit.** The default fingerprint feature set no longer
+includes `class_count`, which audit item C3 showed to be an exact duplicate of
+`class_rate` after column z-scoring. `min_spikes_for_latency` is now actually
+applied (audit item B3), and the fingerprint is measured on the held-out
+**analysis-probe** split rather than the model-selection split (audit item C2).
+
+### 9.2 Primary analysis and controls
+
+`src/function_analysis.py` (run by `scripts/run_function_analysis.py`) implements:
+
+* the primary Spearman **Mantel** test on condensed distance vectors, with a
+  neuron-relabelling permutation null (pairs are **not** treated as independent),
+  a bootstrapped CI, the full null distribution, and the explicit
+  `p_value_floor = 1/(n_perm+1)` with an `at_resolution_floor` flag;
+* controls: `rate_only`, `rate_normalized_fingerprint` (**primary rate control**),
+  `rate_matched` stratified Mantel (**proper rate-matched control**),
+  `random_representation`, `shuffled_neurons`, and kNN for `k = 3, 5, 10, 20`;
+* cross-validated **prediction** (`src/prediction.py`): ridge and k-NN regression
+  from representation to fingerprint, `KFold` across neurons, with standardisation
+  and `alpha` selection fit inside each training fold, reporting Pearson *r*,
+  *R²*, RMSE/nRMSE and MAE.
+
+> **Partial Mantel is secondary and exploratory.** It is explicitly labelled
+> `secondary_exploratory__not_a_proof_of_rate_independence`. Independence from
+> firing rate is argued from the rate-normalized fingerprint and the rate-matched
+> stratified Mantel, **not** from the partial Mantel.
+
+The single machine-readable summary is
+`results/<tag>_function_analysis.json` (with null distributions and distance
+vectors in the companion `.npz`).

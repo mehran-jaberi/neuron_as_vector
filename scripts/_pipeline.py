@@ -16,7 +16,7 @@ guaranteed to use the identical construction.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 
@@ -26,6 +26,7 @@ from src.functional_fingerprint import (
     FingerprintSpace,
     class_conditioned_fingerprint,
     class_conditioned_rate_matrix,
+    resolve_feature_sets,
 )
 from src.neurons import (
     FeatureBlock,
@@ -174,6 +175,8 @@ def build_fingerprint(
         n_bins=res.n_bins,
         bin_ms=res.bin_ms,
         feature_sets=fp_config.feature_sets,
+        n_psth_bins=fp_config.n_psth_bins,
+        min_spikes_for_latency=fp_config.min_spikes_for_latency,
     )
     rate_matrix = class_conditioned_rate_matrix(res.class_psth, res.class_n, bin_ms=res.bin_ms)
     space = FingerprintSpace(
@@ -196,3 +199,75 @@ def build_fingerprint(
         "class_psth": res.class_psth,
         "result": res,
     }
+
+
+def build_fingerprints(
+    model: Any,
+    eval_rec: Any,
+    eval_idx: np.ndarray,
+    *,
+    device: Any,
+    n_classes: int,
+    batch_size: int = 256,
+    presets: Mapping[str, Sequence[str]],
+    standardize: str = "column",
+    normalize_rows: bool = False,
+    metric: str = "euclidean",
+    n_psth_bins: int = 10,
+    min_spikes_for_latency: float = 1.0,
+) -> dict[str, Any]:
+    """Build several fingerprint variants from a *single* labelled activity pass.
+
+    ``presets`` maps a name (e.g. ``"tuning"``) to a feature-set list or preset
+    name (e.g. ``["class_rate"]``). All fingerprints are measured on the same
+    held-out split (the analysis-probe split) so they are directly comparable.
+
+    Returns ``{"fingerprints": {name: FingerprintSpace}, "result": ..., "rate_matrix": ...}``.
+    """
+    res = collect_activity(
+        model, eval_rec, eval_idx, device=device, batch_size=batch_size,
+        n_classes=n_classes, with_labels=True, collect_voltage=False,
+    )
+    rate_matrix = class_conditioned_rate_matrix(res.class_psth, res.class_n, bin_ms=res.bin_ms)
+    split_name = getattr(eval_rec, "name", "eval")
+    fingerprints: dict[str, FingerprintSpace] = {}
+    for name, feature_sets in presets.items():
+        selected = resolve_feature_sets(feature_sets)
+        X, names = class_conditioned_fingerprint(
+            res.class_psth,
+            res.class_counts,
+            res.class_n,
+            res.class_first_spike_sum,
+            res.class_first_spike_count,
+            n_bins=res.n_bins,
+            bin_ms=res.bin_ms,
+            feature_sets=selected,
+            n_psth_bins=n_psth_bins,
+            min_spikes_for_latency=min_spikes_for_latency,
+        )
+        cfg = FingerprintConfig(
+            feature_sets=list(selected),
+            standardize=standardize,
+            normalize_rows=normalize_rows,
+            metric=metric,
+            n_psth_bins=int(n_psth_bins),
+            min_spikes_for_latency=float(min_spikes_for_latency),
+            eval_split=split_name,
+        )
+        fingerprints[name] = FingerprintSpace(
+            X_raw=X,
+            feature_names=names,
+            config=cfg,
+            meta={
+                "name": name,
+                "preset": name,
+                "eval_split": split_name,
+                "n_samples": int(res.n_samples),
+                "n_neurons": int(X.shape[0]),
+                "uses_labels": True,
+                "n_classes": int(n_classes),
+                "min_spikes_for_latency": float(min_spikes_for_latency),
+                "n_psth_bins": int(n_psth_bins),
+            },
+        )
+    return {"fingerprints": fingerprints, "result": res, "rate_matrix": rate_matrix}

@@ -212,31 +212,83 @@ See `AUDIT_REPRESENTATION.md` §7 for the exact feature list.
 
 ---
 
-## 5. Functional fingerprint (uses labels — the evaluation target)
+## 5. Functional fingerprint (uses labels — the independent measurement)
 
-For each hidden neuron we build a **class-conditioned response fingerprint** from
-the neuron's activity on a **held-out** split (`val` by default). It measures what
-the neuron *does*, as a function of the stimulus class:
+The fingerprint is an **independent measurement of what a neuron does**. It is
+built from *class-conditioned, held-out* responses and is **never** an input to the
+representation. It is measured on the **held-out analysis-probe split** (`probe` by
+default): disjoint from training and, unlike `dev`/`val`, **not used for model
+selection**. The official **test** set is never used for the analysis.
 
-| Feature set    | Content |
-| -------------- | ------- |
-| `class_rate`   | mean firing rate per class (20 values) |
-| `class_count`  | per-class spike-count statistics |
-| `class_latency`| per-class first-spike latency (when a minimum spike count is met) |
+Three fingerprint families are provided (`src/functional_fingerprint.py`):
 
-Features are column-standardised, and a `FingerprintSpace`
-(`src/functional_fingerprint.py`) exposes pairwise distances under a configurable
-metric. A **split-half reliability (noise ceiling)** estimate is computed from
-`src.controls.reliability_suite` so a reader can see the *maximum* geometry–function
-correlation that fingerprint noise would ever permit.
+| Family | Feature set(s) | Content |
+| ------ | -------------- | ------- |
+| **A. Class-tuning** | `class_rate` | 20-dimensional class response profile (mean firing rate per SHD class) |
+| **B. Rate-normalized tuning** | `class_rate_norm` | the class profile divided by the neuron's own mean rate over classes, so overall firing-rate **magnitude** cannot dominate similarity |
+| **C. Temporal** | `class_psth`, `class_temporal_center`, `class_temporal_dispersion`, `class_latency` | coarse class-conditioned PSTH, temporal centre, temporal dispersion, first-spike timing |
+
+A `FingerprintSpace` exposes pairwise distances under a configurable metric;
+features are column-standardised. Presets are defined in
+`FINGERPRINT_PRESETS` (`tuning`, `tuning_rate_normalized`, `temporal`,
+`tuning_plus_temporal`) and selected in `configs/analysis.yaml → function_analysis`.
+A **split-half reliability (noise ceiling)** estimate bounds the maximum
+geometry–function correlation that fingerprint noise would ever permit.
+
+> **Separation (enforced in code).** `representation` blocks are label-free
+> (`uses_labels: false`); every fingerprint object carries `uses_labels: true` and a
+> leakage warning. The fingerprint is only ever the *right-hand side* of the
+> analysis, never a feature block.
 
 ---
 
-## 6. Hypothesis
+## 6. Hypothesis and analysis design
 
-**Primary (pre-registered).** The Spearman **Mantel correlation** between the
-representation-space distance matrix and the functional-fingerprint distance matrix
-is **positive and significant** under a permutation test.
+**Primary (pre-registered).** For every pair of hidden neurons compute
+$D_{\text{rep}}(i,j)$ (representation distance) and $D_{\text{fn}}(i,j)$
+(fingerprint distance). The primary statistic is the **Spearman correlation between
+the corresponding upper-triangle (condensed) distance vectors**, tested with a
+Mantel permutation test.
+
+**Permutation scheme.** The null relabels **neurons** (not pairs): a permutation
+$p$ maps the functional distance matrix to $D[p][:, p]$. This is what makes
+"neurons close in representation space have similar fingerprints" falsifiable while
+**never treating neuron pairs as independent samples**.
+
+**What is reported.** Effect size (Spearman $r$), an approximate neuron-bootstrap
+confidence interval, the permutation $p$-value, the number of permutations, and the
+null distribution (summary quantiles in JSON, full vector in NPZ). The $p$-value
+resolution floor $1/(n_{perm}+1)$ is always reported and effects that saturate it
+are flagged as `at_resolution_floor` and should be quoted as
+$p < 1/(n_{perm}+1)$, never as the exact floor value.
+
+**Controls** (`src/function_analysis.py`), all through the identical pipeline:
+
+| Control | Purpose |
+| ------- | ------- |
+| `rate_only` | single scalar firing rate as the "representation" |
+| `rate_normalized_fingerprint` | **primary rate control** — representation vs. the rate-normalized tuning fingerprint (family B) |
+| `rate_matched` | **proper rate-matched control** — stratified Mantel comparing only pairs within narrow $\lvert\Delta\text{rate}\rvert$ strata |
+| `random_representation` | i.i.d. Gaussian features, matched dimensionality (chance) |
+| `shuffled_neurons` | real representation with neuron rows permuted (should destroy the effect) |
+| kNN (`k` = 3, 5, 10, 20) | are representation-space neighbours functionally similar? |
+| partial Mantel | **secondary / exploratory only** — see the warning below |
+
+> **Do not over-read a partial Mantel.** A partial Mantel controlling for firing
+> rate is retained only as a *secondary, exploratory* statistic. It is **not** proof
+> that the effect is independent of firing rate. The **primary** rate control is the
+> rate-normalized fingerprint (family B) and/or the rate-matched stratified Mantel.
+> The partial-Mantel output is explicitly labelled
+> `secondary_exploratory__not_a_proof_of_rate_independence`.
+
+**Cross-validated prediction.** Beyond distance correlation, we ask whether the
+representation can *predict* a held-out neuron's fingerprint. Ridge regression
+(`RidgeCV`, `alpha` chosen by inner CV) and a k-NN regressor are evaluated with
+`KFold` **across neurons**; standardisation and hyper-parameter selection are fit
+inside each training fold. Reported per target and aggregated: Pearson correlation,
+$R^2$, RMSE / normalised RMSE, MAE, and the Spearman correlation between true and
+predicted fingerprint distance matrices. The representation is never tuned against
+these results.
 
 **What the controls must rule out.** A positive result only means something if it
 survives controls that could produce a spurious correlation (see §8).
@@ -493,7 +545,8 @@ neuron_as_vector/
 │   ├── train.py             # stage 4  — train a model
 │   ├── evaluate.py          # stage 4b — accuracy / confusion
 │   ├── extract_representations.py  # stage 5
-│   ├── run_geometry_analysis.py    # stages 6–7
+│   ├── run_function_analysis.py    # primary analysis (representation vs fingerprint)
+│   ├── run_geometry_analysis.py    # stages 6–7 (ablation / controls / figures)
 │   └── make_figures.py             # stage 8
 ├── src/                     # the analysis code-base (namespace package)
 │   ├── data.py              # SHD loading, binning, splits, synthetic data
@@ -501,8 +554,10 @@ neuron_as_vector/
 │   ├── neurons.py           # per-neuron feature blocks
 │   ├── representations.py   # RepresentationSpace (the object under study)
 │   ├── permutation.py       # hidden-neuron permutation-invariance test
-│   ├── functional_fingerprint.py
-│   ├── geometry_analysis.py # Mantel / kNN analysis
+│   ├── functional_fingerprint.py  # independent class-conditioned target (A/B/C)
+│   ├── function_analysis.py # primary analysis + controls + prediction
+│   ├── prediction.py        # cross-validated ridge / kNN prediction of the target
+│   ├── geometry_analysis.py # Mantel / kNN / rate-matched analysis
 │   ├── controls.py          # null controls, ablations, reliability
 │   ├── training.py          # surrogate BPTT loop
 │   ├── evaluation.py        # metrics / activity collection
@@ -605,7 +660,24 @@ uv run python scripts/extract_representations.py --config configs/analysis.yaml
 Writes the neuron representation space, the functional fingerprint, and a
 fingerprint reliability (noise-ceiling) estimate under `results/`.
 
-**Stages 6–7 — geometry–function analysis and controls:**
+**Primary analysis — representation vs. independent fingerprint:**
+
+```powershell
+uv run python scripts/run_function_analysis.py --config configs/analysis.yaml
+```
+
+Builds the label-free representation and the three fingerprint families (A
+class-tuning, B rate-normalized tuning, C temporal) on the held-out **probe** split,
+then runs the primary Mantel test, all controls (rate-only, rate-normalized
+fingerprint, rate-matched stratified Mantel, random representation, shuffled
+neurons, kNN for k = 3/5/10/20, secondary partial Mantel) and the cross-validated
+prediction. Outputs one machine-readable summary and its null distributions:
+
+- `results/<tag>_function_analysis.json` — every primary and control result;
+- `results/<tag>_function_analysis.npz` — permutation null distributions and the
+  condensed representation/functional distance vectors.
+
+**Stages 6–7 — ablation / geometry sweeps and figure data:**
 
 ```powershell
 uv run python scripts/run_geometry_analysis.py --config configs/analysis.yaml

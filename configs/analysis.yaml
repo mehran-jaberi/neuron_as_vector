@@ -87,15 +87,49 @@ representations:
 
 # ---------------------------------------------------------------------------
 # Functional fingerprint (the independent evaluation target; USES LABELS).
+# NOTE: the fingerprint is NEVER an input to the representation.
 # ---------------------------------------------------------------------------
 fingerprint:
-  feature_sets: [class_rate, class_count, class_latency]
+  # feature sets (or preset names from src.functional_fingerprint):
+  #   class_rate | class_rate_norm | class_count | class_latency
+  #   class_psth | class_temporal_center | class_temporal_dispersion
+  feature_sets: [class_rate, class_latency]
   standardize: column        # "column" | "none"
   normalize_rows: false
   metric: euclidean          # "euclidean" | "correlation"
   min_spikes_for_latency: 1.0
-  # held-out split the fingerprint is measured on (never the official test set)
-  eval_split: val
+  n_psth_bins: 10            # coarse PSTH resolution (class_psth)
+  # held-out split the fingerprint is measured on. 'probe' is the analysis-probe
+  # split (never the official test set, and NOT the model-selection split 'dev').
+  eval_split: probe
+
+# ---------------------------------------------------------------------------
+# Primary geometry/function analysis (scripts/run_function_analysis.py)
+# This is the pre-registered analysis: label-free representation vs. independent
+# class-tuning fingerprint, with controls and cross-validated prediction.
+# ---------------------------------------------------------------------------
+function_analysis:
+  # name -> feature sets (preset names or explicit lists) for each fingerprint
+  presets:
+    tuning: [class_rate]                                   # A. class tuning
+    tuning_rate_normalized: [class_rate_norm]              # B. rate-normalized
+    temporal: [class_psth, class_temporal_center, class_temporal_dispersion, class_latency]  # C. temporal
+    tuning_plus_temporal: [class_rate, class_psth, class_temporal_center, class_temporal_dispersion, class_latency]
+  primary_fingerprint: tuning
+  rate_normalized_fingerprint: tuning_rate_normalized     # PRIMARY rate control
+  secondary_fingerprints: [temporal, tuning_plus_temporal]
+  n_perm: 10000             # large enough to expose (but still bounded by) the p-value floor
+  bootstrap: 2000           # neuron-bootstrap CI for the primary statistic
+  k_values: [3, 5, 10, 20]
+  rate_matched_strata: 5    # rate-matched (stratified) control
+  random_repeats: 5
+  n_psth_bins: 10
+  prediction:
+    enabled: true
+    n_splits: 5
+    knn_k: 5
+    alphas: [0.001, 0.01, 0.1, 1.0, 10.0, 100.0, 1000.0]
+    random_control_seed: 12345
 
 # ---------------------------------------------------------------------------
 # Geometry-function analysis
