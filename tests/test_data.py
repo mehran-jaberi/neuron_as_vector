@@ -4,7 +4,13 @@ from __future__ import annotations
 
 import numpy as np
 
-from src.data import iterate_batches, make_synthetic_shd, make_validation_split, subset_by_class
+from src.data import (
+    iterate_batches,
+    make_synthetic_shd,
+    make_train_dev_probe_split,
+    make_validation_split,
+    subset_by_class,
+)
 
 
 def test_synthetic_dataset_shape_and_metadata(synthetic_rec):
@@ -100,3 +106,39 @@ def test_parse_shd_canonical_ragged_layout(tmp_path):
         seg = parsed["times_ms"][lo:hi]
         assert np.all(np.diff(seg) >= 0)
     assert parsed["times_ms"].max() <= 1000.0
+
+
+def test_train_dev_probe_split_is_disjoint_and_complete(synthetic_rec):
+    train, dev, probe, info = make_train_dev_probe_split(
+        synthetic_rec, dev_fraction=0.2, probe_fraction=0.2, seed=0
+    )
+    assert len(train) + len(dev) + len(probe) == len(synthetic_rec)
+    assert len(dev) > 0 and len(probe) > 0 and len(train) > 0
+    # Speaker sets for the three splits must be disjoint (speaker-aware).
+    tr_spk = set(int(s) for s in np.unique(train.speakers))
+    dv_spk = set(int(s) for s in np.unique(dev.speakers))
+    pb_spk = set(int(s) for s in np.unique(probe.speakers))
+    assert tr_spk.isdisjoint(dv_spk)
+    assert tr_spk.isdisjoint(pb_spk)
+    assert dv_spk.isdisjoint(pb_spk)
+
+
+def test_train_dev_probe_split_documents_speakers_and_coverage(synthetic_rec):
+    _, _, _, info = make_train_dev_probe_split(
+        synthetic_rec, dev_fraction=0.2, probe_fraction=0.2, seed=0
+    )
+    assert info["strategy"] == "speaker_aware_train_dev_probe"
+    for split in ("train", "dev", "probe"):
+        block = info["splits"][split]
+        assert "speakers" in block
+        assert "n_samples" in block
+        assert "class_coverage" in block
+        assert block["class_coverage"]["complete"] is True
+
+
+def test_train_dev_probe_split_is_deterministic(synthetic_rec):
+    a = make_train_dev_probe_split(synthetic_rec, dev_fraction=0.2, probe_fraction=0.2, seed=3)
+    b = make_train_dev_probe_split(synthetic_rec, dev_fraction=0.2, probe_fraction=0.2, seed=3)
+    assert np.array_equal(a[0].labels_array, b[0].labels_array)
+    assert np.array_equal(a[1].labels_array, b[1].labels_array)
+    assert np.array_equal(a[2].labels_array, b[2].labels_array)

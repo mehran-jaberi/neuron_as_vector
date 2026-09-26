@@ -21,7 +21,7 @@ paths:
   figures_dir: figures
 
 run:
-  tag: baseline          # used to name checkpoint / result files
+  tag: baseline_v2       # corrected baseline (full window + train/dev/probe split)
   device: auto           # "auto" | "cpu" | "cuda"
   verbose: true
   synthetic: false       # true -> use the built-in synthetic dataset (no download)
@@ -32,11 +32,12 @@ run:
 data:
   download: true         # download SHD if missing
   layout: auto           # "auto" | "flat" | "grouped"
-  val_fraction: 0.1
-  prefer_speaker_aware: true   # whole-speaker validation split when metadata exists
-  split_seed: null       # seed for the train/val split; null -> follow `seed`.
-                         # Fix it (e.g. 0) to hold the split constant across a
-                         # multi-seed robustness study (see scripts/run_multiseed.py).
+  # Fractions of the OFFICIAL training file carved out (as whole speakers) for the
+  # development split (model selection) and the probe split (locked final check).
+  dev_fraction: 0.1
+  probe_fraction: 0.1
+  prefer_speaker_aware: true   # whole-speaker dev/probe splits when metadata exists
+  split_seed: 0          # fixed so the split is stable across model seeds.
   debug: false           # tiny dataset mode for smoke tests
   max_per_class: null    # e.g. 40 -> subsample training set for a quick run
 
@@ -49,9 +50,10 @@ model:
   n_hidden: 256          # 128 / 256 / 512 supported
   n_output: 20
 
-  # temporal discretisation (2 ms bins -> 1000 ms window; use 1.0 ms / 1000 bins
-  # for the higher-resolution variant)
-  n_bins: 500
+  # temporal discretisation. SHD utterances reach ~1.369 s (see
+  # src.data.SHD_MAX_TIME_MS_TRAIN), so we use 700 bins x 2 ms = 1400 ms to cover
+  # the full recording window without truncating late events.
+  n_bins: 700
   bin_ms: 2.0
 
   # neuron dynamics
@@ -95,6 +97,6 @@ train:
   min_lr_factor: 0.01
   warmup_epochs: 0
   early_stopping_patience: 0   # 0 disables early stopping
-  select_by: val_accuracy      # "val_accuracy" | "val_loss"
+  select_by: dev_accuracy      # "dev_accuracy" | "dev_loss"
   eval_batch_size: 256
   n_classes: 20

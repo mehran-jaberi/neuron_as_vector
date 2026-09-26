@@ -21,6 +21,7 @@ from src.data import (  # noqa: E402
     SHDRecordings,
     load_shd,
     make_synthetic_shd,
+    make_train_dev_probe_split,
     make_validation_split,
     subset_by_class,
 )
@@ -121,23 +122,36 @@ def figure_dir(cfg: Config) -> Path:
 # Dataset
 # --------------------------------------------------------------------------
 def build_recordings(cfg: Config) -> dict[str, Any]:
-    """Return ``{"train", "val", "test", "split_info", "name"}``.
+    """Return ``{"train", "dev", "probe", "val", "test", "split_info", "name"}``.
 
-    * Synthetic mode results in a train/val/test split derived from one synthetic
-      dataset (a random 20 % becomes the "test" set purely to exercise the test
-      code path; it has no scientific meaning).
-    * Real mode uses the official SHD train/test files, splitting the official
-      training data into train/validation with a speaker-aware split.
+    Four-way split semantics (see ``src.data.make_train_dev_probe_split``):
+
+    * ``train`` - fitting (gradient updates).
+    * ``dev``   - speaker-aware development split for model selection, carved from
+      the official SHD training file.
+    * ``probe`` - speaker-aware split carved from the official training file, locked
+      after the fact and reported only as a final internal sanity check.
+    * ``test``  - the official SHD test file, fully locked (never used for training
+      or model selection).
+
+    ``"val"`` is kept as a backward-compatible alias for ``"dev"`` so the existing
+    representation/analysis scripts keep working.
+
+    * Synthetic mode carves train/dev/probe/test out of one synthetic dataset (no
+      scientific meaning; it only exercises the code paths).
+    * Real mode uses the official SHD train/test files and splits the official
+      training data into train/dev/probe with a speaker-aware split.
     """
     seed = int(cfg.get_path("seed", 0))
     # The data split may be decoupled from the model/optimisation seed so that a
     # multi-seed robustness study varies only initialisation / optimisation while
-    # holding the train/validation split (and hence the fingerprint target) fixed.
+    # holding the train/dev/probe split (and hence the fingerprint target) fixed.
     # ``data.split_seed: null`` (the default) means "follow ``seed``".
     split_seed_raw = cfg.get_path("data.split_seed", None)
     split_seed = seed if split_seed_raw is None else int(split_seed_raw)
     data_dir = PROJECT_ROOT / str(cfg.get_path("paths.data_dir", "data"))
-    val_fraction = float(cfg.get_path("data.val_fraction", 0.1))
+    dev_fraction = float(cfg.get_path("data.dev_fraction", 0.1))
+    probe_fraction = float(cfg.get_path("data.probe_fraction", 0.1))
     prefer_speaker = bool(cfg.get_path("data.prefer_speaker_aware", True))
     debug = bool(cfg.get_path("run.debug", False))
     synthetic = bool(cfg.get_path("run.synthetic", False))
@@ -159,8 +173,9 @@ def build_recordings(cfg: Config) -> dict[str, Any]:
             bin_ms=float(cfg.get_path("model.bin_ms", 2.0)),
             seed=seed,
         )
-        train_full, val, split_info = make_validation_split(
-            rec, val_fraction=val_fraction, seed=split_seed, prefer_speaker_aware=prefer_speaker
+        train_full, dev, probe, split_info = make_train_dev_probe_split(
+            rec, dev_fraction=dev_fraction, probe_fraction=probe_fraction,
+            seed=split_seed, prefer_speaker_aware=prefer_speaker,
         )
         # Carve a synthetic "test" set out of the training remainder (no meaning).
         n = len(train_full)
@@ -176,23 +191,35 @@ def build_recordings(cfg: Config) -> dict[str, Any]:
         train = train_full.subset(train_idx, name="synthetic_train")
         split_info = dict(split_info)
         split_info["synthetic_test_n"] = len(test)
-        return {"train": train, "val": val, "test": test, "split_info": split_info, "name": "synthetic"}
+        return {
+            "train": train,
+            "dev": dev,
+            "probe": probe,
+            "val": dev,
+            "test": test,
+            "split_info": split_info,
+            "name": "synthetic",
+        }
 
     data = load_shd(data_dir, download=bool(cfg.get_path("data.download", True)),
                     layout=str(cfg.get_path("data.layout", "auto")))
-    train_full, val, split_info = make_validation_split(
-        data["train"], val_fraction=val_fraction, seed=split_seed, prefer_speaker_aware=prefer_speaker
+    train, dev, probe, split_info = make_train_dev_probe_split(
+        data["train"], dev_fraction=dev_fraction, probe_fraction=probe_fraction,
+        seed=split_seed, prefer_speaker_aware=prefer_speaker,
     )
-    train = train_full
     if debug:
         train = subset_by_class(train, max_per_class=40, seed=split_seed)
-        val = subset_by_class(val, max_per_class=20, seed=split_seed)
+        dev = subset_by_class(dev, max_per_class=20, seed=split_seed)
+        if len(probe) > 0:
+            probe = subset_by_class(probe, max_per_class=20, seed=split_seed)
     max_per_class = cfg.get_path("data.max_per_class", None)
     if max_per_class:
         train = subset_by_class(train, max_per_class=int(max_per_class), seed=split_seed)
     return {
         "train": train,
-        "val": val,
+        "dev": dev,
+        "probe": probe,
+        "val": dev,  # backward-compatible alias for the analysis scripts
         "test": data["test"],
         "split_info": split_info,
         "name": "shd",

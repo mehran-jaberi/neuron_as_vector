@@ -45,7 +45,7 @@ class TrainConfig:
     min_lr_factor: float = 0.01
     warmup_epochs: int = 0
     early_stopping_patience: int = 0  # 0 disables early stopping
-    select_by: str = "val_accuracy"  # "val_accuracy" | "val_loss"
+    select_by: str = "dev_accuracy"  # "dev_accuracy" | "dev_loss"
     eval_batch_size: int = 256
     n_classes: int = 20
 
@@ -75,7 +75,7 @@ class TrainResult:
     select_by: str
     wall_time_s: float
     n_train: int
-    n_val: int
+    n_dev: int
     config: dict[str, Any] = field(default_factory=dict)
 
     def history_records(self) -> list[dict[str, Any]]:
@@ -139,8 +139,8 @@ def train_model(
     model: RecurrentLIFSNN,
     train_rec: SHDRecordings,
     train_idx: np.ndarray,
-    val_rec: SHDRecordings,
-    val_idx: np.ndarray,
+    dev_rec: SHDRecordings,
+    dev_idx: np.ndarray,
     tcfg: TrainConfig,
     *,
     device: Any = None,
@@ -148,12 +148,16 @@ def train_model(
     verbose: bool = True,
     on_epoch: Callable[[dict[str, Any]], None] | None = None,
 ) -> TrainResult:
-    """Train ``model`` in place and return history + the best-validation weights.
+    """Train ``model`` in place and return history + the best-dev weights.
+
+    ``dev_rec``/``dev_idx`` are the speaker-aware development split used for model
+    selection (checkpoint / early stopping). The ``probe`` split and the official
+    test set are *not* used here; they are reported separately by ``train.py``.
 
     Parameters
     ----------
     select_by:
-        ``"val_accuracy"`` (maximise) or ``"val_loss"`` (minimise). The official
+        ``"dev_accuracy"`` (maximise) or ``"dev_loss"`` (minimise). The official
         test set is not used for this selection; ``scripts/evaluate.py`` reports
         test metrics only for the already-frozen checkpoint.
     """
@@ -167,7 +171,7 @@ def train_model(
     rng = np.random.default_rng(seed)
 
     history: list[dict[str, Any]] = []
-    best_score = -np.inf if tcfg.select_by == "val_accuracy" else np.inf
+    best_score = -np.inf if tcfg.select_by == "dev_accuracy" else np.inf
     best_epoch = -1
     best_state: dict[str, Any] = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
     epochs_without_improvement = 0
@@ -175,11 +179,13 @@ def train_model(
 
     for epoch in range(tcfg.epochs):
         model.train()
+        t_epoch_start = time.time()
         epoch_seed = int(rng.integers(0, 2**31 - 1))
         losses: list[float] = []
         n_correct = 0
         n_seen = 0
         spike_rate = np.zeros(sim.n_hidden, dtype=np.float64)
+        grad_norms: list[float] = []
         n_batches = 0
         for batch in iterate_batches(
             train_rec,
@@ -198,7 +204,17 @@ def train_model(
             loss = compute_loss(model, out, y, tcfg)
             loss.backward()
             if tcfg.grad_clip and tcfg.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), tcfg.grad_clip)
+                # clip_grad_norm_ returns the total (pre-clip) gradient norm.
+                total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), tcfg.grad_clip)
+                grad_norms.append(float(total_norm))
+            else:
+                with torch.no_grad():
+                    total_norm = torch.sqrt(
+                        torch.stack(
+                            [p.grad.detach().norm(2) for p in model.parameters() if p.grad is not None]
+                        ).sum()
+                    )
+                grad_norms.append(float(total_norm))
             optimizer.step()
 
             losses.append(float(loss.item()))
@@ -214,9 +230,11 @@ def train_model(
         train_loss = float(np.mean(losses)) if losses else float("nan")
         train_acc = float(n_correct / n_seen) if n_seen else float("nan")
         rates_hz = spike_rate / max(n_batches, 1) / max(sim.duration_ms / 1000.0, 1e-9)
+        grad_norm_mean = float(np.mean(grad_norms)) if grad_norms else float("nan")
+        grad_norm_max = float(np.max(grad_norms)) if grad_norms else float("nan")
 
-        val_metrics = evaluate_model(
-            model, val_rec, val_idx, device=device, batch_size=tcfg.eval_batch_size,
+        dev_metrics = evaluate_model(
+            model, dev_rec, dev_idx, device=device, batch_size=tcfg.eval_batch_size,
             n_classes=tcfg.n_classes, compute_confusion=False,
         )
         record = {
@@ -224,16 +242,18 @@ def train_model(
             "lr": float(optimizer.param_groups[0]["lr"]),
             "train_loss": train_loss,
             "train_accuracy": train_acc,
-            "val_loss": val_metrics["loss"],
-            "val_accuracy": val_metrics["accuracy"],
+            "dev_loss": dev_metrics["loss"],
+            "dev_accuracy": dev_metrics["accuracy"],
             "train_hidden_rate_hz": float(rates_hz.mean()),
-            "val_hidden_rate_hz": val_metrics["hidden_mean_rate_hz"],
-            "val_hidden_silent_fraction": val_metrics["hidden_silent_fraction"],
-            "epoch_time_s": None,
+            "dev_hidden_rate_hz": dev_metrics["hidden_mean_rate_hz"],
+            "dev_hidden_silent_fraction": dev_metrics["hidden_silent_fraction"],
+            "grad_norm_mean": grad_norm_mean,
+            "grad_norm_max": grad_norm_max,
+            "epoch_time_s": float(time.time() - t_epoch_start),
         }
         history.append(record)
 
-        score = record["val_accuracy"] if tcfg.select_by == "val_accuracy" else -record["val_loss"]
+        score = record["dev_accuracy"] if tcfg.select_by == "dev_accuracy" else -record["dev_loss"]
         improved = score > best_score
         if improved:
             best_score = score
@@ -246,9 +266,10 @@ def train_model(
         if verbose:
             print(
                 f"[train] epoch {epoch:3d} | train loss {train_loss:.4f} acc {train_acc:.4f} "
-                f"| val loss {record['val_loss']:.4f} acc {record['val_accuracy']:.4f} "
+                f"| dev loss {record['dev_loss']:.4f} acc {record['dev_accuracy']:.4f} "
                 f"| rate {record['train_hidden_rate_hz']:.2f} Hz "
-                f"| silent {record['val_hidden_silent_fraction']:.2f}"
+                f"| silent {record['dev_hidden_silent_fraction']:.2f} "
+                f"| grad {grad_norm_mean:.3f}"
                 + ("  *" if improved else "")
             )
         if on_epoch is not None:
@@ -259,7 +280,7 @@ def train_model(
                 print(f"[train] early stopping after {epochs_without_improvement} epochs without improvement")
             break
 
-    # Restore the best-validation weights so downstream analysis sees the selected model.
+    # Restore the best-dev weights so downstream analysis sees the selected model.
     model.load_state_dict(best_state)
     return TrainResult(
         history=history,
@@ -269,7 +290,7 @@ def train_model(
         select_by=tcfg.select_by,
         wall_time_s=float(time.time() - t_start),
         n_train=int(np.asarray(train_idx).size),
-        n_val=int(np.asarray(val_idx).size),
+        n_dev=int(np.asarray(dev_idx).size),
         config=tcfg.to_dict(),
     )
 

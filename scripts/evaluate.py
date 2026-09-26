@@ -53,11 +53,18 @@ def main(argv: list[str] | None = None) -> int:
     n_classes = int(cfg.get_path("train.n_classes", model.cfg.n_output))
 
     recs = build_recordings(cfg)
-    splits = {"train": recs["train"], "val": recs["val"], "test": recs["test"]}
+    splits = {
+        "train": recs["train"],
+        "dev": recs["dev"],
+        "probe": recs["probe"],
+        "test": recs["test"],
+    }
 
     summary: dict = {"tag": tag, "dataset": recs["name"], "n_classes": n_classes, "splits": {}}
     classes = list(range(n_classes))
     for name, rec in splits.items():
+        if len(rec) == 0:
+            continue
         idx = np.arange(len(rec))
         metrics = evaluate_model(
             model, rec, idx, device=device, batch_size=int(cfg.get_path("train.eval_batch_size", 256)),

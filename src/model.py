@@ -272,8 +272,11 @@ class RecurrentLIFSNN(nn.Module):
             raise ValueError(f"Expected input of shape (B, T, n_input), got {tuple(x.shape)}")
         B, T, _ = x.shape
         if T != cfg.n_bins:
-            # Allow shorter/longer sequences; the readout averages over T.
-            pass
+            raise ValueError(
+                f"Input has T={T} time steps but the model is configured for "
+                f"n_bins={cfg.n_bins}. The binning window and the model must agree; "
+                f"refusing to silently run with a mismatched window."
+            )
         device, dtype = x.device, x.dtype
 
         if state is None:
@@ -311,10 +314,15 @@ class RecurrentLIFSNN(nn.Module):
             v = lif_voltage_update(v, i_syn, alpha)
 
             s = surrogate_spike(v - thr, cfg.surrogate_beta, cfg.surrogate_gamma)
+            # Reset uses the *spike indicator* detached from the autograd graph, so
+            # the surrogate gradient does not leak a second gradient path through the
+            # reset. Forward behaviour is unchanged: subtract the threshold (soft
+            # reset) or zero the membrane (hard reset) whenever the neuron spiked.
+            s_reset = s.detach()
             if reset == 0.0:
-                v = v * (1.0 - s)
+                v = v * (1.0 - s_reset)
             else:
-                v = v - reset * s
+                v = v - reset * s_reset
 
             o = rho * o + s @ w_out + b_out
             o_sum = o_sum + o

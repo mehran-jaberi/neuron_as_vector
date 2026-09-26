@@ -39,6 +39,25 @@ N_CLASSES = 20
 N_TRAIN_SAMPLES = 8156
 N_TEST_SAMPLES = 2264
 
+# Measured on the official SHD HDF5 files (raw times are stored in SECONDS and
+# converted to ms by ``parse_shd_h5``). The longest training utterance reaches
+# 1.3691 s, so a binning window must be at least this long to avoid silently
+# truncating late events.
+SHD_MAX_TIME_MS_TRAIN = 1369.14
+SHD_MAX_TIME_MS_TEST = 1169.92
+
+
+def recommended_n_bins(bin_ms: float, max_time_ms: float = SHD_MAX_TIME_MS_TRAIN) -> int:
+    """Smallest number of ``bin_ms``-wide bins that covers the longest utterance.
+
+    For the default ``bin_ms = 2.0`` this is 685; the baseline config uses the
+    round value 700 (= 1400 ms window) to leave a small margin.
+    """
+    import math
+
+    return int(math.ceil(float(max_time_ms) / float(bin_ms)))
+
+
 SHD_URLS: dict[str, str] = {
     "shd_train.h5": "https://zenkelab.org/datasets/shd_train.h5.zip",
     "shd_test.h5": "https://zenkelab.org/datasets/shd_test.h5.zip",
@@ -430,8 +449,10 @@ def events_to_bins(
 ) -> np.ndarray:
     """Convert one sample's events to a dense ``(n_bins, n_channels)`` count array.
 
-    Events outside ``[0, n_bins * bin_ms)`` are dropped (documented; SHD events
-    end well before the default 1000 ms window).
+    Events outside ``[0, n_bins * bin_ms)`` are dropped. The longest SHD training
+    utterance reaches ~1.369 s (see :data:`SHD_MAX_TIME_MS_TRAIN`), so choose
+    ``n_bins * bin_ms`` large enough (e.g. 700 bins x 2 ms = 1400 ms) to avoid
+    silently truncating late events.
     """
     out = np.zeros((n_bins, n_channels), dtype=np.float32)
     if times_ms.size == 0:
@@ -661,6 +682,179 @@ def make_validation_split(
         if prefer_speaker_aware:
             info["fallback_reason"] = "no speaker metadata in the training file"
     return train_rec.subset(train_idx, name="train"), train_rec.subset(val_idx, name="val"), info
+
+
+# --------------------------------------------------------------------------
+# Clean train / dev / probe split of the official training file
+# --------------------------------------------------------------------------
+def _class_coverage(labels: np.ndarray, idx: np.ndarray, n_classes: int) -> dict[str, Any]:
+    """Report which of the ``n_classes`` classes are present among ``idx``."""
+    present = set(int(c) for c in np.unique(np.asarray(labels)[idx])) if len(idx) else set()
+    missing = sorted(set(range(n_classes)) - present)
+    return {
+        "n_classes_present": len(present),
+        "classes_missing": missing,
+        "complete": len(missing) == 0,
+    }
+
+
+def speaker_aware_train_dev_probe_split(
+    labels: np.ndarray,
+    speakers: np.ndarray,
+    *,
+    dev_fraction: float = 0.1,
+    probe_fraction: float = 0.1,
+    seed: int = 0,
+    n_classes: int | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
+    """Partition the official training file into train / dev / probe by holding out
+    *whole speakers* (speaker-aware), keeping the official test file untouched.
+
+    Semantics of the four splits used by this project
+    -------------------------------------------------
+    * ``train`` - used for fitting (gradient updates).
+    * ``dev``   - speaker-aware development split, used for *model selection*
+      (checkpoint / early stopping). Carved from the official training file.
+    * ``probe`` - speaker-aware split carved from the official training file and
+      *locked after the fact*: reported as a final internal sanity check but never
+      used to choose the model. Independent of ``dev``.
+    * ``test``  - the official SHD test file, fully locked (never passed here).
+
+    Procedure
+    ---------
+    1. Deterministically shuffle the speaker ids (``seed``).
+    2. Greedily assign whole speakers to ``probe`` until ``probe_fraction`` of the
+       samples is covered, then to ``dev`` until ``dev_fraction`` is covered.
+    3. The remaining speakers form ``train``.
+    4. Verify class coverage (all ``n_classes`` present) in each of train/dev/probe
+       and record the exact speaker ids and sample counts per split.
+
+    Returns ``(train_idx, dev_idx, probe_idx, info)``. ``info`` documents, per
+    split, the speaker ids and sample counts, plus class-coverage checks, so the
+    split is fully auditable from the saved metadata.
+    """
+    labels = np.asarray(labels, dtype=np.int64)
+    speakers = np.asarray(speakers, dtype=np.int64)
+    if labels.shape != speakers.shape:
+        raise ValueError("labels and speakers must have the same shape")
+    if n_classes is None:
+        n_classes = int(labels.max() + 1) if labels.size else 0
+
+    rng = np.random.default_rng(seed)
+    unique_speakers = np.unique(speakers)
+    order = rng.permutation(unique_speakers)
+    total = labels.size
+
+    def _take(pool: list[int], fraction: float) -> list[int]:
+        """Move whole speakers from ``pool`` into a held-out set until the target
+        fraction of samples is covered. Returns the chosen speaker ids."""
+        target = fraction * total
+        chosen: list[int] = []
+        current = 0
+        while pool and current < target:
+            spk = pool.pop(0)
+            chosen.append(int(spk))
+            current += int((speakers == spk).sum())
+        return chosen
+
+    remaining = list(int(s) for s in order)
+    probe_speakers = _take(remaining, probe_fraction)
+    dev_speakers = _take(remaining, dev_fraction)
+    train_speakers = remaining
+
+    def _idx_for(spk_list: list[int]) -> np.ndarray:
+        if not spk_list:
+            return np.empty(0, dtype=np.int64)
+        mask = np.isin(speakers, np.asarray(spk_list, dtype=np.int64))
+        return np.flatnonzero(mask).astype(np.int64)
+
+    train_idx = _idx_for(train_speakers)
+    dev_idx = _idx_for(dev_speakers)
+    probe_idx = _idx_for(probe_speakers)
+
+    # Sanity: the three index sets must be disjoint and cover everything.
+    assert train_idx.size + dev_idx.size + probe_idx.size == total
+    assert len(set(train_idx.tolist()) & set(dev_idx.tolist())) == 0
+    assert len(set(train_idx.tolist()) & set(probe_idx.tolist())) == 0
+    assert len(set(dev_idx.tolist()) & set(probe_idx.tolist())) == 0
+
+    def _speaker_breakdown(spk_list: list[int]) -> dict[int, int]:
+        return {int(s): int((speakers == s).sum()) for s in spk_list}
+
+    info = {
+        "strategy": "speaker_aware_train_dev_probe",
+        "seed": int(seed),
+        "dev_fraction_requested": float(dev_fraction),
+        "probe_fraction_requested": float(probe_fraction),
+        "n_speakers_total": int(unique_speakers.size),
+        "splits": {
+            "train": {
+                "speakers": train_speakers,
+                "n_samples": int(train_idx.size),
+                "speaker_sample_counts": _speaker_breakdown(train_speakers),
+                "class_coverage": _class_coverage(labels, train_idx, n_classes),
+            },
+            "dev": {
+                "speakers": dev_speakers,
+                "n_samples": int(dev_idx.size),
+                "speaker_sample_counts": _speaker_breakdown(dev_speakers),
+                "class_coverage": _class_coverage(labels, dev_idx, n_classes),
+            },
+            "probe": {
+                "speakers": probe_speakers,
+                "n_samples": int(probe_idx.size),
+                "speaker_sample_counts": _speaker_breakdown(probe_speakers),
+                "class_coverage": _class_coverage(labels, probe_idx, n_classes),
+            },
+        },
+        "n_train": int(train_idx.size),
+        "n_dev": int(dev_idx.size),
+        "n_probe": int(probe_idx.size),
+    }
+    return train_idx, dev_idx, probe_idx, info
+
+
+def make_train_dev_probe_split(
+    train_rec: SHDRecordings,
+    *,
+    dev_fraction: float = 0.1,
+    probe_fraction: float = 0.1,
+    seed: int = 0,
+    prefer_speaker_aware: bool = True,
+) -> tuple[SHDRecordings, SHDRecordings, SHDRecordings, dict[str, Any]]:
+    """Split the official training data into ``(train, dev, probe)`` recordings.
+
+    Uses a whole-speaker split when speaker metadata is present (the SHD case).
+    If speaker metadata is unavailable, falls back to a stratified random split for
+    ``dev`` and leaves ``probe`` empty with a recorded limitation (a speaker-aware
+    probe is then not possible).
+    """
+    if prefer_speaker_aware and train_rec.speakers is not None:
+        train_idx, dev_idx, probe_idx, info = speaker_aware_train_dev_probe_split(
+            train_rec.labels_array,
+            train_rec.speakers,
+            dev_fraction=dev_fraction,
+            probe_fraction=probe_fraction,
+            seed=seed,
+        )
+    else:
+        # Fallback: only a dev split is meaningful without speaker metadata.
+        train_idx, dev_idx, sub_info = stratified_split(
+            train_rec.labels_array, val_fraction=dev_fraction, seed=seed
+        )
+        probe_idx = np.empty(0, dtype=np.int64)
+        info = {
+            "strategy": "stratified_train_dev_only",
+            "fallback_reason": "no speaker metadata in the training file",
+            "sub": sub_info,
+            "n_probe": 0,
+        }
+    return (
+        train_rec.subset(train_idx, name="train"),
+        train_rec.subset(dev_idx, name="dev"),
+        train_rec.subset(probe_idx, name="probe"),
+        info,
+    )
 
 
 # --------------------------------------------------------------------------

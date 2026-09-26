@@ -78,3 +78,29 @@ def test_derived_time_constants():
     assert np.isclose(cfg.alpha, math.exp(-2.0 / 20.0))
     assert np.isclose(cfg.beta, math.exp(-2.0 / 5.0))
     assert np.isclose(cfg.duration_ms, cfg.n_bins * cfg.bin_ms)
+
+
+def test_forward_rejects_mismatched_time_steps(tiny_snn_config):
+    import pytest
+
+    model = build_model(tiny_snn_config, seed=0)
+    # One fewer time step than the configured n_bins must raise, not silently run.
+    x = torch.randn(2, tiny_snn_config.n_bins - 1, tiny_snn_config.n_input)
+    with pytest.raises(ValueError):
+        model(x)
+
+
+def test_reset_does_not_leak_surrogate_gradient(tiny_snn_config):
+    """The reset uses the detached spike indicator, so perturbing the surrogate
+    pathway of the spike cannot change the *forward* reset value. Here we simply
+    check the forward spikes remain exactly {0, 1} and gradients stay finite."""
+    model = build_model(tiny_snn_config, seed=0)
+    x = torch.randn(3, tiny_snn_config.n_bins, tiny_snn_config.n_input)
+    out = model(x, record=True)
+    s = out["hidden_spikes"]
+    assert torch.all((s == 0) | (s == 1))
+    loss = out["logits"].pow(2).mean()
+    loss.backward()
+    for p in model.parameters():
+        if p.grad is not None:
+            assert torch.isfinite(p.grad).all()

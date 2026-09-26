@@ -47,7 +47,7 @@ from _common import (  # noqa: E402  (scripts dir is on sys.path when run)
     resolve_device,
     result_path,
 )
-from src.evaluation import evaluate_model
+from src.evaluation import circuit_health, evaluate_model
 from src.model import count_parameters
 from src.training import TrainConfig, activity_report, train_model
 from src.utils import describe_device, ensure_dir, save_json
@@ -74,10 +74,18 @@ def main(argv: list[str] | None = None) -> int:
 
     tag = str(cfg.get_path("run.tag", "run"))
     recs = build_recordings(cfg)
-    train_rec, val_rec, test_rec = recs["train"], recs["val"], recs["test"]
+    train_rec, dev_rec, probe_rec, test_rec = (
+        recs["train"], recs["dev"], recs["probe"], recs["test"],
+    )
     train_idx = np.arange(len(train_rec))
-    val_idx = np.arange(len(val_rec))
+    dev_idx = np.arange(len(dev_rec))
+    probe_idx = np.arange(len(probe_rec))
     test_idx = np.arange(len(test_rec))
+
+    print(
+        f"[split] train={len(train_rec)} dev={len(dev_rec)} "
+        f"probe={len(probe_rec)} test={len(test_rec)} (test is the locked official set)"
+    )
 
     model = build_model_from_config(cfg, seed=int(cfg.get_path("seed", 0)), device=device)
     n_params = count_parameters(model)
@@ -90,8 +98,8 @@ def main(argv: list[str] | None = None) -> int:
         model,
         train_rec,
         train_idx,
-        val_rec,
-        val_idx,
+        dev_rec,
+        dev_idx,
         tcfg,
         device=device,
         seed=int(cfg.get_path("seed", 0)),
@@ -100,23 +108,46 @@ def main(argv: list[str] | None = None) -> int:
     wall = time.time() - t0
 
     # Circuit-health diagnostics: a silent hidden layer makes the whole study vacuous.
+    # ``activity_report`` is the compact per-epoch-style report; ``circuit_health``
+    # adds the full rate distribution, spike counts and membrane-potential statistics.
     health_train = activity_report(model, train_rec, train_idx, device=device)
+    full_health_train = circuit_health(
+        model, train_rec, train_idx, device=device, batch_size=tcfg.eval_batch_size,
+        n_classes=tcfg.n_classes,
+    )
+    full_health_dev = circuit_health(
+        model, dev_rec, dev_idx, device=device, batch_size=tcfg.eval_batch_size,
+        n_classes=tcfg.n_classes,
+    )
 
     metrics: dict = {}
     metrics["train"] = evaluate_model(
         model, train_rec, train_idx, device=device, batch_size=tcfg.eval_batch_size, n_classes=tcfg.n_classes
     )
-    metrics["val"] = evaluate_model(
-        model, val_rec, val_idx, device=device, batch_size=tcfg.eval_batch_size, n_classes=tcfg.n_classes
+    metrics["dev"] = evaluate_model(
+        model, dev_rec, dev_idx, device=device, batch_size=tcfg.eval_batch_size, n_classes=tcfg.n_classes
     )
+    if len(probe_rec) > 0:
+        metrics["probe"] = evaluate_model(
+            model, probe_rec, probe_idx, device=device, batch_size=tcfg.eval_batch_size, n_classes=tcfg.n_classes
+        )
     metrics["test"] = evaluate_model(
         model, test_rec, test_idx, device=device, batch_size=tcfg.eval_batch_size, n_classes=tcfg.n_classes
     )
 
     print(
         f"[eval] train acc {metrics['train']['accuracy']:.4f} | "
-        f"val acc {metrics['val']['accuracy']:.4f} | "
-        f"test acc {metrics['test']['accuracy']:.4f}"
+        f"dev acc {metrics['dev']['accuracy']:.4f} | "
+        + (f"probe acc {metrics['probe']['accuracy']:.4f} | " if "probe" in metrics else "")
+        + f"test acc {metrics['test']['accuracy']:.4f}"
+    )
+    print(
+        f"[health] train mean rate {full_health_train['rate_hz_mean']:.1f} Hz "
+        f"(p10 {full_health_train['rate_hz_percentiles']['p10']:.1f}, "
+        f"p90 {full_health_train['rate_hz_percentiles']['p90']:.1f}) "
+        f"silent {full_health_train['silent_neuron_fraction']:.3f} | "
+        f"V mean {full_health_train['v_global_mean']:.3f} std {full_health_train['v_global_std']:.3f} "
+        f"[{full_health_train['v_global_min']:.3f}, {full_health_train['v_global_max']:.3f}]"
     )
 
     extra = {
@@ -143,12 +174,15 @@ def main(argv: list[str] | None = None) -> int:
         "best_epoch": result.best_epoch,
         "best_score": result.best_score,
         "select_by": result.select_by,
-        "n_train": result.n_train,
-        "n_val": result.n_val,
+        "n_train": int(len(train_rec)),
+        "n_dev": int(len(dev_rec)),
+        "n_probe": int(len(probe_rec)),
         "split_info": recs["split_info"],
         "device": describe_device(device),
         "n_parameters": n_params,
         "hidden_health_train": health_train,
+        "circuit_health_train": full_health_train,
+        "circuit_health_dev": full_health_dev,
         "metrics": metrics,
         "config": cfg.to_dict(),
     }

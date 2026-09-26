@@ -55,6 +55,12 @@ class ActivityAccumulatorResult:
     n_bins: int
     n_hidden: int
     bin_ms: float
+    # Global membrane-potential statistics over all recorded (sample, time, neuron)
+    # entries. Defaulted so older saved payloads (without them) still load.
+    v_global_mean: float = 0.0
+    v_global_std: float = 0.0
+    v_global_min: float = 0.0
+    v_global_max: float = 0.0
     labels: np.ndarray | None = None  # (N,) kept only for bookkeeping/audit
     meta: dict[str, Any] = field(default_factory=dict)
 
@@ -83,6 +89,10 @@ class ActivityAccumulatorResult:
             "n_bins": np.array([self.n_bins]),
             "n_hidden": np.array([self.n_hidden]),
             "bin_ms": np.array([self.bin_ms]),
+            "v_global_mean": np.array([self.v_global_mean], dtype=np.float64),
+            "v_global_std": np.array([self.v_global_std], dtype=np.float64),
+            "v_global_min": np.array([self.v_global_min], dtype=np.float64),
+            "v_global_max": np.array([self.v_global_max], dtype=np.float64),
             "labels": self.labels if self.labels is not None else np.array([], dtype=np.int64),
         }
         np.savez_compressed(path, **payload)
@@ -91,6 +101,10 @@ class ActivityAccumulatorResult:
     def load(cls, path: str) -> "ActivityAccumulatorResult":
         with np.load(str(path), allow_pickle=False) as data:
             labels = data["labels"]
+
+            def _scalar(key: str, default: float) -> float:
+                return float(data[key][0]) if key in data.files else default
+
             return cls(
                 counts=data["counts"].astype(np.float64),
                 psth=data["psth"].astype(np.float64),
@@ -106,6 +120,10 @@ class ActivityAccumulatorResult:
                 n_bins=int(data["n_bins"][0]),
                 n_hidden=int(data["n_hidden"][0]),
                 bin_ms=float(data["bin_ms"][0]),
+                v_global_mean=_scalar("v_global_mean", 0.0),
+                v_global_std=_scalar("v_global_std", 0.0),
+                v_global_min=_scalar("v_global_min", 0.0),
+                v_global_max=_scalar("v_global_max", 0.0),
                 labels=None if labels.size == 0 else labels.astype(np.int64),
             )
 
@@ -149,6 +167,12 @@ class ActivityAccumulator:
         self.class_first_spike_count = np.zeros((self.n_classes, self.n_hidden), dtype=np.float64)
         self._v_sum = np.zeros(self.n_hidden, dtype=np.float64)
         self._v_n = 0
+        # Global (pooled over sample/time/neuron) membrane-potential accumulators.
+        self._v_global_sum = 0.0
+        self._v_global_sq = 0.0
+        self._v_global_min = np.inf
+        self._v_global_max = -np.inf
+        self._v_global_count = 0
         self.n_samples = 0
         self._t_ms = np.arange(self.n_bins, dtype=np.float64) * self.bin_ms
 
@@ -202,6 +226,13 @@ class ActivityAccumulator:
             v = np.asarray(hidden_v, dtype=np.float64)
             self._v_sum += v.mean(axis=(0, 1))
             self._v_n += 1
+            # Pooled global membrane-potential statistics (running, memory-bounded).
+            self._v_global_sum += float(v.sum())
+            self._v_global_sq += float((v * v).sum())
+            if v.size:
+                self._v_global_min = min(self._v_global_min, float(v.min()))
+                self._v_global_max = max(self._v_global_max, float(v.max()))
+                self._v_global_count += int(v.size)
 
         self.n_samples += B
 
@@ -212,6 +243,15 @@ class ActivityAccumulator:
         counts = np.concatenate(self._counts, axis=0)
         labels = np.concatenate(self._labels, axis=0) if self._labels else None
         v_mean = self._v_sum / self._v_n if self._v_n > 0 else np.zeros(self.n_hidden)
+        if self._v_global_count > 0:
+            vg_mean = self._v_global_sum / self._v_global_count
+            vg_var = max(self._v_global_sq / self._v_global_count - vg_mean * vg_mean, 0.0)
+            v_global_mean = float(vg_mean)
+            v_global_std = float(np.sqrt(vg_var))
+            v_global_min = float(self._v_global_min)
+            v_global_max = float(self._v_global_max)
+        else:
+            v_global_mean = v_global_std = v_global_min = v_global_max = 0.0
         return ActivityAccumulatorResult(
             counts=counts,
             psth=self.psth.copy(),
@@ -227,6 +267,10 @@ class ActivityAccumulator:
             n_bins=int(self.n_bins),
             n_hidden=int(self.n_hidden),
             bin_ms=float(self.bin_ms),
+            v_global_mean=v_global_mean,
+            v_global_std=v_global_std,
+            v_global_min=v_global_min,
+            v_global_max=v_global_max,
             labels=labels,
             meta={"collect_voltage": self.collect_voltage},
         )
@@ -260,6 +304,7 @@ def evaluate_model(
     import torch.nn.functional as F
 
     device = device or get_device()
+    model = model.to(device)
     model.eval()
     sim = model.cfg
     total = 0
@@ -333,6 +378,7 @@ def collect_activity(
     import torch
 
     device = device or get_device()
+    model = model.to(device)
     model.eval()
     sim = model.cfg
     acc = ActivityAccumulator(
@@ -351,6 +397,63 @@ def collect_activity(
                 hidden_v=out["hidden_v"].cpu().numpy() if collect_voltage else None,
             )
     return acc.finalize()
+
+
+def circuit_health(
+    model: RecurrentLIFSNN,
+    rec: SHDRecordings,
+    indices: Sequence[int] | np.ndarray,
+    *,
+    device: Any = None,
+    batch_size: int = 256,
+    n_classes: int = 20,
+) -> dict[str, Any]:
+    """Comprehensive circuit-health diagnostics for the hidden layer.
+
+    Reports, for the hidden population on ``indices``:
+      * hidden firing-rate distribution (per-neuron rates + summary percentiles),
+      * silent-neuron fraction,
+      * spike counts (total, and mean per sample),
+      * membrane-potential statistics (per-neuron mean V and pooled global
+        mean/std/min/max over all recorded (sample, time, neuron) entries).
+
+    This is label-free (no class information is used).
+    """
+    res = collect_activity(
+        model, rec, indices, device=device, batch_size=batch_size,
+        n_classes=n_classes, with_labels=False, collect_voltage=True,
+    )
+    duration_s = max(res.duration_s, 1e-9)
+    # Per-neuron firing rate (Hz): total spikes / (n_samples * duration).
+    rates = res.counts.sum(axis=0) / (res.n_samples * duration_s)
+    rates = np.asarray(rates, dtype=np.float64)
+    total_spikes = res.counts.sum(axis=0)
+    q = [0.0, 10.0, 25.0, 50.0, 75.0, 90.0, 100.0]
+    pctl = np.percentile(rates, q) if rates.size else np.full(len(q), np.nan)
+    return {
+        "n_samples": int(res.n_samples),
+        "n_hidden": int(res.n_hidden),
+        "duration_s": float(res.duration_s),
+        # firing-rate distribution
+        "rate_hz_mean": float(rates.mean()) if rates.size else float("nan"),
+        "rate_hz_std": float(rates.std()) if rates.size else float("nan"),
+        "rate_hz_percentiles": {f"p{int(p)}": float(v) for p, v in zip(q, pctl)},
+        "rate_hz_per_neuron": rates.tolist(),
+        # silent neurons
+        "silent_neuron_fraction": float((total_spikes <= 0).mean()) if rates.size else float("nan"),
+        "n_silent_neurons": int((total_spikes <= 0).sum()) if rates.size else 0,
+        "low_rate_fraction_lt_0p5hz": float((rates < 0.5).mean()) if rates.size else float("nan"),
+        # spike counts
+        "total_spikes": int(total_spikes.sum()) if rates.size else 0,
+        "mean_total_spikes_per_sample": float(res.counts.sum(axis=1).mean()) if res.counts.size else float("nan"),
+        "mean_spike_count_per_neuron_per_sample": float(res.counts.mean()) if res.counts.size else float("nan"),
+        # membrane potential statistics
+        "v_mean_per_neuron": np.asarray(res.v_mean, dtype=np.float64).tolist(),
+        "v_global_mean": float(res.v_global_mean),
+        "v_global_std": float(res.v_global_std),
+        "v_global_min": float(res.v_global_min),
+        "v_global_max": float(res.v_global_max),
+    }
 
 
 def split_half_indices(
