@@ -53,6 +53,21 @@ def _pair_indices(n: int) -> tuple[np.ndarray, np.ndarray]:
     return np.triu_indices(n, 1)
 
 
+def _pair_index_matrix(n: int) -> np.ndarray:
+    """``(n, n)`` matrix mapping (i, j) -> condensed-vector index.
+
+    Lets a neuron permutation be applied to a condensed vector by pure indexing:
+    if ``dy_p = D[p[ii], p[jj]]`` then ``dy_p = dy[pair_index[p[ii], p[jj]]]``.
+    This removes the per-permutation ``rankdata`` from the null loop (a large
+    speed-up) while keeping the statistic numerically identical.
+    """
+    ii, jj = _pair_indices(n)
+    mat = np.zeros((n, n), dtype=np.int64)
+    mat[ii, jj] = np.arange(ii.size)
+    mat[jj, ii] = np.arange(ii.size)
+    return mat
+
+
 def condensed_to_matrix(condensed: np.ndarray, n: int) -> np.ndarray:
     from scipy.spatial.distance import squareform
 
@@ -203,21 +218,35 @@ def mantel_test(
         raise ValueError("Could not infer the number of neurons from the distance vector length")
 
     observed = statistic_from_vectors(dx, dy, method)
-    rx = rankdata(dx) if method == "spearman" else (np.log1p(dx) if method == "pearson_log" else dx)
 
-    dmat = condensed_to_matrix(dy, n)
+    # Fixed vector `a` and permutable base `b`. For "spearman" we rank once and
+    # reuse the rank vector under permutation, because permuting `dy` preserves
+    # ties, so rankdata(dy[perm_pair]) == rankdata(dy)[perm_pair].
+    if method == "spearman":
+        a = rankdata(dx)
+        base = rankdata(dy)
+    elif method == "pearson":
+        a = dx
+        base = dy
+    elif method == "pearson_log":
+        a = np.log1p(dx)
+        base = np.log1p(dy)
+    else:
+        raise ValueError(f"Unknown Mantel method {method!r}")
+
+    a_c = a - a.mean()
+    b_c = base - base.mean()
+    denom = float(m) * float(a.std()) * float(base.std())
+    pair_index = _pair_index_matrix(n)
     rng = np.random.default_rng(seed)
     null = np.empty(n_perm, dtype=np.float64)
     for k in range(n_perm):
         p = rng.permutation(n)
-        # Relabelled functional distances, computed without materialising D[p][:, p].
-        dy_p = dmat[p[ii], p[jj]]
-        if method == "spearman":
-            null[k] = _pearson(rx, rankdata(dy_p))
-        elif method == "pearson":
-            null[k] = _pearson(rx, dy_p)
+        perm_pair = pair_index[p[ii], p[jj]]
+        if denom > 1e-12:
+            null[k] = float((a_c * b_c[perm_pair]).sum() / denom)
         else:
-            null[k] = _pearson(rx, np.log1p(dy_p))
+            null[k] = float("nan")
 
     null_mean = float(np.nanmean(null)) if np.isfinite(null).any() else float("nan")
     null_std = float(np.nanstd(null)) if np.isfinite(null).any() else float("nan")
@@ -363,12 +392,12 @@ def rate_matched_mantel(
 
     observed = stratified(dy)
 
-    D = condensed_to_matrix(dy, n)
+    pair_index = _pair_index_matrix(n)
     rng = np.random.default_rng(seed)
     null = np.empty(n_perm, dtype=np.float64)
     for k in range(n_perm):
         p = rng.permutation(n)
-        null[k] = stratified(D[p[ii], p[jj]])
+        null[k] = stratified(dy[pair_index[p[ii], p[jj]]])
 
     null_mean = float(np.nanmean(null)) if np.isfinite(null).any() else float("nan")
     null_std = float(np.nanstd(null)) if np.isfinite(null).any() else float("nan")
@@ -425,13 +454,15 @@ def partial_mantel_test(
     ry = _residualize(rankdata(dy), rankdata(dz))
     observed = _pearson(rx, ry)
 
-    dmat = condensed_to_matrix(dy, n)
+    ry_base = rankdata(dy)
+    rz = rankdata(dz)
+    pair_index = _pair_index_matrix(n)
     rng = np.random.default_rng(seed)
     null = np.empty(n_perm, dtype=np.float64)
     for k in range(n_perm):
         p = rng.permutation(n)
-        dy_p = dmat[p[ii], p[jj]]
-        ry_p = _residualize(rankdata(dy_p), rankdata(dz))
+        dy_p_ranks = ry_base[pair_index[p[ii], p[jj]]]
+        ry_p = _residualize(dy_p_ranks, rz)
         null[k] = _pearson(rx, ry_p)
 
     if np.isfinite(null).any():

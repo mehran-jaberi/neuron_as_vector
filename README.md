@@ -293,6 +293,77 @@ these results.
 **What the controls must rule out.** A positive result only means something if it
 survives controls that could produce a spurious correlation (see §8).
 
+### 6.1 Stress-testing the result
+
+`scripts/run_stress_test.py` (`src/stress_test.py`) evaluates a fixed set of
+representations/controls through the identical pipeline and, for **every** row,
+answers the mandatory question *"could this be explained simply by firing rate?"*
+using the rate-normalized fingerprint and the rate-matched stratified Mantel. Every
+row is reported — negative, null and skipped results included; the primary result
+is the structural representation, never the best row of the table.
+
+| # | Representation / control |
+| - | ------------------------ |
+| 1 | firing-rate-only |
+| 2 | activity-only |
+| 3 | input-connectivity-only |
+| 4 | recurrent-connectivity-only |
+| 5 | intrinsic/dynamical-only (the generic learned bias in the default architecture) |
+| 6 | full structural (**primary**) |
+| 7 | structural + activity |
+| 8 | random representation |
+| 9 | hidden-neuron permutation / shuffle |
+| 10 | **rewired recurrent-network control** (a condition, below) |
+
+**Rewired recurrent-network control** (`src/rewiring.py`). The learned recurrent
+matrix is rewired to destroy the specific neuron-to-neuron relational structure
+while preserving the weight distribution as far as possible. Three modes are
+provided, each documented in code and in the results:
+
+| mode | preserved | destroyed |
+| ---- | --------- | --------- |
+| `global` | exact multiset of all recurrent weights | all per-neuron in/out marginals **and** all relations |
+| `rowwise` | multiset **and** each neuron's incoming weight multiset (so `recurrent_in` is unchanged) | outgoing marginal and all relations |
+| `columnwise` | multiset **and** each neuron's outgoing weight multiset (so `recurrent_out` is unchanged) | incoming marginal and all relations |
+
+The rewired network has a different function, so **both** its representation and
+its functional fingerprint are recomputed and compared within the rewired
+condition.
+
+**Before / after learning.** An untrained network with the *same architecture and
+same initialisation seed* is compared with the trained checkpoint, using the *same*
+analysis-probe data. Both conditions are pushed through the same stress table so
+the change in the representation-function association (and in its rate-controlled
+versions) is visible per representation.
+
+### 6.2 Fingerprint reliability audit
+
+The noise-ceiling calculation is itself audited (`src/functional_fingerprint.py →
+reliability_audit`), not assumed. The audit verifies and reports: the two halves are
+**disjoint** and **cover** the evaluated samples; the split is **class-stratified**;
+the split is the held-out **analysis-probe** split (never `train`, never the official
+test set); both halves are reduced with the **same distance metric**; feature names
+are aligned; and the ceiling uses the **Spearman–Brown corrected full-length**
+reliability $2r/(1+r)$ of the half–half distance correlation, with attenuation
+$\sqrt{2r/(1+r)}$ (the more conservative half-length attenuation $\sqrt{r}$ is also
+reported). Labels are used by the fingerprint *by design*; the representation never
+sees them.
+
+### 6.3 Leakage audit (split independence)
+
+The stress test includes a `fingerprint_split_leakage_guard` that compares the
+**model-selection** speakers recorded in the checkpoint's provenance with the
+speakers of the split the fingerprint is measured on, and flags any overlap.
+
+> **Finding.** The legacy checkpoint `checkpoints/baseline.pt` (n_bins = 500) was
+> trained with the old 2-way split, selecting the model on `held_out_speakers =
+> [6, 8]`. The 3-way split assigns `probe = [6, 8]`, so for that checkpoint the
+> fingerprint coincided with the **model-selection** split. The corrected
+> checkpoint `checkpoints/baseline_v2.pt` (n_bins = 700) selects on `dev = [2]` and
+> locks `probe = [6, 8]`, so its probe fingerprint is genuinely independent. The
+> authoritative stress-test artifact is therefore **`baseline_v2`**
+> (`--override run.tag=baseline_v2 --override model.n_bins=700`).
+
 ---
 
 ## 7. Results
@@ -446,24 +517,120 @@ default (`multiseed.seeds`), and only the structural + activity blocks with a
 single architecture (256 hidden neurons) were studied so far. See §18 for the
 deferred extensions and open questions.
 
+### 7.8 Stress test — what survives the controls
+
+The stress test (§6.1) was run on the **leakage-free** checkpoint
+`checkpoints/baseline_v2.pt` (3-way split; model selection on `dev = [2]`, locked
+`probe = [6, 8]`), probe *n* = 1236, `n_perm` = 1000 (p-value floor
+`1/1001 ≈ 0.001`; `at_resolution_floor = True` for every significant row, so quote
+*"p < 0.001"*, not the floor value). Full artifact:
+`results/baseline_v2_stress_test.{json,csv,npz}`.
+
+**After learning** (raw association vs the class-tuning fingerprint; the
+rate-normalized association; the rate-matched stratified control; ridge-CV *R²*):
+
+| Representation / control | raw *r* | rate-norm *r* | rate-matched *r* | pred *R²* | *p* |
+| ------------------------ | ------- | ------------- | ---------------- | --------- | --- |
+| firing-rate-only | 0.457 | 0.219 | **−0.092** | 0.076 | <0.001 |
+| activity-only | 0.404 | 0.300 | 0.156 | 0.549 | <0.001 |
+| input-connectivity-only | 0.158 | 0.120 | 0.198 | 0.103 | <0.001 |
+| recurrent-connectivity-only | 0.097 | 0.097 | **0.001** | 0.191 | <0.001 |
+| intrinsic/dynamical-only (learned bias) | 0.376 | 0.150 | 0.295 | 0.158 | <0.001 |
+| **structural (primary)** | **0.303** | **0.186** | **0.225** | **0.363** | **<0.001** |
+| structural + activity | 0.360 | 0.236 | 0.232 | 0.599 | <0.001 |
+| random representation | 0.008 | 0.011 | 0.025 | −0.011 | 0.38 |
+| hidden-neuron shuffle | 0.048 | −0.070 | 0.054 | −0.018 | 0.056 |
+
+**Rewired recurrent-network control** (same table rows, rewired networks):
+
+| Condition | structural raw *r* | structural rate-norm *r* | structural rate-matched *r* |
+| --------- | ------------------ | ------------------------ | --------------------------- |
+| after learning | 0.303 | 0.186 | 0.225 |
+| rewired `global` (multiset only) | 0.099 | 0.140 | 0.106 |
+| rewired `rowwise` (incoming marginals kept) | 0.124 | 0.157 | 0.141 |
+| rewired `columnwise` (outgoing marginals kept) | 0.100 | 0.173 | 0.116 |
+
+**Before vs after learning** (same architecture, same initialisation seed, same
+probe data), Δ = after − before on the raw association:
+
+| Representation | *r* before | *r* after | Δ |
+| -------------- | ---------- | --------- | - |
+| structural (primary) | 0.019 (*p* = 0.28) | 0.303 | **+0.284** |
+| recurrent-connectivity-only | −0.028 | 0.097 | +0.125 |
+| input-connectivity-only | 0.083 | 0.158 | +0.075 |
+| activity-only | 0.409 | 0.404 | −0.005 |
+| firing-rate-only | 0.381 | 0.457 | +0.077 |
+
+Learning also makes the fingerprint *less* reducible to a single rate: for
+`firing_rate_only` the **rate-normalized** association drops from 0.539 (before) to
+0.219 (after) and its predictive *R²* from 0.503 to 0.076.
+
+**Reliability audit.** Split-half reliability of the class-tuning fingerprint on the
+probe: half–half distance *r* = **0.9964**, Spearman–Brown full-length reliability
+**0.9982**, attenuation factor **0.9991**, per-neuron vector *r* = 0.9886. Audit
+passed all checks (halves disjoint and covering, class-stratified, held-out probe
+split, same distance metric, aligned features, fingerprint uses labels by design).
+So the target is essentially noiseless here and the moderate structural *r* ≈ 0.30
+is **not** a noise-ceiling artefact.
+
+**Leakage audit.** The guard confirmed the probe split (speakers `[6,8]`) is
+disjoint from the model-selection `dev` speakers `[2]` for `baseline_v2`. The legacy
+`baseline.pt` **failed** this check (its 2-way validation speakers were `[6,8]`), so
+the legacy stress table is superseded — see §6.3 and `AUDIT_REPRESENTATION.md` §10.3.
+
+**Interpretation.**
+
+- **Survives.** The structural representation is associated with function beyond
+  order (shuffle *r* = 0.048, *p* = 0.056; random *r* = 0.008, *p* = 0.38), beyond
+  overall firing-rate magnitude (rate-normalized *r* = 0.186, *p* < 0.001) and
+  beyond firing-rate *differences* (rate-matched *r* = 0.225, *p* < 0.001). Learning
+  is what creates it (before-learning structural *r* = 0.019, *p* = 0.28) and it is
+  predictable out of sample (ridge *R²* = 0.363 vs −0.011 for a random
+  representation).
+- **Does not survive / is weakened.** The rewiring controls cut the structural
+  association roughly threefold (raw 0.303 → 0.10–0.12; rate-matched 0.225 →
+  0.11–0.14) while leaving it significant, so **a substantial part of the effect
+  depends on the specific learned relational wiring**, and a smaller generic
+  component survives destroying it. Individually, `recurrent-connectivity-only`
+  collapses under rate matching (*r* = 0.001) and `firing-rate-only` collapses
+  entirely (*r* = −0.092): those two do **not** carry rate-independent information.
+  `activity-only` remains rate-linked (its before-learning predictive *R²* is 0.956
+  with a null raw association), so predictive *R²* alone is not evidence.
+- **Uncertain.** One checkpoint/seed on the corrected pipeline (no multi-seed
+  confidence yet); the residual post-rewiring component (~0.10) shows the effect is
+  not purely relational; and the single strongest rate-independent representation is
+  the one-dimensional `learned_bias` (rate-matched *r* = 0.295), i.e. a *generic
+  learned excitability offset*, not a biophysical parameter. Whether the remaining
+  structure carries information beyond that bias is not yet established.
+
 ---
 
 ## 8. Controls
 
-All controls run through the *identical* geometry pipeline
-(`src/controls.py → default_variants`), so they are directly comparable:
+The comprehensive control suite is the **stress test** (§6.1,
+`scripts/run_stress_test.py`), which evaluates every representation/control through
+the *identical* pipeline and reports raw, rate-normalized, rate-matched, predictive
+and permutation-significance columns in one table (no cherry-picking). Its rows:
 
-| Variant | Purpose |
-| ------- | ------- |
-| `random_null`        | shuffled neuron labels — null distribution |
-| `rate_only`          | trivial baseline: does a single firing rate already explain everything? |
-| `activity_only`      | label-free activity geature block alone |
-| `connectivity_only`  | structural (weight) blocks alone |
-| `structural_activity`| structural + activity |
-| per-block & leave-one-block-out | which representation content matters |
-| `fingerprint` (circular) | sanity check — **never reported as a result** |
-| **partial Mantel** controlling for firing-rate distance | is the effect more than rate? |
-| **before/after learning** | untrained vs trained network in the same architecture |
+| Row | Purpose |
+| --- | ------- |
+| firing-rate-only | trivial baseline: does a single firing rate already explain everything? |
+| activity-only | label-free activity statistics alone |
+| input-connectivity-only | input weights alone |
+| recurrent-connectivity-only | recurrent weights alone |
+| intrinsic/dynamical-only | the learned intrinsic parameter(s) alone |
+| structural (**primary**) | all structure, zero data, zero labels |
+| structural + activity | whether label-free activity adds anything |
+| random representation | chance level at matched dimensionality |
+| hidden-neuron shuffle | an artefact of row ordering |
+| rewired recurrent (`global`/`rowwise`/`columnwise`) | whether the *specific* learned wiring matters |
+| before vs after learning | whether learning creates the relationship |
+| partial Mantel | **secondary/exploratory only** — never proof of rate independence |
+
+The per-block / leave-one-block-out variants from `src/controls.py::default_variants`
+remain available in `scripts/run_geometry_analysis.py`, together with the circular
+`fingerprint_descriptive` sanity check (flagged, never reported as evidence). The
+fingerprint reliability/noise-ceiling is audited (§6.2).
 
 ---
 
@@ -546,6 +713,7 @@ neuron_as_vector/
 │   ├── evaluate.py          # stage 4b — accuracy / confusion
 │   ├── extract_representations.py  # stage 5
 │   ├── run_function_analysis.py    # primary analysis (representation vs fingerprint)
+│   ├── run_stress_test.py          # stress-test controls + before/after + rewiring
 │   ├── run_geometry_analysis.py    # stages 6–7 (ablation / controls / figures)
 │   └── make_figures.py             # stage 8
 ├── src/                     # the analysis code-base (namespace package)
@@ -557,6 +725,8 @@ neuron_as_vector/
 │   ├── functional_fingerprint.py  # independent class-conditioned target (A/B/C)
 │   ├── function_analysis.py # primary analysis + controls + prediction
 │   ├── prediction.py        # cross-validated ridge / kNN prediction of the target
+│   ├── stress_test.py       # stress-test table (10 controls + before/after)
+│   ├── rewiring.py          # rewired recurrent-network control
 │   ├── geometry_analysis.py # Mantel / kNN / rate-matched analysis
 │   ├── controls.py          # null controls, ablations, reliability
 │   ├── training.py          # surrogate BPTT loop
@@ -676,6 +846,21 @@ prediction. Outputs one machine-readable summary and its null distributions:
 - `results/<tag>_function_analysis.json` — every primary and control result;
 - `results/<tag>_function_analysis.npz` — permutation null distributions and the
   condensed representation/functional distance vectors.
+
+**Stress-test — is the result real or trivial?:**
+
+```powershell
+uv run python scripts/run_stress_test.py --config configs/analysis.yaml
+```
+
+Evaluates the fixed representation/control set (§6.1) for the after-learning,
+before-learning and rewired recurrent-network conditions on the same
+analysis-probe data, and writes one table:
+
+- `results/<tag>_stress_test.json` — table + per-row details + before/after +
+  fingerprint reliability audit;
+- `results/<tag>_stress_test.csv` — the compact five-column table;
+- `results/<tag>_stress_test.npz` — permutation null distributions and distances.
 
 **Stages 6–7 — ablation / geometry sweeps and figure data:**
 

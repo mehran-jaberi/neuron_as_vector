@@ -494,12 +494,36 @@ def reliability_suite(
     fingerprints_full: FingerprintSpace,
     fingerprints_half_a: FingerprintSpace,
     fingerprints_half_b: FingerprintSpace,
+    *,
+    common_standardizer: Any | None = None,
+    labels: np.ndarray | None = None,
+    idx_a: np.ndarray | None = None,
+    idx_b: np.ndarray | None = None,
+    split_name: str | None = None,
 ) -> dict[str, Any]:
-    """Bundle the noise-ceiling diagnostics with the full-data fingerprint size."""
-    from .functional_fingerprint import split_half_reliability
+    """Bundle the noise-ceiling diagnostics with the full-data fingerprint size.
 
-    rel = split_half_reliability(fingerprints_half_a, fingerprints_half_b)
+    When the split labels/indices are supplied, a full audit (independence, class
+    balance, split provenance, metric consistency) is attached under ``"audit"``.
+    """
+    from .functional_fingerprint import reliability_audit, split_half_reliability
+
+    rel = split_half_reliability(
+        fingerprints_half_a, fingerprints_half_b, common_standardizer=common_standardizer
+    )
     rel["n_samples_half_a"] = fingerprints_half_a.meta.get("n_samples")
     rel["n_samples_half_b"] = fingerprints_half_b.meta.get("n_samples")
     rel["full_fingerprint_n_features"] = len(fingerprints_full.feature_names)
+    if labels is not None and idx_a is not None and idx_b is not None:
+        rel["audit"] = reliability_audit(
+            labels=labels,
+            idx_a=idx_a,
+            idx_b=idx_b,
+            half_a=fingerprints_half_a,
+            half_b=fingerprints_half_b,
+            full=fingerprints_full,
+            split_name=split_name,
+            n_classes=fingerprints_full.meta.get("n_classes"),
+            common_standardizer=common_standardizer,
+        )
     return rel

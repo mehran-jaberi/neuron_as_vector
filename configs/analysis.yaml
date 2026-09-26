@@ -132,6 +132,25 @@ function_analysis:
     random_control_seed: 12345
 
 # ---------------------------------------------------------------------------
+# Stress-test (scripts/run_stress_test.py): is the neuron-space result real or a
+# trivial property of the network? Evaluates the fixed representation/control set
+# for the after-learning, before-learning and rewired recurrent conditions.
+# ---------------------------------------------------------------------------
+stress_test:
+  n_perm: 1000              # permutation count for the stress table (floor 1/(n_perm+1))
+  k_values: [3, 5, 10, 20]
+  # rewired recurrent-network control modes (see src/rewiring.py for what each
+  # mode preserves/destroys): global = multiset only; rowwise = incoming marginals
+  # preserved; columnwise = outgoing marginals preserved.
+  rewired_modes: [global, rowwise, columnwise]
+  include_before_learning: true
+  reliability_audit: true
+  prediction:
+    enabled: true
+    n_splits: 5
+    alphas: [0.001, 0.01, 0.1, 1.0, 10.0, 100.0, 1000.0]
+
+# ---------------------------------------------------------------------------
 # Geometry-function analysis
 # ---------------------------------------------------------------------------
 geometry:

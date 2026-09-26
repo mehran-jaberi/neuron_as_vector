@@ -290,3 +290,57 @@ applied (audit item B3), and the fingerprint is measured on the held-out
 The single machine-readable summary is
 `results/<tag>_function_analysis.json` (with null distributions and distance
 vectors in the companion `.npz`).
+
+---
+
+## 10. Stress test: controls, rewiring, before/after, and the reliability audit
+
+`scripts/run_stress_test.py` (`src/stress_test.py`) evaluates the fixed
+representation/control set for the after-learning, before-learning and rewired
+recurrent conditions on the same architecture and the same analysis-probe data, and
+writes one table (`results/<tag>_stress_test.{json,csv,npz}`) whose columns are:
+representation/control, raw geometry-function association, rate-normalized
+association, predictive metric, permutation significance. Every row is reported
+(controls, negative and skipped results included).
+
+### 10.1 Rewired recurrent-network control (`src/rewiring.py`)
+
+| mode | preserved | destroyed |
+| ---- | --------- | --------- |
+| `global` | exact multiset of all recurrent weights | all per-neuron in/out marginals + all relations |
+| `rowwise` | multiset + each neuron's **incoming** multiset (`recurrent_in` unchanged) | outgoing marginal + all relations |
+| `columnwise` | multiset + each neuron's **outgoing** multiset (`recurrent_out` unchanged) | incoming marginal + all relations |
+
+The diagonal is preserved (re-zeroed when self-connections are disabled). Both the
+representation *and* the fingerprint are recomputed on the rewired network.
+
+### 10.2 Fingerprint reliability audit (`reliability_audit`)
+
+Reports and checks: halves **disjoint** and **cover** the evaluated samples; split
+**class-stratified**; split is the held-out **probe** (not `train`, not the test
+set); both halves use the **same distance metric**; feature names aligned; the
+ceiling is the **Spearman–Brown corrected full-length** reliability
+``2r/(1+r)`` with attenuation ``sqrt(full)`` (the more conservative half-length
+attenuation ``sqrt(r)`` is also reported). If the two halves disagree on the
+metric the call raises instead of silently mixing metrics.
+
+### 10.3 Leakage finding (IMPORTANT)
+
+The audit found that the split used for the fingerprint was, for the **legacy**
+checkpoint, the model-selection split:
+
+- `checkpoints/baseline.pt` (n_bins = 500) was trained with the old **2-way** split:
+  model selection on `held_out_speakers = [6, 8]` (`select_by: val_accuracy`).
+  `configs/analysis.yaml` sets `fingerprint.eval_split: probe`, and the 3-way split
+  assigns the first held-out speakers to `probe` = `[6, 8]`. **So the fingerprint
+  was measured on exactly the speakers used to select that checkpoint** — a mild
+  adaptive-overfitting loop.
+- `checkpoints/baseline_v2.pt` (n_bins = 700) was trained with the corrected
+  **3-way** split: `dev = [2]` (model selection, `select_by: dev_accuracy`),
+  `probe = [6, 8]` (locked, independent of model selection).
+
+A guard (`fingerprint_split_leakage_guard`) now compares the checkpoint's recorded
+model-selection speakers with the fingerprint split's speakers and flags overlap.
+**The authoritative stress-test artifact is therefore `baseline_v2`**
+(`--override run.tag=baseline_v2 --override model.n_bins=700`); results computed on
+the legacy `baseline.pt` are not independent of model selection.

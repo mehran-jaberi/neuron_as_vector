@@ -377,51 +377,234 @@ class FingerprintSpace:
 # --------------------------------------------------------------------------
 # Reliability / noise ceiling
 # --------------------------------------------------------------------------
+def _aligned_raw(
+    fingerprints_a: "FingerprintSpace",
+    fingerprints_b: "FingerprintSpace",
+) -> tuple[np.ndarray, np.ndarray, list[str], bool]:
+    """Align two half-fingerprints by feature name (they should already match)."""
+    names_a = list(fingerprints_a.feature_names)
+    names_b = list(fingerprints_b.feature_names)
+    aligned = names_a == names_b
+    if aligned:
+        return fingerprints_a.X_raw, fingerprints_b.X_raw, names_a, True
+    common = [n for n in names_a if n in set(names_b)]
+    if not common:
+        raise ValueError("The two half-fingerprints share no feature names")
+    ia = [names_a.index(n) for n in common]
+    ib = [names_b.index(n) for n in common]
+    return fingerprints_a.X_raw[:, ia], fingerprints_b.X_raw[:, ib], common, False
+
+
 def split_half_reliability(
-    fingerprints_a: FingerprintSpace,
-    fingerprints_b: FingerprintSpace,
+    fingerprints_a: "FingerprintSpace",
+    fingerprints_b: "FingerprintSpace",
+    *,
+    common_standardizer: Any | None = None,
+    metric: str | None = None,
 ) -> dict[str, Any]:
-    """Estimate the noise ceiling of the fingerprint.
+    """Estimate the noise ceiling of the fingerprint from two independent halves.
 
-    Two independent halves of the held-out data each yield a fingerprint. If the
-    fingerprints themselves are unreliable, no representation could ever predict
-    them, so we report
+    Audit-critical properties (all reported explicitly so they can be checked):
 
-    * ``matrix_reliability``: Spearman correlation between the two fingerprint
-      distance matrices (the Mantel reliability of the target),
-    * ``vector_reliability``: mean per-neuron Pearson correlation between the two
-      fingerprint vectors,
-    * ``attenuation_factor``: ``sqrt(matrix_reliability)``, used to correct an
-      observed representation->fingerprint correlation for target noise
-      (:math:`r_{true} \\approx r_{obs} / \\sqrt{r_{ceiling}}`).
+    * the two halves are separate measurements of the *same neurons* (they must
+      contain the same number of neurons and the same feature names);
+    * both halves are reduced to distances with the **same metric** - if the two
+      spaces disagree, the call raises rather than silently mixing metrics;
+    * optionally a **common** :class:`~src.utils.Standardizer` is used so that the
+      two halves are scaled identically (otherwise each half standardises itself,
+      which conflates measurement noise with scaling differences);
+    * the reported ceiling is the **Spearman-Brown corrected full-length**
+      reliability ``2r / (1 + r)`` of the half-half distance correlation, and the
+      attenuation factor is ``sqrt(full)``. The half-length attenuation
+      ``sqrt(r_half)`` is reported separately and is more conservative.
 
-    This is a *diagnostic*, not a result: it bounds how strong a correlation can
-    possibly be.
+    This is a *diagnostic*, not a result: it bounds how strong a
+    representation-function correlation can possibly be.
     """
+    from scipy.spatial.distance import pdist
     from scipy.stats import pearsonr, spearmanr
 
-    da = fingerprints_a.condensed()
-    db = fingerprints_b.condensed()
-    matrix_r = float(spearmanr(da, db).statistic) if da.size > 2 else float("nan")
+    if fingerprints_a.n_neurons != fingerprints_b.n_neurons:
+        raise ValueError(
+            "The two half-fingerprints must describe the same neurons; got "
+            f"{fingerprints_a.n_neurons} and {fingerprints_b.n_neurons}"
+        )
 
-    a = fingerprints_a.X_raw
-    b = fingerprints_b.X_raw
+    metric_a = fingerprints_a.config.metric
+    metric_b = fingerprints_b.config.metric
+    metrics_match = metric_a == metric_b
+    if metric is None:
+        if not metrics_match:
+            raise ValueError(
+                f"Half-fingerprints use different metrics ({metric_a!r} vs {metric_b!r}); "
+                "pass an explicit `metric` to override."
+            )
+        metric = metric_a
+
+    warnings: list[str] = []
+    if not metrics_match:
+        warnings.append(
+            f"half fingerprints used different metrics ({metric_a!r} vs {metric_b!r}); "
+            f"reliability was computed with the explicit metric {metric!r}"
+        )
+
+    raw_a, raw_b, names, aligned = _aligned_raw(fingerprints_a, fingerprints_b)
+    if not aligned:
+        warnings.append("half-fingerprint feature names differed; aligned on the intersection")
+
+    def _prepare(raw: np.ndarray) -> np.ndarray:
+        if common_standardizer is None:
+            return raw
+        return sanitize_features(common_standardizer.transform(raw))
+
+    Za = _prepare(raw_a)
+    Zb = _prepare(raw_b)
+    da = pdist(Za, metric=metric) if Za.shape[0] > 1 else np.zeros(0)
+    db = pdist(Zb, metric=metric) if Zb.shape[0] > 1 else np.zeros(0)
+    matrix_r = float(spearmanr(da, db).statistic) if da.size > 2 and da.std() > 1e-12 and db.std() > 1e-12 else float("nan")
+
     per_neuron: list[float] = []
-    for i in range(a.shape[0]):
-        va, vb = a[i], b[i]
+    for i in range(Za.shape[0]):
+        va, vb = Za[i], Zb[i]
         if np.std(va) < 1e-12 or np.std(vb) < 1e-12:
             continue
-        per_neuron.append(float(pearsonr(va, vb).statistic))
+        r = float(pearsonr(va, vb).statistic)
+        if np.isfinite(r):
+            per_neuron.append(r)
     vector_r = float(np.mean(per_neuron)) if per_neuron else float("nan")
-    ceiling = max(matrix_r, 0.0)
+
+    if np.isfinite(matrix_r):
+        r_clipped = float(np.clip(matrix_r, -0.999999, 0.999999))
+        full_r = 2.0 * r_clipped / (1.0 + r_clipped)
+    else:
+        full_r = float("nan")
+        warnings.append("matrix reliability is not finite; ceiling is undefined")
+
+    ceiling_full = max(full_r, 0.0) if np.isfinite(full_r) else float("nan")
+    ceiling_half = max(matrix_r, 0.0) if np.isfinite(matrix_r) else float("nan")
     return {
+        "metric": metric,
+        "metrics_match": bool(metrics_match),
+        "common_standardizer_used": bool(common_standardizer is not None),
+        "feature_names_aligned": bool(aligned),
+        "n_features": len(names),
+        "n_pairs": int(da.size),
+        # half-length distance correlation between the two independent halves
         "matrix_reliability_spearman": matrix_r,
+        # Spearman-Brown correction to the full-length measurement
+        "matrix_reliability_full_spearman_brown": full_r,
+        # per-neuron fingerprint vector reproducibility (Pearson, scale-invariant)
         "vector_reliability_pearson": vector_r,
         "n_neurons_with_variance": len(per_neuron),
-        "attenuation_factor_sqrt_ceiling": float(np.sqrt(ceiling)),
+        # attenuation factors: the full-length one is the correct ceiling divisor
+        "attenuation_factor_sqrt_ceiling": float(np.sqrt(ceiling_full)) if np.isfinite(ceiling_full) else float("nan"),
+        "attenuation_factor_half_length": float(np.sqrt(ceiling_half)) if np.isfinite(ceiling_half) else float("nan"),
+        "warnings": warnings,
         "interpretation": (
-            "Upper bound on any achievable distance-distance correlation. Reported for "
-            "transparency; a low ceiling means the target itself is noisy."
+            "Upper bound on any achievable distance-distance correlation. "
+            "matrix_reliability_spearman is the split-half (shorter measurement) "
+            "correlation; matrix_reliability_full_spearman_brown = 2r/(1+r) is the "
+            "full-length noise ceiling and attenuation_factor_sqrt_ceiling = "
+            "sqrt(full) is the factor by which an observed correlation is attenuated."
+        ),
+    }
+
+
+# --------------------------------------------------------------------------
+# Reliability audit (independence, class balance, split, metric, leakage)
+# --------------------------------------------------------------------------
+def audit_split_halves(
+    labels: np.ndarray,
+    idx_a: np.ndarray,
+    idx_b: np.ndarray,
+    *,
+    n_classes: int | None = None,
+    split_name: str | None = None,
+) -> dict[str, Any]:
+    """Verify the split-half construction used for the noise ceiling.
+
+    Checks: disjointness, coverage of every evaluated sample, and class balance
+    between the two halves.
+    """
+    labels = np.asarray(labels, dtype=np.int64).reshape(-1)
+    a = np.asarray(idx_a, dtype=np.int64).reshape(-1)
+    b = np.asarray(idx_b, dtype=np.int64).reshape(-1)
+    set_a, set_b = set(a.tolist()), set(b.tolist())
+    all_idx = set(range(labels.size))
+    n_classes = int(n_classes if n_classes is not None else (labels.max() + 1 if labels.size else 0))
+
+    counts_full = np.bincount(labels, minlength=n_classes)[:n_classes] if labels.size else np.zeros(n_classes, dtype=int)
+    counts_a = np.bincount(labels[a], minlength=n_classes)[:n_classes] if a.size else np.zeros(n_classes, dtype=int)
+    counts_b = np.bincount(labels[b], minlength=n_classes)[:n_classes] if b.size else np.zeros(n_classes, dtype=int)
+    frac_a = counts_a / np.maximum(counts_full, 1)
+    frac_b = counts_b / np.maximum(counts_full, 1)
+    deviation = float(np.max(np.abs(frac_a - frac_b))) if n_classes else float("nan")
+    min_class = int(counts_full.min()) if counts_full.size else 0
+    tol = (1.0 / min_class + 1e-9) if min_class > 0 else 1.0
+    return {
+        "split_name": split_name,
+        "n_samples_total": int(labels.size),
+        "n_half_a": int(a.size),
+        "n_half_b": int(b.size),
+        "halves_disjoint": bool(len(set_a & set_b) == 0),
+        "n_overlap": int(len(set_a & set_b)),
+        "halves_cover_all_samples": bool((set_a | set_b) == all_idx),
+        "n_uncovered": int(len(all_idx - (set_a | set_b))),
+        "class_counts_total": counts_full.tolist(),
+        "class_counts_half_a": counts_a.tolist(),
+        "class_counts_half_b": counts_b.tolist(),
+        "max_class_fraction_deviation": deviation,
+        "class_stratified": bool(np.isfinite(deviation) and deviation <= tol),
+        "all_classes_present_in_both_halves": bool(counts_a.size > 0 and counts_b.size > 0
+                                                    and np.all(counts_a > 0) and np.all(counts_b > 0)),
+    }
+
+
+def reliability_audit(
+    *,
+    labels: np.ndarray,
+    idx_a: np.ndarray,
+    idx_b: np.ndarray,
+    half_a: "FingerprintSpace",
+    half_b: "FingerprintSpace",
+    full: "FingerprintSpace | None" = None,
+    split_name: str | None = None,
+    n_classes: int | None = None,
+    common_standardizer: Any | None = None,
+) -> dict[str, Any]:
+    """Full audit of the fingerprint reliability / noise-ceiling calculation.
+
+    Combines the split construction audit with the reliability estimate and records
+    the leakage-relevant provenance (which split was used, which metric, whether a
+    common standardiser was applied).
+    """
+    split = audit_split_halves(labels, idx_a, idx_b, n_classes=n_classes, split_name=split_name)
+    rel = split_half_reliability(half_a, half_b, common_standardizer=common_standardizer)
+    held_out = split_name is None or str(split_name).lower() in ("probe", "dev", "val", "test")
+    checks = {
+        "halves_disjoint": split["halves_disjoint"],
+        "halves_cover_all_samples": split["halves_cover_all_samples"],
+        "class_stratified": split["class_stratified"],
+        "split_is_held_out": bool(held_out),
+        "split_is_not_train": str(split_name).lower() != "train",
+        "same_distance_metric": rel["metrics_match"],
+        "feature_names_aligned": rel["feature_names_aligned"],
+        "fingerprint_uses_labels_by_design": bool(
+            getattr(half_a, "meta", {}).get("uses_labels", True)
+        ),
+    }
+    return {
+        "split": split,
+        "reliability": rel,
+        "checks": checks,
+        "passed": bool(all(checks.values())),
+        "full_fingerprint_n_features": (len(full.feature_names) if full is not None else None),
+        "split_name": split_name,
+        "note": (
+            "The reliability target is measured on a held-out split; the two halves "
+            "are disjoint and class-stratified; both halves are reduced with the same "
+            "distance metric; the ceiling is the Spearman-Brown corrected full-length "
+            "reliability. This is a diagnostic, not evidence for the hypothesis."
         ),
     }
 
