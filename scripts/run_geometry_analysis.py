@@ -136,6 +136,9 @@ def main(argv: list[str] | None = None) -> int:
 
     weighting = str(cfg.get_path("representations.weighting", "equal"))
     normalize_rows = bool(cfg.get_path("representations.normalize_rows", False))
+    block_weights = cfg.get_path("representations.block_weights", None)
+    block_weights = {str(k): float(v) for k, v in block_weights.items()} if block_weights else None
+    include_tonotopic_features = bool(cfg.get_path("representations.include_tonotopic_features", False))
     primary_blocks = [str(b) for b in cfg.get_path(
         "representations.primary_blocks",
         ["intrinsic", "input_conn", "recurrent_in", "recurrent_out"],
@@ -156,8 +159,10 @@ def main(argv: list[str] | None = None) -> int:
         model, ref_rec, ref_idx,
         device=device, n_classes=n_classes, batch_size=batch_size,
         weighting=weighting, normalize_rows=normalize_rows,
+        block_weights=block_weights,
         include_activity_in_primary="activity" in primary_blocks,
         primary_blocks=primary_blocks,
+        include_tonotopic_features=include_tonotopic_features,
     )
     structural = bundle["structural"]
     activity = bundle["activity"]
@@ -193,7 +198,7 @@ def main(argv: list[str] | None = None) -> int:
         default_variants(), structural, fingerprint,
         activity_reps=activity,
         n_perm=n_perm, k_values=k_values, seed=seed,
-        weighting=weighting, normalize_rows=normalize_rows,
+        weighting=weighting, normalize_rows=normalize_rows, block_weights=block_weights,
         nuisance_condensed=nuisance, n_random_repeats=random_repeats,
     )
     rows = suite["rows"]

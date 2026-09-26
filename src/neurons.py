@@ -4,18 +4,51 @@ This is the central object of the project. A :class:`NeuronRepresentation`
 stores, for one hidden neuron, several named *feature blocks*, each of which is a
 dict of interpretable scalar summaries:
 
-===============  =========================================================
-block            content
-===============  =========================================================
-``intrinsic``    membrane time constant, threshold, reset, per-neuron bias
-``input_conn``   compact statistics of the 700-dim input weight vector
-``recurrent_in`` statistics of the incoming recurrent weight column
-``recurrent_out``statistics of the outgoing recurrent weight row
-``activity``     label-free firing statistics measured on training data
-===============  =========================================================
+=================  =======================================================
+block              content
+=================  =======================================================
+``intrinsic``      per-neuron parameters actually *learned* for the neuron
+``input_conn``     compact statistics of the input weight vector
+``recurrent_in``   statistics of the incoming recurrent weights (a **row**)
+``recurrent_out``  statistics of the outgoing recurrent weights (a **column**)
+``activity``       label-free firing statistics measured on a reference split
+=================  =======================================================
 
-Nothing in this module is allowed to use class labels, the official test set, or
-the neuron's array index. Blocks are selected by name so that any subset can be
+Weight orientation (see :mod:`src.model`)
+-----------------------------------------
+``w_rec[i, j]`` is the weight **from neuron j to neuron i** (``forward`` computes
+``s_prev @ w_rec.t()``). Therefore *row* ``i`` holds the weights **onto** neuron
+*i* (incoming) and *column* ``j`` holds the weights **from** neuron *j*
+(outgoing). The ``recurrent_in`` / ``recurrent_out`` blocks follow this
+convention explicitly.
+
+Generic learned bias vs. genuine dynamical parameters
+-----------------------------------------------------
+Block ``intrinsic`` distinguishes two very different things by feature name and
+by metadata:
+
+* :data:`DYNAMICAL_FEATURE_NAMES` -- per-neuron *dynamical* parameters that the
+  architecture genuinely learns per neuron (e.g. a per-neuron membrane time
+  constant in ``bias_tau`` mode). These may legitimately be called intrinsic
+  dynamical parameters.
+* :data:`GENERIC_LEARNED_FEATURE_NAMES` -- generic learned additive terms (a
+  per-neuron ``learned_bias``). These are **not** biophysical parameters and are
+  never described as such. Shared constants (threshold, reset, the base membrane
+  time constant when it is not learned per neuron) are *not* emitted as features
+  at all, because a constant carries zero neuron-specific information.
+
+Input-channel ordering
+----------------------
+By default the ``input_conn`` block contains only features that are invariant to
+an arbitrary permutation of the input channels. The tonotopic "centre of mass"
+and "spread" (which *require* a known channel ordering) are **not** part of the
+default/primary representation: nothing in the local documentation or in the SHD
+HDF5 files establishes a channel ordering, so assuming one would be an
+unsupported assumption. They are available only behind the explicit
+``include_tonotopic=True`` opt-in and are listed in :data:`TONOTOPIC_FEATURE_NAMES`.
+
+Nothing in this module uses class labels, the official test set, or the neuron's
+array index as a feature. Blocks are selected by name so that any subset can be
 used, which is what makes the ablation analysis in :mod:`src.controls` possible.
 
 ``to_vector()`` concatenates the requested blocks in a fixed, reproducible order
@@ -33,6 +66,35 @@ from typing import Any, Iterable, Mapping, Sequence
 import numpy as np
 
 from .utils import sanitize_features
+
+# --------------------------------------------------------------------------
+# Feature semantics (audit-friendly, machine-readable)
+# --------------------------------------------------------------------------
+#: Generic learned additive terms. A per-neuron bias changes the neuron's
+#: excitability but is *not* a biophysical parameter; it must never be reported
+#: as "intrinsic biophysics".
+GENERIC_LEARNED_FEATURE_NAMES = frozenset({"intrinsic.learned_bias"})
+
+#: Genuine per-neuron *dynamical* parameters (present only when the architecture
+#: actually learns them per neuron, e.g. ``neuron_param_mode="bias_tau"``).
+DYNAMICAL_FEATURE_NAMES = frozenset({"intrinsic.tau_mem_ms"})
+
+#: Features that assume a known (tonotopic) ordering of the input channels. They
+#: are excluded from the default/primary representation because a channel
+#: ordering cannot be established from the local documentation or the SHD files.
+TONOTOPIC_FEATURE_NAMES = frozenset({"input_conn.channel_com", "input_conn.channel_spread"})
+
+
+def classify_feature(qualified_name: str) -> str:
+    """Return ``"generic_learned"``, ``"dynamical"``, ``"tonotopic"`` or ``"other"``."""
+    if qualified_name in GENERIC_LEARNED_FEATURE_NAMES:
+        return "generic_learned"
+    if qualified_name in DYNAMICAL_FEATURE_NAMES:
+        return "dynamical"
+    if qualified_name in TONOTOPIC_FEATURE_NAMES:
+        return "tonotopic"
+    return "other"
+
 
 # --------------------------------------------------------------------------
 # Block registry
@@ -121,6 +183,32 @@ class NeuronRepresentation:
     @property
     def activity_features(self) -> dict[str, float]:
         return self.features.get(FeatureBlock.ACTIVITY.value, {})
+
+    def generic_learned_features(self) -> dict[str, float]:
+        """Generic learned additive terms (e.g. ``intrinsic.learned_bias``).
+
+        Kept separate from :meth:`dynamical_features` so a learned excitability
+        offset is never confused with a genuine biophysical parameter.
+        """
+        out: dict[str, float] = {}
+        for block, feats in self.features.items():
+            for name, value in feats.items():
+                if f"{block}.{name}" in GENERIC_LEARNED_FEATURE_NAMES:
+                    out[f"{block}.{name}"] = float(value)
+        return out
+
+    def dynamical_features(self) -> dict[str, float]:
+        """Genuine per-neuron dynamical parameters (may be empty)."""
+        out: dict[str, float] = {}
+        for block, feats in self.features.items():
+            for name, value in feats.items():
+                if f"{block}.{name}" in DYNAMICAL_FEATURE_NAMES:
+                    out[f"{block}.{name}"] = float(value)
+        return out
+
+    def feature_kinds(self) -> dict[str, str]:
+        """Map every qualified feature name to its :func:`classify_feature` kind."""
+        return {f"{b}.{n}": classify_feature(f"{b}.{n}") for b, f in self.features.items() for n in f}
 
     # -- vectorisation ------------------------------------------------------
     def available_blocks(self) -> list[str]:
@@ -310,45 +398,65 @@ def _vector_stats(w: np.ndarray) -> dict[str, float]:
     }
 
 
-def input_connectivity_features(w_in_column: np.ndarray) -> dict[str, float]:
+def input_connectivity_features(
+    w_in_column: np.ndarray,
+    *,
+    include_tonotopic: bool = False,
+) -> dict[str, float]:
     """Compact description of one neuron's input weight vector.
 
-    The 700-dimensional weight vector is indexed by SHD channel. Following the
-    dataset documentation, channels are ordered along the cochlea (channel 0 is
-    the lowest frequency), so the (normalised) weighted centre of mass and spread
-    are meaningful tonotopic summaries. This assumption is documented in the
-    README; if the channel order were arbitrary these two features would be
-    meaningless, while all other features would remain valid.
+    All features returned by default are *permutation invariant* with respect to
+    the ordering of the input channels: they are symmetric functions of the
+    multiset of input weights (norms, sparsity, sign balance, ...). Nothing here
+    depends on the channel index.
+
+    ``include_tonotopic`` (default ``False``)
+        When ``True`` two ordering-dependent features are added:
+        ``channel_com`` (normalised weighted centre of mass over the channel
+        index) and ``channel_spread``. These are meaningful **only if** channel
+        index increases monotonically with cochlear characteristic frequency.
+        That ordering is *not* established by the local documentation or by the
+        SHD HDF5 files (which contain no channel metadata), so these features are
+        deliberately excluded from the primary representation and are opt-in only.
+        See :data:`TONOTOPIC_FEATURE_NAMES`.
     """
     w = np.asarray(w_in_column, dtype=np.float64).ravel()
     feats = _vector_stats(w)
     feats.update(_concentration_stats(w))
-    n = w.size
-    a = np.abs(w)
-    total = float(a.sum())
-    if n > 1 and total > 0:
-        axis = np.arange(n, dtype=np.float64) / (n - 1)  # normalised tonotopic position
-        p = a / total
-        com = float((p * axis).sum())
-        spread = float(np.sqrt(max(((p * (axis - com) ** 2).sum()), 0.0)))
-    else:
-        com, spread = 0.0, 0.0
-    feats["channel_com"] = com
-    feats["channel_spread"] = spread
+    if include_tonotopic:
+        n = w.size
+        a = np.abs(w)
+        total = float(a.sum())
+        if n > 1 and total > 0:
+            axis = np.arange(n, dtype=np.float64) / (n - 1)  # assumed tonotopic position
+            p = a / total
+            com = float((p * axis).sum())
+            spread = float(np.sqrt(max(((p * (axis - com) ** 2).sum()), 0.0)))
+        else:
+            com, spread = 0.0, 0.0
+        feats["channel_com"] = com
+        feats["channel_spread"] = spread
     return feats
 
 
-def recurrent_incoming_features(w_rec_column: np.ndarray) -> dict[str, float]:
-    """Statistics of the weights *onto* a neuron (a column of ``W_rec``)."""
-    feats = _vector_stats(w_rec_column)
-    feats.update(_concentration_stats(w_rec_column))
-    return feats
+def recurrent_incoming_features(w_rec_row: np.ndarray) -> dict[str, float]:
+    """Statistics of the weights *onto* a neuron.
 
-
-def recurrent_outgoing_features(w_rec_row: np.ndarray) -> dict[str, float]:
-    """Statistics of the weights *from* a neuron (a row of ``W_rec``)."""
+    ``w_rec[i, j]`` is the weight from ``j`` to ``i`` (see :mod:`src.model`), so
+    the weights **onto** neuron ``j`` are the **row** ``w_rec[j, :]``.
+    """
     feats = _vector_stats(w_rec_row)
     feats.update(_concentration_stats(w_rec_row))
+    return feats
+
+
+def recurrent_outgoing_features(w_rec_column: np.ndarray) -> dict[str, float]:
+    """Statistics of the weights *from* a neuron.
+
+    The weights **from** neuron ``j`` are the **column** ``w_rec[:, j]``.
+    """
+    feats = _vector_stats(w_rec_column)
+    feats.update(_concentration_stats(w_rec_column))
     return feats
 
 
@@ -384,59 +492,143 @@ def recurrent_relationship_features(w_rec: np.ndarray, neuron_id: int) -> dict[s
     ``in_out_cosine``
         cosine similarity between incoming and outgoing weight vectors.
     """
-    col = np.asarray(w_rec[:, neuron_id], dtype=np.float64)
-    row = np.asarray(w_rec[neuron_id, :], dtype=np.float64)
-    l2_in = float(np.sqrt((col**2).sum()))
-    l2_out = float(np.sqrt((row**2).sum()))
+    incoming = np.asarray(w_rec[neuron_id, :], dtype=np.float64)  # weights onto this neuron
+    outgoing = np.asarray(w_rec[:, neuron_id], dtype=np.float64)  # weights from this neuron
+    l2_in = float(np.sqrt((incoming**2).sum()))
+    l2_out = float(np.sqrt((outgoing**2).sum()))
     denom = l2_in + l2_out
-    cosine = float((col * row).sum() / (l2_in * l2_out)) if l2_in > 0 and l2_out > 0 else 0.0
+    cosine = float((incoming * outgoing).sum() / (l2_in * l2_out)) if l2_in > 0 and l2_out > 0 else 0.0
     return {
         "self_connection": float(w_rec[neuron_id, neuron_id]),
-        "in_out_correlation": _safe_corr(col, row),
+        "in_out_correlation": _safe_corr(incoming, outgoing),
         "in_out_cosine": cosine,
         "in_out_asymmetry": float((l2_in - l2_out) / denom) if denom > 0 else 0.0,
-        "reciprocal_strength": float(np.mean(np.abs(col) * np.abs(row))) if col.size else 0.0,
+        "reciprocal_strength": float(np.mean(np.abs(incoming) * np.abs(outgoing))) if incoming.size else 0.0,
     }
 
 
-def intrinsic_features_from_model(model: Any, neuron_ids: Sequence[int] | None = None) -> dict[str, np.ndarray]:
-    """Per-neuron intrinsic parameters gathered from a model.
+def _varies(values: np.ndarray, rtol: float = 1e-9) -> bool:
+    """True if ``values`` actually differ across neurons (not a shared constant)."""
+    v = np.asarray(values, dtype=np.float64).ravel()
+    if v.size < 2:
+        return False
+    ptp = float(np.ptp(v))
+    if ptp == 0.0:
+        return False
+    return ptp > rtol * (float(np.abs(v).mean()) + rtol)
 
-    If ``neuron_param_mode`` is ``"none"`` every neuron shares the same threshold,
-    time constant and reset. The block is still returned and still usable, but it
-    is *constant* and therefore flagged as non-informative by the standardiser and
-    reported as such - that is an honest result, not a bug.
+
+def intrinsic_features_from_model(model: Any, neuron_ids: Sequence[int] | None = None) -> dict[str, np.ndarray]:
+    """Per-neuron parameters that the architecture *actually learns per neuron*.
+
+    Only parameters that genuinely differ across neurons are emitted. Shared
+    constants are omitted on purpose: the threshold, the base membrane time
+    constant and the reset value are identical for every neuron (unless a
+    per-neuron parameterisation is used), so including them would add
+    zero-information columns that the standardiser would discard anyway.
+
+    Two kinds of parameter are handled explicitly and never conflated:
+
+    ``tau_mem_ms``
+        A genuine per-neuron *dynamical* parameter. It appears only when the
+        model learns a per-neuron time constant (``neuron_param_mode="bias_tau"``
+        *and* the learned offsets are non-degenerate). Listed in
+        :data:`DYNAMICAL_FEATURE_NAMES`.
+    ``learned_bias``
+        A generic learned per-neuron additive input (a learned excitability
+        offset). It is a legitimate learned *intrinsic* parameter but it is **not**
+        a biophysical parameter and is never described as one. Listed in
+        :data:`GENERIC_LEARNED_FEATURE_NAMES`.
+
+    An untrained network (all-zero bias / offsets) therefore contributes **no**
+    intrinsic features; a neuron-specific intrinsic representation only exists
+    once the parameter is actually learned to vary.
     """
     import torch
 
     cfg = model.cfg
     n = cfg.n_hidden
-    ids = np.arange(n) if neuron_ids is None else np.asarray(neuron_ids, dtype=np.int64)
+    ids = np.arange(n, dtype=np.int64) if neuron_ids is None else np.asarray(neuron_ids, dtype=np.int64)
     with torch.no_grad():
-        tau = model.alpha_tensor().detach().cpu().numpy()
-        # recover the effective time constant from alpha to keep units interpretable
-        tau_ms = -cfg.bin_ms / np.log(np.clip(tau, 1e-6, 1 - 1e-6))
-        thr = model.effective_threshold().detach().cpu().numpy()
-        bias = (
-            model.b_hid.detach().cpu().numpy()
-            if getattr(model, "b_hid", None) is not None
-            else np.zeros(n, dtype=np.float64)
-        )
-    reset = np.full(n, float(model.effective_reset), dtype=np.float64)
+        alpha = model.alpha_tensor().detach().cpu().numpy().astype(np.float64)
+        tau_ms_all = -cfg.bin_ms / np.log(np.clip(alpha, 1e-6, 1 - 1e-6))
+        b_hid = getattr(model, "b_hid", None)
+        bias_all = b_hid.detach().cpu().numpy().astype(np.float64) if b_hid is not None else None
+
+    feats: dict[str, np.ndarray] = {}
+    tau_ms = tau_ms_all[ids]
+    if _varies(tau_ms):
+        feats["tau_mem_ms"] = tau_ms
+    if bias_all is not None:
+        bias = bias_all[ids]
+        if _varies(bias):
+            feats["learned_bias"] = bias
+    return feats
+
+
+def intrinsic_feature_provenance(model: Any) -> dict[str, Any]:
+    """Explain, for a given model, which intrinsic parameters exist and why.
+
+    Useful for the audit/README report: it distinguishes genuine per-neuron
+    dynamical parameters, generic learned terms, and shared constants that are
+    deliberately not emitted as features.
+    """
+    import torch
+
+    cfg = model.cfg
+    n = cfg.n_hidden
+    with torch.no_grad():
+        alpha = model.alpha_tensor().detach().cpu().numpy().astype(np.float64)
+        tau_ms = -cfg.bin_ms / np.log(np.clip(alpha, 1e-6, 1 - 1e-6))
+        b_hid = getattr(model, "b_hid", None)
+        bias = b_hid.detach().cpu().numpy().astype(np.float64) if b_hid is not None else None
+    has_per_neuron_tau = getattr(model, "log_tau_offset", None) is not None
     return {
-        "tau_mem_ms": tau_ms[ids].astype(np.float64),
-        "threshold": thr[ids].astype(np.float64),
-        "reset": reset[ids],
-        "bias": bias[ids].astype(np.float64),
+        "neuron_param_mode": str(getattr(model, "neuron_param_mode", cfg.neuron_param_mode)),
+        "n_hidden": int(n),
+        "dynamical": {
+            "tau_mem_ms": {
+                "learned_per_neuron": bool(has_per_neuron_tau),
+                "varies_across_neurons": bool(_varies(tau_ms)),
+                "emitted": bool(has_per_neuron_tau and _varies(tau_ms)),
+                "note": "genuine per-neuron dynamical parameter" if has_per_neuron_tau else "base tau is shared",
+            }
+        },
+        "generic_learned": {
+            "learned_bias": {
+                "present": bool(bias is not None),
+                "varies_across_neurons": bool(_varies(bias)) if bias is not None else False,
+                "emitted": bool(bias is not None and _varies(bias)),
+                "note": "generic learned additive excitation; NOT a biophysical parameter",
+            }
+        },
+        "shared_constants_not_emitted": {
+            "threshold": float(model.effective_threshold().mean().item()),
+            "reset": float(model.effective_reset),
+            "base_tau_mem_ms": float(cfg.tau_mem_ms),
+        },
     }
 
 
-def extract_structural_representations(model: Any) -> NeuronRepresentationSet:
+
+def extract_structural_representations(
+    model: Any,
+    *,
+    include_tonotopic: bool = False,
+) -> NeuronRepresentationSet:
     """Build the data-free (structural) representation for every hidden neuron.
 
-    Uses only ``W_in``, ``W_rec`` and the neuron parameters. No dataset, no
-    labels, no forward pass. This is the representation that the primary
+    Uses only ``W_in``, ``W_rec`` and the (learned) neuron parameters. No dataset,
+    no labels, no forward pass. This is the representation that the primary
     hypothesis is tested with in the most conservative setting.
+
+    Orientation follows :mod:`src.model`: for neuron ``j`` the **incoming**
+    recurrent weights are the row ``w_rec[j, :]`` and the **outgoing** weights are
+    the column ``w_rec[:, j]``.
+
+    ``include_tonotopic`` (default ``False``) additionally enables the two
+    ordering-dependent input features; they are excluded from the primary
+    representation because no local evidence establishes the channel ordering.
     """
     import torch
 
@@ -445,16 +637,20 @@ def extract_structural_representations(model: Any) -> NeuronRepresentationSet:
         w_rec = model.w_rec.detach().cpu().numpy().astype(np.float64)  # (n_hidden, n_hidden)
     n_hidden = w_rec.shape[0]
     intrinsic = intrinsic_features_from_model(model)
+    use_intrinsic = len(intrinsic) > 0
 
     reps: list[NeuronRepresentation] = []
     for j in range(n_hidden):
-        feats = {
-            FeatureBlock.INTRINSIC.value: {k: float(v[j]) for k, v in intrinsic.items()},
-            FeatureBlock.INPUT_CONN.value: input_connectivity_features(w_in[:, j]),
-            FeatureBlock.RECURRENT_IN.value: recurrent_incoming_features(w_rec[:, j]),
-            FeatureBlock.RECURRENT_OUT.value: recurrent_outgoing_features(w_rec[j, :]),
-        }
-        feats[FeatureBlock.RECURRENT_IN.value].update(recurrent_relationship_features(w_rec, j))
+        feats: dict[str, dict[str, float]] = {}
+        if use_intrinsic:
+            feats[FeatureBlock.INTRINSIC.value] = {k: float(v[j]) for k, v in intrinsic.items()}
+        feats[FeatureBlock.INPUT_CONN.value] = input_connectivity_features(
+            w_in[:, j], include_tonotopic=include_tonotopic
+        )
+        rec_in = recurrent_incoming_features(w_rec[j, :])  # row = weights onto j
+        rec_in.update(recurrent_relationship_features(w_rec, j))
+        feats[FeatureBlock.RECURRENT_IN.value] = rec_in
+        feats[FeatureBlock.RECURRENT_OUT.value] = recurrent_outgoing_features(w_rec[:, j])  # col = from j
         reps.append(
             NeuronRepresentation(
                 neuron_id=j,
@@ -462,6 +658,7 @@ def extract_structural_representations(model: Any) -> NeuronRepresentationSet:
                 metadata={"source": "structure"},
             )
         )
+    blocks_present = [b for b in FeatureBlock.structural() if use_intrinsic or b != FeatureBlock.INTRINSIC.value]
     return NeuronRepresentationSet(
         reps,
         meta={
@@ -470,10 +667,18 @@ def extract_structural_representations(model: Any) -> NeuronRepresentationSet:
             "uses_data": False,
             "n_hidden": n_hidden,
             "n_input": int(w_in.shape[0]),
+            "blocks_present": blocks_present,
+            "intrinsic_block_present": bool(use_intrinsic),
+            "include_tonotopic_features": bool(include_tonotopic),
+            "generic_learned_features": sorted(GENERIC_LEARNED_FEATURE_NAMES)
+            if FeatureBlock.INTRINSIC.value in {f"{b}" for b in blocks_present}
+            else [],
+            "dynamical_features": sorted(DYNAMICAL_FEATURE_NAMES) if use_intrinsic else [],
             "note": (
-                "recurrent_in additionally carries incoming/outgoing relationship features "
-                "(self_connection, in_out_correlation, in_out_cosine, in_out_asymmetry, "
-                "reciprocal_strength)."
+                "recurrent_in = row w_rec[j,:] (weights onto j, includes incoming/outgoing "
+                "relationship features); recurrent_out = column w_rec[:,j] (weights from j). "
+                "`learned_bias` is a generic learned term, NOT a biophysical parameter. "
+                "Shared constants (threshold/reset/base tau) are not emitted."
             ),
         },
     )
@@ -512,10 +717,14 @@ def activity_features_from_psth(
     flagged in ``flags["silent_neuron"]`` so analyses can exclude or at least
     identify them.
 
-    Note: interspike-interval statistics are computed from the pooled per-neuron
-    spike-time histogram rather than from individual spike times. This is an
-    approximation (it assumes a renewal-like process) that keeps memory bounded;
-    it is documented in the README.
+    Audit note (see ``AUDIT_REPRESENTATION.md``): the earlier ``isi_cv`` /
+    ``burstiness`` / ``isi_mean_ms`` names were **mislabelled** - they were
+    computed from the pooled per-neuron spike-time histogram, not from
+    interspike intervals. ``spike_time_cv`` now states what it actually is (the
+    coefficient of variation of the *pooled spike times*, i.e. temporal
+    dispersion), and the exact duplicates ``mean_spike_count`` (= ``rate_hz`` up
+    to a constant) and ``burstiness`` (= a monotone transform of
+    ``spike_time_cv``) are no longer emitted.
     """
     psth = np.asarray(psth, dtype=np.float64)
     counts = np.asarray(counts, dtype=np.float64)
@@ -533,25 +742,21 @@ def activity_features_from_psth(
     with np.errstate(divide="ignore", invalid="ignore"):
         fano = np.where(mean_count > 0, counts.var(axis=0) / np.where(mean_count > 0, mean_count, 1.0), 0.0)
 
-    # -- ISI statistics from the pooled histogram ---------------------------
+    # -- temporal dispersion from the pooled histogram ----------------------
+    # NOTE: these describe the distribution of *spike times* (pooled over the
+    # reference split), NOT interspike intervals. The feature is named
+    # ``spike_time_cv`` accordingly.
     psth_sum = np.where(psth.sum(axis=1, keepdims=True) > 0, psth.sum(axis=1, keepdims=True), 1.0)
     p_time = psth / psth_sum
-    isi_mean, isi_cv, burstiness = np.zeros(n_hidden), np.zeros(n_hidden), np.zeros(n_hidden)
-    active_bins = (psth > 0).sum(axis=1).astype(np.float64)
+    spike_time_cv = np.zeros(n_hidden)
     for h in range(n_hidden):
         if total_spikes[h] <= 0:
             continue
-        # Approximate mean ISI from spike density: duration / #spike-events.
-        n_events = max(active_bins[h], 1.0)
-        isi_mean[h] = (duration_s * 1000.0) / n_events
-        # Second moment of the ISI distribution approximated from the histogram
-        # of activity times (exponential-like assumption for the CV).
         t_ms = np.arange(n_bins, dtype=np.float64) * bin_ms
         mean_t = float((p_time[h] * t_ms).sum())
         var_t = float((p_time[h] * (t_ms - mean_t) ** 2).sum())
         sd_t = float(np.sqrt(max(var_t, 0.0)))
-        isi_cv[h] = sd_t / mean_t if mean_t > 0 else 0.0
-        burstiness[h] = (isi_cv[h] - 1.0) / (isi_cv[h] + 1.0) if isi_cv[h] > 0 else 0.0
+        spike_time_cv[h] = sd_t / mean_t if mean_t > 0 else 0.0
 
     # -- temporal summaries from the pooled PSTH ---------------------------
     t_ms = np.arange(n_bins, dtype=np.float64) * bin_ms
@@ -576,11 +781,8 @@ def activity_features_from_psth(
         "rate_hz": mean_rate,
         "rate_std_hz": std_rate,
         "silent_fraction": silent_fraction,
-        "mean_spike_count": mean_count,
         "fano_factor": fano,
-        "isi_mean_ms": isi_mean,
-        "isi_cv": isi_cv,
-        "burstiness": burstiness,
+        "spike_time_cv": spike_time_cv,
         # First-spike latency is computed elsewhere (per-sample) and merged in by
         # the accumulator; default here is the censored maximum.
         "temporal_center_ms": temporal_center,
@@ -620,7 +822,6 @@ def add_first_spike_features(
     latency[has] = observed_mean[has]
     features = dict(features)
     features["first_spike_latency_ms"] = latency
-    features["first_spike_latency_norm"] = latency / max(duration_ms, 1e-9)
     return features
 
 

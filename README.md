@@ -135,28 +135,80 @@ removal.
 ## 4. Neuron representation (label-free — the object under study)
 
 For each hidden neuron we assemble a feature vector from **structured blocks**.
-By default the *primary* representation uses the four structural blocks; the
-label-free activity block is included when `include_activity_in_primary` is set.
+The default *primary* representation uses the four structural blocks; the
+label-free `activity` block is added when `activity` is listed in
+`representations.primary_blocks`.
 
-| Block           | Name (`FeatureBlock`) | Content |
-| --------------- | --------------------- | ------- |
-| **Intrinsic**   | `intrinsic`           | per-neuron parameters (bias / learned $\tau$), threshold, reset mode, … |
-| **Input conn.** | `input_conn`          | statistics of $W_{in}[\cdot, i]$: norm, sparsity, **cochlear-weighted centre of mass**, spread, sign balance |
-| **Recurrent in**| `recurrent_in`        | in-degree/strength statistics of columns of $W_{rec}$ |
-| **Recurrent out**| `recurrent_out`      | out-degree/strength statistics of rows of $W_{rec}$ |
-| **Activity**    | `activity`            | **label-free** PSTH + first-spike statistics on a reference split |
+| Block | Name (`FeatureBlock`) | Content |
+| ----- | --------------------- | ------- |
+| **Intrinsic** | `intrinsic` | per-neuron parameters the architecture actually learns per neuron |
+| **Input conn.** | `input_conn` | channel-permutation-invariant statistics of $W_{in}[\cdot, i]$ |
+| **Recurrent in** | `recurrent_in` | statistics of the incoming weights *onto* $i$ (**row** $W_{rec}[i, :]$) + in/out relationship features |
+| **Recurrent out** | `recurrent_out` | statistics of the outgoing weights *from* $i$ (**column** $W_{rec}[:, i]$) |
+| **Activity** | `activity` | **label-free** PSTH + first-spike statistics on a reference split |
 
 Each block is z-scored and concatenated; block-level **weighting** (`equal` per
-block vs `uniform` per feature) and optional row normalisation are configurable
+block, `uniform` per feature, or `custom` with explicit `block_weights`) and
+optional row normalisation are configurable
 (`configs/analysis.yaml → representations`). The result is exposed as a
-`RepresentationSpace` (`src/representations.py`) with pairwise distances.
+`RepresentationSpace` (`src/representations.py`) with pairwise distances and full
+feature provenance. A detailed, feature-by-feature audit is in
+[`AUDIT_REPRESENTATION.md`](AUDIT_REPRESENTATION.md).
 
-> **Assumption (documented):** for the input-connectivity "weighted centre of
-> mass across the 700 channels" we assume the natural cochlear/channel ordering
-> $0 \dots 699$ provided by SHD (channel index increases with characteristic
-> frequency). If that ordering were permuted, only the centre-of-mass and spread
-> features would be affected; all norm/sparsity/sign features are permutation
-> invariant.
+### 4.1 Generic learned bias vs. genuine dynamical parameters
+
+The `intrinsic` block is *only* populated by parameters that genuinely vary across
+neurons. Two kinds are kept strictly apart:
+
+- **`learned_bias`** — a generic learned per-neuron additive input (an excitability
+  offset). It is a learned parameter but it is **not** a biophysical parameter and
+  is never described as one (`GENERIC_LEARNED_FEATURE_NAMES`).
+- **`tau_mem_ms`** — a genuine per-neuron *dynamical* parameter, emitted only when
+  the model learns it per neuron (`neuron_param_mode="bias_tau"`;
+  `DYNAMICAL_FEATURE_NAMES`).
+
+Shared constants (threshold, reset, the base membrane time constant when it is not
+learned per neuron) are **not** emitted, because a constant carries no per-neuron
+information. In the default `bias` architecture there are therefore **no genuine
+per-neuron dynamical parameters**: the `intrinsic` block contains exactly one
+informative feature, `learned_bias`. An untrained network (all-zero bias) has an
+empty `intrinsic` block, which is reported honestly. Ablation variants
+`excitability_only` (learned bias) and `dynamical_only` (genuine dynamics) make the
+distinction measurable.
+
+### 4.2 Input-channel ordering (tonotopic features removed)
+
+The input-connectivity features are **all invariant to a permutation of the 700
+input channels**. The former "cochlear-weighted centre of mass" and "spread"
+features are ordering-dependent: they are meaningful only if channel index
+increases monotonically with characteristic frequency. That ordering cannot be
+established from the local documentation or from the SHD HDF5 files (which carry
+no channel metadata — verified), so **they are not part of the primary
+representation**. They remain available behind the explicit opt-in
+`representations.include_tonotopic_features: true` and are listed in
+`TONOTOPIC_FEATURE_NAMES`.
+
+### 4.3 Permutation invariance
+
+The representation is explicitly tested for invariance to the arbitrary hidden-neuron
+ordering (`src/permutation.py`): the hidden units are randomly relabelled, **all**
+corresponding parameters (`W_in` columns, `W_rec` rows *and* columns, `W_out` rows,
+per-neuron parameters) are permuted consistently, the permuted network is checked to
+be functionally identical, and the representations are recomputed. Any feature that
+changes is reported as permutation-sensitive. A deliberately index-based control
+representation demonstrates that the detector fires. The structural representation
+**passes** the test. The check also runs automatically during
+`scripts/extract_representations.py` and is written to
+`results/<tag>_permutation_invariance.json`.
+
+### 4.4 Dimensionality (trained baseline, 256 neurons)
+
+- Primary (structural) representation: **48** = `intrinsic` 1 (`learned_bias`) +
+  `input_conn` 14 + `recurrent_in` 19 + `recurrent_out` 14.
+- Activity block: **12**.
+- `structural + activity`: **60**.
+
+See `AUDIT_REPRESENTATION.md` §7 for the exact feature list.
 
 ---
 
@@ -198,6 +250,17 @@ LIF hidden neurons, 20 training epochs on the official SHD training split,
 speaker-aware validation split, seed 0) plus a **three-seed robustness study**.
 All numbers are produced by the scripts in §14–§15 and are stored under
 `results/` and `figures/`; nothing here is hand-entered.
+
+> **Representation revision (2026-09-26).** The numbers in §7.2–§7.6 were produced
+> with the *pre-audit* representation (v1). Following the feature audit
+> ([`AUDIT_REPRESENTATION.md`](AUDIT_REPRESENTATION.md)) the representation was
+> corrected: the tonotopic centre-of-mass features were removed from the primary
+> representation, the recurrent in/out orientation was fixed, the learned bias was
+> renamed `learned_bias` and separated from genuine dynamical parameters, and
+> duplicate/mislabelled activity features were dropped. The primary
+> representation is now 48-dimensional (§4.4). The quantitative values below are
+> therefore a record of v1 and are expected to change on re-running the pipeline;
+> they are retained for provenance, not as a claim about the current code.
 
 > **Headline.** Hidden neurons occupy a structured, *label-free* space built only
 > from the network's own parameters (`structural` representation:
@@ -437,6 +500,7 @@ neuron_as_vector/
 │   ├── model.py             # recurrent LIF SNN
 │   ├── neurons.py           # per-neuron feature blocks
 │   ├── representations.py   # RepresentationSpace (the object under study)
+│   ├── permutation.py       # hidden-neuron permutation-invariance test
 │   ├── functional_fingerprint.py
 │   ├── geometry_analysis.py # Mantel / kNN analysis
 │   ├── controls.py          # null controls, ablations, reliability
@@ -635,8 +699,11 @@ uv sync --all-groups
 - **Documented assumptions.**
   1. The spec's `neuron_representation.py` is implemented as
      `src/representations.py`.
-  2. Cochlear channel ordering $0\dots699$ is assumed for centre-of-mass features
-     (§4).
+  2. **No channel ordering is assumed.** The input-connectivity features are all
+     invariant to a permutation of the 700 channels. The tonotopic centre-of-mass
+     and spread features are excluded from the primary representation because no
+     local documentation or data establishes the channel ordering; they are
+     opt-in only (`representations.include_tonotopic_features`, §4.2).
   3. Validation uses a **speaker-aware** split by default, with a stratified
      random fallback (§2).
   4. Default config values live in `configs/baseline.yaml` and

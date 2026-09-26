@@ -14,12 +14,14 @@ configurable:
    fractions, entropies). Without z-scoring, the norms would dominate every
    distance. Columns with zero variance are mapped to a constant ``0`` and
    reported as non-informative rather than producing NaNs.
-2. **Block weighting.** After standardisation, each block is rescaled by
-   ``1/sqrt(n_features_in_block)`` (``weighting="equal"``). This gives every
-   feature block the same total squared contribution to the distance, so the
-   ablation comparison is not decided by whichever block happens to have the
-   most features. ``weighting="uniform"`` (every feature equal) is available as
-   a robustness check.
+2. **Block weighting.** After standardisation, each feature is rescaled so that a
+   block's total squared contribution to the distance is controlled explicitly:
+   ``weighting="equal"`` gives every block the same total contribution
+   (``1/sqrt(n_features_in_block)`` per feature), ``weighting="uniform"`` gives
+   every feature equal weight, and ``weighting="custom"`` accepts per-block
+   weights ``block_weights`` (each block contributes its weight to the squared
+   distance). This makes the ablation comparison explicit rather than decided by
+   whichever block happens to have the most features.
 """
 
 from __future__ import annotations
@@ -30,12 +32,22 @@ from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 
-from .neurons import FeatureBlock, NeuronRepresentationSet
+from .neurons import FeatureBlock, NeuronRepresentationSet, classify_feature
 from .utils import Standardizer, sanitize_features
 
 
 def _block_of(feature_name: str) -> str:
     return feature_name.split(".", 1)[0]
+
+
+class EmptyFeatureSelectionError(ValueError):
+    """Raised when a block/feature selection yields no usable features.
+
+    Distinct from a generic ``ValueError`` so that an ablation suite can record a
+    *skipped* variant (e.g. "intrinsic only" for an untrained network whose
+    per-neuron parameters are all zero) rather than crashing or silently
+    producing a degenerate all-zero space.
+    """
 
 
 @dataclass
@@ -47,6 +59,7 @@ class RepresentationSpace:
     blocks: list[str] = field(default_factory=list)
     weighting: str = "equal"
     normalize_rows: bool = False
+    block_weights: Mapping[str, float] | None = None
     meta: dict[str, Any] = field(default_factory=dict)
 
     # fitted state
@@ -73,17 +86,33 @@ class RepresentationSpace:
     def _fit(self) -> None:
         self.standardizer.fit(self.X_raw)
         Z = self.standardizer.transform(self.X_raw)
+        scales = np.ones(len(self.feature_names), dtype=np.float64)
         if self.weighting == "equal":
-            scales = np.ones(len(self.feature_names), dtype=np.float64)
             for block in sorted(set(_block_of(n) for n in self.feature_names)):
                 idx = [i for i, n in enumerate(self.feature_names) if _block_of(n) == block]
                 if idx:
                     scales[idx] = 1.0 / np.sqrt(len(idx))
-            self.block_scales = scales
         elif self.weighting == "uniform":
-            self.block_scales = np.ones(len(self.feature_names), dtype=np.float64)
+            pass  # every feature contributes equally
+        elif self.weighting == "custom":
+            weights = dict(self.block_weights or {})
+            if not weights:
+                raise ValueError("weighting='custom' requires a non-empty block_weights mapping")
+            unknown = sorted(set(weights) - set(_block_of(n) for n in self.feature_names))
+            if unknown:
+                raise ValueError(f"block_weights refers to unknown blocks: {unknown}")
+            for block, weight in weights.items():
+                if float(weight) < 0:
+                    raise ValueError(f"block weight for {block!r} must be >= 0")
+                idx = [i for i, n in enumerate(self.feature_names) if _block_of(n) == block]
+                if idx:
+                    # squared contribution of the block == weight
+                    scales[idx] = np.sqrt(float(weight) / len(idx))
         else:
-            raise ValueError(f"Unknown weighting {self.weighting!r}; use 'equal' or 'uniform'")
+            raise ValueError(
+                f"Unknown weighting {self.weighting!r}; use 'equal', 'uniform' or 'custom'"
+            )
+        self.block_scales = scales
         Z = Z * self.block_scales
         if self.normalize_rows:
             norms = np.linalg.norm(Z, axis=1, keepdims=True)
@@ -94,6 +123,7 @@ class RepresentationSpace:
         self.meta.setdefault("n_features", int(self.X.shape[1]))
         self.meta.setdefault("n_informative_features", int(self.standardizer.n_informative))
         self.meta.setdefault("weighting", self.weighting)
+        self.meta.setdefault("block_weights", dict(self.block_weights) if self.block_weights else None)
         self.meta.setdefault("blocks", list(self.blocks))
 
     @property
@@ -190,7 +220,12 @@ class RepresentationSpace:
             "constant_features": self.constant_features,
             "block_feature_counts": self.block_feature_counts(),
             "weighting": self.weighting,
+            "block_weights": dict(self.block_weights) if self.block_weights else None,
             "normalize_rows": bool(self.normalize_rows),
+            "feature_kinds": {
+                kind: sorted(n for n in self.feature_names if classify_feature(n) == kind)
+                for kind in ("dynamical", "generic_learned", "tonotopic", "other")
+            },
             "meta": self.meta,
         }
 
@@ -204,13 +239,33 @@ def build_space_from_representations(
     *,
     weighting: str = "equal",
     normalize_rows: bool = False,
+    block_weights: Mapping[str, float] | None = None,
+    include_features: Sequence[str] | None = None,
+    exclude_features: Sequence[str] | None = None,
     meta: Mapping | None = None,  # type: ignore[valid-type]
 ) -> RepresentationSpace:
-    """Standard entry point: representation set + block selection -> metric space."""
+    """Standard entry point: representation set + block selection -> metric space.
+
+    ``include_features`` / ``exclude_features`` are optional lists of substrings
+    matched against the qualified ``"block.name"`` feature names; they allow
+    feature-level variants (e.g. a "learned-bias only" space that isolates the
+    generic learned term from genuine dynamical parameters).
+    """
     selected = FeatureBlock.coerce(blocks)
     X, names = reps.to_matrix(blocks=selected)
+    keep = np.ones(len(names), dtype=bool)
+    if include_features:
+        keep &= np.array([any(pat in n for pat in include_features) for n in names])
+    if exclude_features:
+        keep &= np.array([not any(pat in n for pat in exclude_features) for n in names])
+    if not keep.all():
+        X = X[:, keep]
+        names = [n for n, k in zip(names, keep) if k]
     if X.shape[1] == 0:
-        raise ValueError(f"Selected blocks {selected} carry no features")
+        raise EmptyFeatureSelectionError(
+            f"Selected blocks {selected} (include={include_features}, exclude={exclude_features}) "
+            f"carry no features"
+        )
     info = dict(reps.meta)
     if meta:
         info.update(dict(meta))
@@ -220,6 +275,7 @@ def build_space_from_representations(
         blocks=selected,
         weighting=weighting,
         normalize_rows=normalize_rows,
+        block_weights=block_weights,
         meta=info,
     )
 
@@ -264,6 +320,7 @@ def shuffle_control_space(space: RepresentationSpace, *, seed: int = 0) -> Repre
         blocks=list(space.blocks),
         weighting=space.weighting,
         normalize_rows=space.normalize_rows,
+        block_weights=dict(space.block_weights) if space.block_weights else None,
         meta={**space.meta, "kind": "shuffled_control", "seed": int(seed), "permutation": perm.tolist()},
     )
 

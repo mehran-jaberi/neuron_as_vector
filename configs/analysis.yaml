@@ -64,11 +64,24 @@ train:
 # ---------------------------------------------------------------------------
 # Neuron representation (the object under study). Feature blocks:
 #   intrinsic | input_conn | recurrent_in | recurrent_out | activity
+#
+# Weighting: "equal" (each block contributes equally) | "uniform" (each feature
+# equal) | "custom" (use block_weights, e.g. {intrinsic: 0.5, input_conn: 1.0}).
+#
+# NOTE: "intrinsic" contains only per-neuron parameters that the architecture
+# actually learns per neuron. In the default neuron_param_mode="bias" that is
+# the generic *learned bias* (a learned excitability offset, NOT a biophysical
+# parameter); the shared threshold/reset/base-tau constants are not emitted.
 # ---------------------------------------------------------------------------
 representations:
-  weighting: equal           # "equal" (per-block) | "uniform" (per-feature)
+  weighting: equal           # "equal" (per-block) | "uniform" (per-feature) | "custom"
+  block_weights: null        # used only when weighting: custom
   normalize_rows: false
   primary_blocks: [intrinsic, input_conn, recurrent_in, recurrent_out]
+  # Tonotopic input features (channel centre of mass / spread) require a known
+  # channel ordering, which is NOT established by the local docs or the SHD
+  # files. Off by default and excluded from the primary representation.
+  include_tonotopic_features: false
   # where the label-free activity features are measured (never the test set)
   activity_split: train
 

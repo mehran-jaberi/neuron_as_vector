@@ -90,8 +90,10 @@ def build_representation_bundle(
     batch_size: int = 256,
     weighting: str = "equal",
     normalize_rows: bool = False,
+    block_weights: dict[str, float] | None = None,
     include_activity_in_primary: bool = False,
     primary_blocks: list[str] | None = None,
+    include_tonotopic_features: bool = False,
 ) -> dict[str, Any]:
     """Build structural + activity representations and the derived metric spaces.
 
@@ -101,31 +103,33 @@ def build_representation_bundle(
 
     Returns a dict containing the representation sets, the representations spaces
     (with the *primary* one under key ``"primary"``), and diagnostics.
+
+    ``include_tonotopic_features`` opts into the ordering-dependent input features
+    (see :mod:`src.neurons`); it is ``False`` by default and excluded from the
+    primary representation.
     """
-    structural = extract_structural_representations(model)
+    structural = extract_structural_representations(model, include_tonotopic=include_tonotopic_features)
     activity, diag = build_activity_representation(
         model, ref_rec, ref_idx, device=device, n_classes=n_classes, batch_size=batch_size
     )
     full = merge_representation_sets(structural, activity)
 
     if primary_blocks is None:
-        primary_blocks = list(FeatureBlock.structural())
+        primary_blocks = list(structural.available_blocks())
         if include_activity_in_primary:
             primary_blocks = primary_blocks + [FeatureBlock.ACTIVITY.value]
 
+    def _space(reps, blocks):
+        return build_space_from_representations(
+            reps, blocks,
+            weighting=weighting, normalize_rows=normalize_rows, block_weights=block_weights,
+        )
+
     spaces: dict[str, RepresentationSpace] = {
-        "structural": build_space_from_representations(
-            structural, FeatureBlock.structural(), weighting=weighting, normalize_rows=normalize_rows
-        ),
-        "activity": build_space_from_representations(
-            activity, [FeatureBlock.ACTIVITY.value], weighting=weighting, normalize_rows=normalize_rows
-        ),
-        "full": build_space_from_representations(
-            full, FeatureBlock.all(), weighting=weighting, normalize_rows=normalize_rows
-        ),
-        "primary": build_space_from_representations(
-            full, primary_blocks, weighting=weighting, normalize_rows=normalize_rows
-        ),
+        "structural": _space(structural, FeatureBlock.structural()),
+        "activity": _space(activity, [FeatureBlock.ACTIVITY.value]),
+        "full": _space(full, FeatureBlock.all()),
+        "primary": _space(full, primary_blocks),
     }
     return {
         "structural": structural,

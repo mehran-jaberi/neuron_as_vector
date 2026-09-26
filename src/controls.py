@@ -36,6 +36,7 @@ from .functional_fingerprint import FingerprintSpace
 from .geometry_analysis import geometry_function_analysis, primary_metric_row
 from .neurons import FeatureBlock, NeuronRepresentationSet, merge_representation_sets
 from .representations import (
+    EmptyFeatureSelectionError,
     RepresentationSpace,
     build_space_from_representations,
     random_baseline_space,
@@ -58,6 +59,8 @@ class VariantSpec:
     is_control: bool = False
     circular: bool = False
     use_activity: bool = False
+    include_features: list[str] | None = None
+    exclude_features: list[str] | None = None
 
 
 def default_variants() -> list[VariantSpec]:
@@ -111,7 +114,32 @@ def default_variants() -> list[VariantSpec]:
             name="intrinsic_only",
             kind="blocks",
             blocks=[intrinsic],
-            description="per-neuron intrinsic parameters only",
+            description=(
+                "per-neuron learned intrinsic parameters only. In the default "
+                "'bias' architecture this block contains ONLY the generic learned "
+                "bias (not a biophysical parameter); genuine dynamical parameters "
+                "are absent, so this variant is effectively 'learned bias only'."
+            ),
+        ),
+        VariantSpec(
+            name="excitability_only",
+            kind="blocks",
+            blocks=[intrinsic],
+            include_features=["learned_bias"],
+            description=(
+                "generic learned per-neuron bias only (a learned excitability "
+                "offset; explicitly NOT a biophysical intrinsic parameter)"
+            ),
+        ),
+        VariantSpec(
+            name="dynamical_only",
+            kind="blocks",
+            blocks=[intrinsic],
+            include_features=["tau_mem_ms", "threshold", "reset"],
+            description=(
+                "genuine per-neuron dynamical parameters only (empty/skipped when "
+                "the architecture does not learn per-neuron dynamics)"
+            ),
         ),
         VariantSpec(
             name="input_conn_only",
@@ -135,7 +163,7 @@ def default_variants() -> list[VariantSpec]:
             name="structural_no_intrinsic",
             kind="blocks",
             blocks=[input_conn, rec_in, rec_out],
-            description="leave-one-block-out: drop intrinsic",
+            description="leave-one-block-out: drop the (learned) intrinsic parameters",
         ),
         VariantSpec(
             name="structural_no_input",
@@ -177,6 +205,7 @@ def build_variant_space(
     *,
     weighting: str = "equal",
     normalize_rows: bool = False,
+    block_weights: Mapping[str, float] | None = None,
     random_seed: int = 0,
     shuffle_seed: int = 0,
     full_space: RepresentationSpace | None = None,
@@ -184,7 +213,10 @@ def build_variant_space(
     """Materialise one variant as a :class:`RepresentationSpace`.
 
     Returns ``(space, circular)``; the ``circular`` flag is propagated so that
-    downstream tables can refuse to treat it as evidence.
+    downstream tables can refuse to treat it as evidence. Raises
+    :class:`~src.representations.EmptyFeatureSelectionError` when the selection
+    yields no features (e.g. an untrained model with no informative intrinsic
+    parameters).
     """
     if spec.kind == "blocks":
         reps = structural_reps
@@ -194,6 +226,8 @@ def build_variant_space(
             reps = merge_representation_sets(structural_reps, activity_reps)
         space = build_space_from_representations(
             reps, spec.blocks, weighting=weighting, normalize_rows=normalize_rows,
+            block_weights=block_weights,
+            include_features=spec.include_features, exclude_features=spec.exclude_features,
             meta={"variant": spec.name, "description": spec.description},
         )
         return space, False
@@ -215,6 +249,7 @@ def build_variant_space(
                 activity_reps,
                 weighting=weighting,
                 normalize_rows=normalize_rows,
+                block_weights=block_weights,
             )
         return shuffle_control_space(full_space, seed=shuffle_seed), False
 
@@ -262,6 +297,7 @@ def run_variant_suite(
     seed: int = 0,
     weighting: str = "equal",
     normalize_rows: bool = False,
+    block_weights: Mapping[str, float] | None = None,
     nuisance_condensed: np.ndarray | None = None,
     n_random_repeats: int = 5,
     collect_spaces: bool = True,
@@ -270,6 +306,9 @@ def run_variant_suite(
 
     The ``random_null`` variant is repeated ``n_random_repeats`` times with
     different seeds so that its spread is visible; all other variants are run once.
+    Variants whose feature selection is empty (e.g. "dynamical only" for an
+    architecture with no per-neuron dynamics) are recorded with ``skipped=True``
+    instead of being silently dropped or crashing.
     """
     rows: list[dict[str, Any]] = []
     analyses: dict[str, Any] = {}
@@ -285,23 +324,44 @@ def run_variant_suite(
         activity_reps,
         weighting=weighting,
         normalize_rows=normalize_rows,
+        block_weights=block_weights,
     )
 
     for spec in variants:
         repeats = n_random_repeats if (spec.kind == "random" and n_random_repeats > 1) else 1
         for rep_idx in range(repeats):
             label = spec.name if repeats == 1 else f"{spec.name}#{rep_idx}"
-            space, circular = build_variant_space(
-                spec,
-                structural_reps,
-                activity_reps,
-                fingerprints,
-                weighting=weighting,
-                normalize_rows=normalize_rows,
-                random_seed=seed + 1000 * rep_idx,
-                shuffle_seed=seed + 1000 * rep_idx,
-                full_space=full_space,
-            )
+            try:
+                space, circular = build_variant_space(
+                    spec,
+                    structural_reps,
+                    activity_reps,
+                    fingerprints,
+                    weighting=weighting,
+                    normalize_rows=normalize_rows,
+                    block_weights=block_weights,
+                    random_seed=seed + 1000 * rep_idx,
+                    shuffle_seed=seed + 1000 * rep_idx,
+                    full_space=full_space,
+                )
+            except EmptyFeatureSelectionError as exc:
+                rows.append(
+                    {
+                        "label": label,
+                        "variant": spec.name,
+                        "repeat": rep_idx,
+                        "kind": spec.kind,
+                        "blocks": ",".join(spec.blocks),
+                        "n_features": 0,
+                        "n_informative_features": 0,
+                        "description": spec.description,
+                        "is_control": spec.is_control,
+                        "circular__do_not_report_as_evidence": False,
+                        "skipped": True,
+                        "skip_reason": str(exc),
+                    }
+                )
+                continue
             analysis = geometry_function_analysis(
                 space.X,
                 fingerprints.X,
@@ -322,6 +382,7 @@ def run_variant_suite(
                     "description": spec.description,
                     "is_control": spec.is_control,
                     "circular__do_not_report_as_evidence": circular,
+                    "skipped": False,
                 }
             )
             rows.append(row)

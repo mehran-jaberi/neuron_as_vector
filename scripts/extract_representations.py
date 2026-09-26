@@ -48,6 +48,7 @@ from _pipeline import build_fingerprint, build_representation_bundle  # noqa: E4
 from src.controls import reliability_suite  # noqa: E402
 from src.evaluation import split_half_indices  # noqa: E402
 from src.functional_fingerprint import FingerprintConfig  # noqa: E402
+from src.permutation import check_structural_permutation_invariance  # noqa: E402
 from src.utils import save_json  # noqa: E402
 
 
@@ -114,6 +115,9 @@ def main(argv: list[str] | None = None) -> int:
 
     weighting = str(cfg.get_path("representations.weighting", "equal"))
     normalize_rows = bool(cfg.get_path("representations.normalize_rows", False))
+    block_weights = cfg.get_path("representations.block_weights", None)
+    block_weights = {str(k): float(v) for k, v in block_weights.items()} if block_weights else None
+    include_tonotopic_features = bool(cfg.get_path("representations.include_tonotopic_features", False))
     primary_blocks = cfg.get_path(
         "representations.primary_blocks",
         ["intrinsic", "input_conn", "recurrent_in", "recurrent_out"],
@@ -130,8 +134,10 @@ def main(argv: list[str] | None = None) -> int:
         batch_size=batch_size,
         weighting=weighting,
         normalize_rows=normalize_rows,
+        block_weights=block_weights,
         include_activity_in_primary=include_activity_in_primary,
         primary_blocks=primary_blocks,
+        include_tonotopic_features=include_tonotopic_features,
     )
     diag = bundle["diagnostics"]
     print(
@@ -185,6 +191,25 @@ def main(argv: list[str] | None = None) -> int:
         f"attenuation=sqrt(ceiling)={reliability['attenuation_factor_sqrt_ceiling']:.3f}"
     )
 
+    # ---- permutation-invariance of the structural representation ---------
+    permutation_report = check_structural_permutation_invariance(
+        model,
+        seed=int(cfg.get_path("seed", 0)),
+        include_tonotopic=include_tonotopic_features,
+    )
+    sensitive = permutation_report["sensitive_features"]
+    if permutation_report["passed"]:
+        print(
+            f"[permutation] structural representation is permutation-INVARIANT "
+            f"({permutation_report['n_features']} features)"
+        )
+    else:
+        print(
+            f"[permutation][WARN] permutation-SENSITIVE features detected: {sensitive}. "
+            "These depend on the arbitrary neuron ordering and must not be used."
+        )
+    save_json(permutation_report, result_path(cfg, f"{tag}_permutation_invariance.json"))
+
     summary = {
         "tag": tag,
         "dataset": recs["name"],
@@ -193,9 +218,15 @@ def main(argv: list[str] | None = None) -> int:
         "fingerprint_eval_split": eval_split,
         "n_classes": n_classes,
         "weighting": weighting,
+        "block_weights": block_weights,
+        "include_tonotopic_features": include_tonotopic_features,
         "primary_blocks": primary_blocks,
         "representation_diagnostics": diag,
+        "representation_feature_kinds": {
+            name: space.summary()["feature_kinds"] for name, space in bundle["spaces"].items()
+        },
         "representation_spaces": {name: space.summary() for name, space in bundle["spaces"].items()},
+        "permutation_invariance": permutation_report,
         "fingerprint_meta": fp["space"].meta,
         "fingerprint_reliability": reliability,
         "split_info": recs["split_info"],
