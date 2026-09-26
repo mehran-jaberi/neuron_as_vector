@@ -10,7 +10,7 @@ analysis-probe split (see config ``fingerprint.eval_split``):
 
 **A. Class-tuning fingerprint** (``class_rate``)
     A ``C``-dimensional response profile: the mean firing rate of the neuron in
-    each of the ``C`` SHD classes. This is the pre-registered primary target.
+    each of the ``C`` SHD classes. This is the PRIMARY ANALYSIS target.
 
 **B. Rate-normalized tuning fingerprint** (``class_rate_norm``)
     The class profile divided by the neuron's own mean rate over classes, so the
@@ -69,7 +69,7 @@ FINGERPRINT_FEATURE_SETS = (
 
 # Named presets that map the fingerprint families A / B / C onto feature sets.
 FINGERPRINT_PRESETS: dict[str, tuple[str, ...]] = {
-    # A. class-tuning fingerprint (the pre-registered primary target)
+    # A. class-tuning fingerprint (the PRIMARY ANALYSIS target)
     "tuning": ("class_rate",),
     # B. rate-normalized tuning fingerprint (primary rate control target)
     "tuning_rate_normalized": ("class_rate_norm",),
@@ -95,7 +95,7 @@ FINGERPRINT_PRESETS: dict[str, tuple[str, ...]] = {
 # --------------------------------------------------------------------------
 # The ONE primary functional target (used by every script)
 # --------------------------------------------------------------------------
-#: Preset name of the pre-registered primary fingerprint:
+#: Preset name of the PRIMARY ANALYSIS fingerprint:
 #: the 20-dimensional class-conditioned firing-rate profile.
 PRIMARY_FINGERPRINT_PRESET = "tuning"
 #: Secondary target (adds first-spike latency).

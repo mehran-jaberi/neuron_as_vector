@@ -6,7 +6,7 @@ Neurons that are close in the proposed representation space should tend to have
 similar functional fingerprints, i.e. the *distance matrices* of the two spaces
 should be positively related.
 
-Primary metric (pre-registered in the config, reported everywhere)
+Primary metric (PRIMARY ANALYSIS, reported everywhere)
 -----------------------------------------------------------------
 ``mantel_spearman_r``: Spearman correlation between the condensed pairwise
 distance vector of the neuron representation and the condensed pairwise distance
@@ -527,8 +527,11 @@ def knn_analysis(
     The null distribution is obtained by randomly relabelling neurons, i.e. by
     asking "what if neighbour identity were unrelated to function?".
 
-    A *negative* effect (observed < null) means neighbours are functionally more
-    similar than chance - the hypothesis of interest.
+    A positive ``effect_size_z`` means the observed mean functional distance to a
+    neuron's representation-space neighbours is *smaller* than the permutation
+    null, i.e. neighbours are functionally more similar than chance - the
+    hypothesis of interest. In symbols ``effect_size = (null_mean - observed) /
+    null_std`` and ``p_value`` is one-sided for ``observed < null``.
     """
     X = np.asarray(space_matrix, dtype=np.float64)
     D = np.asarray(func_distance_matrix, dtype=np.float64)

@@ -13,7 +13,7 @@ Protocol (leakage-safe)
 * The representation is *not* tuned against these results: the same fixed
   representation is used for every target.
 
-Two simple, pre-registered regressors are provided:
+Two simple regressors are provided:
 
 * **Ridge regression** (``RidgeCV`` selects ``alpha`` by internal CV on the
   training fold).
@@ -73,6 +73,7 @@ def regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, Any]
     r2s = np.array([d["r2"] for d in per_target], dtype=np.float64)
     rs = np.array([d["pearson_r"] for d in per_target], dtype=np.float64)
     nrmse = np.array([d["nrmse"] for d in per_target], dtype=np.float64)
+    rmse = np.array([d["rmse"] for d in per_target], dtype=np.float64)
     total_res = float(((y_true - y_pred) ** 2).sum())
     total_tot = float(((y_true - y_true.mean(axis=0, keepdims=True)) ** 2).sum())
 
@@ -96,6 +97,8 @@ def regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, Any]
         "r2_median": float(np.nanmedian(r2s)) if r2s.size else float("nan"),
         "r2_overall": (1.0 - total_res / total_tot) if total_tot > 1e-12 else float("nan"),
         "nrmse_mean": float(np.nanmean(nrmse)) if nrmse.size else float("nan"),
+        "rmse_mean": float(np.nanmean(rmse)) if rmse.size else float("nan"),
+        "rmse_median": float(np.nanmedian(rmse)) if rmse.size else float("nan"),
         "mae_mean": float(np.mean([d["mae"] for d in per_target])) if per_target else float("nan"),
         "predicted_vs_true_fingerprint_distance_spearman": dist_r,
         "per_target": per_target,
@@ -105,11 +108,33 @@ def regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, Any]
 # --------------------------------------------------------------------------
 # Cross-validated predictors
 # --------------------------------------------------------------------------
-def _kfold(n_samples: int, n_splits: int, seed: int):
+def make_shared_folds(n_samples: int, n_splits: int = 5, seed: int = 0):
+    """Build one ``KFold`` splitter so every representation uses the SAME folds.
+
+    Exposed separately from :func:`cross_validated_ridge` so a comparison across
+    several representations of the same neurons can pass the *identical* splitter
+    to each call (and can assert the fold assignment is identical).
+    """
     from sklearn.model_selection import KFold
 
-    n_splits = int(max(2, min(n_splits, n_samples)))
-    return KFold(n_splits=n_splits, shuffle=True, random_state=int(seed)), n_splits
+    n_splits = int(max(2, min(int(n_splits), int(n_samples))))
+    return KFold(n_splits=n_splits, shuffle=True, random_state=int(seed))
+
+
+def _kfold(n_samples: int, n_splits: int, seed: int, cv: Any | None = None):
+    if cv is not None:
+        return cv, int(getattr(cv, "n_splits", n_splits))
+    folds = make_shared_folds(n_samples, n_splits, seed)
+    return folds, int(folds.n_splits)
+
+
+def fold_assignment(n_samples: int, n_splits: int = 5, seed: int = 0, cv: Any | None = None) -> np.ndarray:
+    """Fold id (0..n_splits-1) of every neuron for a given splitter."""
+    splitter, _ = _kfold(n_samples, n_splits, seed, cv)
+    out = np.full(int(n_samples), -1, dtype=np.int64)
+    for f, (_, test) in enumerate(splitter.split(np.arange(int(n_samples)))):
+        out[np.asarray(test, dtype=np.int64)] = f
+    return out
 
 
 def cross_validated_ridge(
@@ -119,8 +144,13 @@ def cross_validated_ridge(
     n_splits: int = 5,
     alphas: Sequence[float] = DEFAULT_ALPHAS,
     seed: int = 0,
+    cv: Any | None = None,
 ) -> dict[str, Any]:
-    """Out-of-fold ridge predictions of ``Y`` from ``X`` (CV across neurons)."""
+    """Out-of-fold ridge predictions of ``Y`` from ``X`` (CV across neurons).
+
+    Pass an explicit ``cv`` splitter (see :func:`make_shared_folds`) to guarantee
+    that several representations are compared on identical folds.
+    """
     from sklearn.linear_model import RidgeCV
     from sklearn.model_selection import cross_val_predict
     from sklearn.pipeline import Pipeline
@@ -130,7 +160,7 @@ def cross_validated_ridge(
     Y = np.asarray(Y, dtype=np.float64)
     if X.shape[0] != Y.shape[0]:
         raise ValueError("X and Y must have the same number of neurons")
-    cv, n_splits = _kfold(X.shape[0], n_splits, seed)
+    cv, n_splits = _kfold(X.shape[0], n_splits, seed, cv)
     estimator = Pipeline(
         [
             ("scale", StandardScaler()),
@@ -150,6 +180,7 @@ def cross_validated_knn(
     n_splits: int = 5,
     k: int = 5,
     seed: int = 0,
+    cv: Any | None = None,
 ) -> dict[str, Any]:
     """Out-of-fold k-NN regression predictions of ``Y`` from ``X``."""
     from sklearn.model_selection import cross_val_predict
@@ -161,7 +192,7 @@ def cross_validated_knn(
     Y = np.asarray(Y, dtype=np.float64)
     if X.shape[0] != Y.shape[0]:
         raise ValueError("X and Y must have the same number of neurons")
-    cv, n_splits = _kfold(X.shape[0], n_splits, seed)
+    cv, n_splits = _kfold(X.shape[0], n_splits, seed, cv)
     k_eff = int(max(1, min(k, X.shape[0] - 1)))
     estimator = Pipeline(
         [("scale", StandardScaler()), ("knn", KNeighborsRegressor(n_neighbors=k_eff))]

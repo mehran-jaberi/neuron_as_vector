@@ -1,6 +1,6 @@
 """Primary geometry/function analysis, controls and cross-validated prediction.
 
-This module is the single entry point for the pre-registered analysis. It keeps
+This module is the single entry point for the PRIMARY ANALYSIS. It keeps
 the central scientific separation explicit:
 
 * **proposed representation** - label-free, built from the network parameters and

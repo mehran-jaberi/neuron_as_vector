@@ -1,6 +1,6 @@
 """Primary geometry/function analysis (representation vs. independent fingerprint).
 
-This is the pre-registered analysis entry point (see README §7 and
+This is the PRIMARY ANALYSIS entry point (see README §7 and
 ``src/function_analysis.py``). It:
 
 1. builds the **label-free** neuron representation from a trained checkpoint;

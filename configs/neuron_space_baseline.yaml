@@ -1,0 +1,156 @@
+# -----------------------------------------------------------------------------
+# neuron_space_baseline.yaml
+#
+# THE scientific experiment: does the label-free structural neuron representation
+# predict neuron function beyond trivial firing-rate magnitude?
+#
+# This config drives scripts/run_neuron_space_baseline.py (and
+# scripts/train_nsb_baseline.py). It does NOT change the LIF training
+# configuration: the selected baseline is trained with exactly the recipe that
+# was chosen on DEV in the previous stage (readout=sum, no spike regularisation,
+# Adam lr 1e-3, cosine schedule, 40-epoch budget with DEV early stopping,
+# 700 x 2 ms, 256 hidden). See select_recipe below.
+#
+# Scientific separation enforced everywhere:
+#   * representation = LABEL-FREE (structural blocks + optional label-free activity)
+#   * fingerprint    = class-conditioned, measured on the held-out PROBE split,
+#                      never fed back into the representation
+#   * the official TEST set is NEVER used here (not even once)
+# -----------------------------------------------------------------------------
+
+seed: 0
+
+paths:
+  data_dir: data
+  checkpoint_dir: checkpoints
+  results_dir: results
+  figures_dir: figures
+
+run:
+  tag: nsb                 # run tag (only used for checkpoint bookkeeping)
+  device: auto
+  verbose: true
+  synthetic: false
+  synthetic_n_samples: 600
+  synthetic_n_classes: 5
+  synthetic_n_channels: 40
+
+data:
+  download: true
+  layout: auto
+  dev_fraction: 0.1
+  probe_fraction: 0.1
+  prefer_speaker_aware: true
+  split_seed: 0            # FIXED: the data split is identical for every seed.
+  debug: false
+  max_per_class: null
+
+# Model block - MUST match the selected checkpoint exactly.
+model:
+  n_input: 700
+  n_hidden: 256
+  n_output: 20
+  n_bins: 700
+  bin_ms: 2.0
+  tau_mem_ms: 20.0
+  tau_syn_ms: 5.0
+  threshold: 1.0
+  reset: subtract
+  readout_leak: 0.0
+  readout_mode: sum          # the decisive lever of the selected baseline
+  surrogate_beta: 5.0
+  surrogate_gamma: 0.3
+  input_weight_scale: 10.0
+  recurrent_weight_scale: 2.0
+  recurrent_density: 1.0
+  zero_self_connection: false
+  signed_input_weights: true
+  signed_recurrent_weights: true
+  neuron_param_mode: bias
+
+train:
+  n_classes: 20
+
+# ---------------------------------------------------------------------------
+# The SELECTED baseline recipe (used only by scripts/train_nsb_baseline.py to
+# train the additional seeds; it must reproduce the DEV-selected configuration).
+# ---------------------------------------------------------------------------
+select_recipe:
+  base_config: configs/baseline_repaired.yaml
+  overrides:
+    model.readout_mode: sum
+    train.l2_spikes: 0.0
+    train.epochs: 40
+    train.early_stopping_patience: 8
+    train.select_by: dev_accuracy
+  # seed 0 reuses the already-selected checkpoint instead of retraining it.
+  reuse_seed0_checkpoint: checkpoints/sweep_l2_0.pt
+
+# ---------------------------------------------------------------------------
+# Neuron representation (the object under study; LABEL-FREE).
+# ---------------------------------------------------------------------------
+representations:
+  weighting: equal
+  block_weights: null
+  normalize_rows: false
+  primary_blocks: [intrinsic, input_conn, recurrent_in, recurrent_out]
+  include_tonotopic_features: false
+  activity_split: train       # label-free activity is measured on FIT
+
+# ---------------------------------------------------------------------------
+# Functional fingerprint (the independent target; USES LABELS, PROBE only).
+# ---------------------------------------------------------------------------
+fingerprint:
+  primary_preset: tuning                  # the ONE canonical primary target
+  secondary_preset: tuning_with_latency
+  exploratory_preset: temporal
+  primary_key: tuning
+  rate_normalized_key: tuning_rate_normalized
+  secondary_keys: [temporal]
+  feature_sets: [class_rate]
+  standardize: column
+  normalize_rows: false
+  metric: euclidean
+  min_spikes_for_latency: 1.0
+  n_psth_bins: 10
+  eval_split: probe
+
+# ---------------------------------------------------------------------------
+# PRIMARY ANALYSIS + controls + prediction
+# ---------------------------------------------------------------------------
+analysis:
+  n_perm: 10000               # permutation count for the canonical table
+  n_perm_conditions: 2000     # before/rewired conditions (cheaper)
+  bootstrap: 2000             # neuron-bootstrap CI for the primary statistic
+  k_values: [3, 5, 10, 20]
+  rate_matched_strata: 5
+  control_repeats: 5          # repeats for random / neuron-shuffle controls
+  prediction:
+    enabled: true
+    n_splits: 5
+    knn_k: 5
+    alphas: [0.001, 0.01, 0.1, 1.0, 10.0, 100.0, 1000.0]
+    random_control_seed: 12345
+
+# Before-learning and rewired-recurrent conditions.
+conditions:
+  include_before_learning: true
+  rewired_modes: [global, rowwise, columnwise]
+
+# ---------------------------------------------------------------------------
+# Multi-seed replication (the SAME analysis at each seed; the data split is fixed)
+# ---------------------------------------------------------------------------
+multiseed:
+  seeds: [0, 1, 2]
+  primary_metrics: [raw_r, rate_normalized_r, rate_matched_r, cv_r2_mean, cv_pearson_r_mean]
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+output:
+  dir: results/neuron_space_baseline
+
+figures:
+  dpi: 200
+  formats: [png, pdf]
+  n_pca_components: 2

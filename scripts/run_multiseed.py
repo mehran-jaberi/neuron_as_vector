@@ -4,7 +4,7 @@ Stage 8 (robustness). This driver answers a question that a single training run
 cannot: *how stable is the reported geometry-function relationship across
 initialisations?* It runs the full three-stage pipeline -- train ->
 extract representations -> geometry analysis -- once per seed and then
-aggregates the pre-registered primary metric (the Spearman Mantel correlation
+aggregates the PRIMARY ANALYSIS metric (the Spearman Mantel correlation
 between the label-free *structural* representation space and the independent
 functional fingerprint) into a mean +/- std summary.
 

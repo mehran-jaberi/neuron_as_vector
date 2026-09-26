@@ -61,7 +61,9 @@ def permute_hidden_neurons(model: Any, perm: Sequence[int]) -> Any:
     * recurrent weights: ``w_rec_new[a, b] = w_rec_old[perm[a], perm[b]]``
       (both the pre- and the post-synaptic index are relabelled)
     * readout weights: ``w_out_new[k, :] = w_out_old[perm[k], :]``
-    * per-neuron parameters (bias, learned tau offset) follow their neuron.
+    * per-neuron parameters (bias, learned tau offset) follow their neuron;
+    * the structural ``self_mask`` buffer (relevant only when self-connections are
+      disabled) is relabelled with the same index on both axes.
 
     The result is functionally identical to the input model; only the numbering
     of the hidden units changes.
@@ -85,6 +87,13 @@ def permute_hidden_neurons(model: Any, perm: Sequence[int]) -> Any:
             new_model.b_hid.copy_(model.b_hid.detach().index_select(0, perm_t))
         if getattr(model, "log_tau_offset", None) is not None:
             new_model.log_tau_offset.copy_(model.log_tau_offset.detach().index_select(0, perm_t))
+        # self_mask is a structural buffer: relabel both axes so a disabled
+        # self-connection stays disabled for the *same* functional neuron.
+        mask = getattr(model, "self_mask", None)
+        if mask is not None:
+            new_model.self_mask.copy_(
+                mask.detach().index_select(0, perm_t).index_select(1, perm_t)
+            )
     return new_model
 
 

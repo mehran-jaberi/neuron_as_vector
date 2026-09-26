@@ -6,7 +6,7 @@
 # compatible with the checkpoint produced by a baseline.yaml run (the model block
 # below is used to rebuild the architecture when loading a checkpoint).
 #
-# The primary, pre-registered metric is the Spearman Mantel correlation between
+# The PRIMARY ANALYSIS metric is the Spearman Mantel correlation between
 # the representation-space distance matrix and the functional-fingerprint
 # distance matrix (see README "Hypothesis").
 # -----------------------------------------------------------------------------
@@ -116,7 +116,7 @@ fingerprint:
 
 # ---------------------------------------------------------------------------
 # Primary geometry/function analysis (scripts/run_function_analysis.py)
-# This is the pre-registered analysis: label-free representation vs. independent
+# This is the PRIMARY ANALYSIS: label-free representation vs. independent
 # class-tuning fingerprint, with controls and cross-validated prediction.
 # ---------------------------------------------------------------------------
 function_analysis:

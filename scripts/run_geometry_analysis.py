@@ -1,7 +1,7 @@
 """Geometry-function analysis: does neuron-space geometry predict function?
 
 Stage 6-7 of the pipeline. This is the scientific core of the project. It takes a
-trained checkpoint and asks the *pre-registered* question:
+trained checkpoint and asks the *PRIMARY ANALYSIS* question:
 
     Do hidden neurons that are close in the structured representation space also
     tend to have similar functional fingerprints (held-out, class-conditioned

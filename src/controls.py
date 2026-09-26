@@ -64,7 +64,7 @@ class VariantSpec:
 
 
 def default_variants() -> list[VariantSpec]:
-    """The pre-registered ablation set.
+    """The default ablation set (representation/control variants).
 
     Ordered from the conservative structural representation to deliberately
     circular variants, so that the final table reads top-to-bottom as
