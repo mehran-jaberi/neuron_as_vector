@@ -34,7 +34,11 @@ from _common import (  # noqa: E402
 from _pipeline import build_fingerprints, build_representation_bundle  # noqa: E402
 from src.controls import reliability_suite  # noqa: E402
 from src.evaluation import split_half_indices  # noqa: E402
-from src.functional_fingerprint import FINGERPRINT_PRESETS  # noqa: E402
+from src.functional_fingerprint import (  # noqa: E402
+    FINGERPRINT_PRESETS,
+    PRIMARY_FINGERPRINT_PRESET,
+    fingerprint_definition,
+)
 from src.model import build_model  # noqa: E402
 from src.rewiring import REWIRE_MODES, rewire_recurrent, rewiring_report  # noqa: E402
 from src.stress_test import (  # noqa: E402
@@ -95,7 +99,7 @@ def _build_condition(
         model, eval_rec, eval_idx,
         device=device, n_classes=n_classes, batch_size=batch_size,
         presets={
-            "tuning": list(FINGERPRINT_PRESETS["tuning"]),
+            PRIMARY_FINGERPRINT_PRESET: list(FINGERPRINT_PRESETS[PRIMARY_FINGERPRINT_PRESET]),
             "tuning_rate_normalized": list(FINGERPRINT_PRESETS["tuning_rate_normalized"]),
         },
         standardize=fp_standardize, normalize_rows=fp_normalize_rows, metric=fp_metric,
@@ -218,7 +222,7 @@ def main(argv: list[str] | None = None) -> int:
     result = run_stress_test(
         conditions,
         variants=stress_variants(),
-        tuning_key="tuning",
+        tuning_key=PRIMARY_FINGERPRINT_PRESET,
         tuning_normalized_key="tuning_rate_normalized",
         n_perm=n_perm, k_values=k_values, seed=seed,
         weighting=weighting, normalize_rows=normalize_rows,
@@ -231,6 +235,11 @@ def main(argv: list[str] | None = None) -> int:
         "tag": tag,
         "dataset": recs["name"],
         "seed": seed,
+        "primary_preset": PRIMARY_FINGERPRINT_PRESET,
+        "primary_fingerprint": fingerprint_definition(
+            after.fingerprints[PRIMARY_FINGERPRINT_PRESET].config,
+            dimension=len(after.fingerprints[PRIMARY_FINGERPRINT_PRESET].feature_names),
+        ),
         "fingerprint_eval_split": eval_split,
         "activity_split": activity_split,
         "meta": result["meta"],

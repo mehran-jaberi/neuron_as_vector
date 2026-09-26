@@ -67,7 +67,12 @@ from src.controls import (  # noqa: E402
     run_variant_suite,
 )
 from src.evaluation import split_half_indices  # noqa: E402
-from src.functional_fingerprint import FingerprintConfig  # noqa: E402
+from src.functional_fingerprint import (  # noqa: E402
+    PRIMARY_FINGERPRINT_PRESET,
+    FingerprintConfig,
+    fingerprint_definition,
+    preset_fingerprint_config,
+)
 from src.geometry_analysis import geometry_function_analysis  # noqa: E402
 from src.model import build_model, count_parameters  # noqa: E402
 from src.utils import ensure_dir, save_json  # noqa: E402
@@ -151,7 +156,17 @@ def main(argv: list[str] | None = None) -> int:
     ref_idx = np.arange(len(ref_rec))
     eval_rec = recs[eval_split]
     eval_idx = np.arange(len(eval_rec))
-    fp_config = FingerprintConfig.from_mapping(cfg.get_path("fingerprint", {}) or {})
+    # ONE primary fingerprint definition, shared by every analysis script.
+    primary_preset = str(cfg.get_path("fingerprint.primary_preset", PRIMARY_FINGERPRINT_PRESET))
+    fp_config = preset_fingerprint_config(
+        primary_preset,
+        standardize=str(cfg.get_path("fingerprint.standardize", "column")),
+        normalize_rows=bool(cfg.get_path("fingerprint.normalize_rows", False)),
+        metric=str(cfg.get_path("fingerprint.metric", "euclidean")),
+        n_psth_bins=int(cfg.get_path("fingerprint.n_psth_bins", 10)),
+        min_spikes_for_latency=float(cfg.get_path("fingerprint.min_spikes_for_latency", 1.0)),
+        eval_split=eval_split,
+    )
 
     # ---- representation + fingerprint for the trained model --------------
     bundle = build_representation_bundle(
@@ -310,6 +325,12 @@ def main(argv: list[str] | None = None) -> int:
         "dataset": recs["name"],
         "n_perm": n_perm,
         "primary_blocks": primary_blocks,
+        "primary_preset": primary_preset,
+        "primary_fingerprint": {
+            **fingerprint_definition(fp_config, dimension=len(fingerprint.feature_names)),
+            "preset": primary_preset,
+            "n_neurons": int(fingerprint.n_neurons),
+        },
         "primary_mantel_spearman": p,
         "representation_diagnostics": diag,
         "fingerprint_reliability": reliability,

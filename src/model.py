@@ -45,7 +45,7 @@ from typing import Any, Mapping
 import torch
 import torch.nn as nn
 
-from .utils import Config
+from .utils import Config, coerce_dataclass_kwargs
 
 
 # --------------------------------------------------------------------------
@@ -92,7 +92,7 @@ class SNNConfig:
     def from_mapping(cls, mapping: Mapping[str, Any]) -> "SNNConfig":
         valid = {f for f in cls.__dataclass_fields__}  # type: ignore[attr-defined]
         kwargs = {k: v for k, v in dict(mapping).items() if k in valid}
-        return cls(**kwargs)
+        return cls(**coerce_dataclass_kwargs(cls, kwargs))
 
     @classmethod
     def from_config(cls, cfg: Config, prefix: str = "model") -> "SNNConfig":
@@ -264,8 +264,8 @@ class RecurrentLIFSNN(nn.Module):
         Returns
         -------
         dict with ``logits`` (B, n_output), ``spike_count`` (B, n_hidden) and, if
-        ``record``, ``hidden_v``/``hidden_spikes`` (B, T, n_hidden) and
-        ``output_activity`` (B, T, n_output).
+        ``record``, ``hidden_v``/``hidden_i_syn``/``hidden_spikes`` (B, T, n_hidden)
+        and ``output_activity`` (B, T, n_output).
         """
         cfg = self.cfg
         if x.dim() != 3:
@@ -305,6 +305,7 @@ class RecurrentLIFSNN(nn.Module):
         rec_spikes = torch.zeros(B, T, cfg.n_hidden, device=device, dtype=dtype) if record else None
         rec_v = torch.zeros(B, T, cfg.n_hidden, device=device, dtype=dtype) if record else None
         rec_o = torch.zeros(B, T, cfg.n_output, device=device, dtype=dtype) if record else None
+        rec_i = torch.zeros(B, T, cfg.n_hidden, device=device, dtype=dtype) if record else None
 
         for t in range(T):
             recurrent_input = s_prev @ w_rec.t()
@@ -333,6 +334,7 @@ class RecurrentLIFSNN(nn.Module):
                 rec_spikes[:, t, :] = s
                 rec_v[:, t, :] = v
                 rec_o[:, t, :] = o
+                rec_i[:, t, :] = i_syn
 
         logits = o_sum / float(max(T, 1))
 
@@ -345,6 +347,7 @@ class RecurrentLIFSNN(nn.Module):
         if record:
             out["hidden_v"] = rec_v
             out["hidden_spikes"] = rec_spikes
+            out["hidden_i_syn"] = rec_i
             out["output_activity_trace"] = rec_o
         return out
 

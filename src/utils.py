@@ -9,9 +9,10 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence, get_type_hints
 
 import numpy as np
 import yaml
@@ -116,12 +117,77 @@ class Config(dict):
         return p
 
 
+def parse_scalar(text: str) -> Any:
+    """Parse a CLI override value into a Python scalar.
+
+    YAML 1.1 only recognises floats written with a decimal point, so a value like
+    ``1e-3`` is returned as the *string* ``'1e-3'``. That silently produced a
+    string where a float was expected (e.g. ``train.l2_spikes``) and crashed
+    training with ``'>' not supported between instances of 'str' and 'int'``.
+    Here we additionally coerce numeric-looking strings with a strict, full-match
+    regex so that legitimate non-numeric strings (``reset=subtract``) are left
+    untouched.
+    """
+    value = yaml.safe_load(text)
+    if not isinstance(value, str):
+        return value
+    s = value.strip()
+    if s == "":
+        return value
+    if re.fullmatch(r"[+-]?\d+", s):
+        return int(s)
+    if re.fullmatch(r"[+-]?(\d+\.\d*|\.\d+|\d+)([eE][+-]?\d+)?", s):
+        try:
+            return float(s)
+        except ValueError:  # pragma: no cover - regex already guarantees a float
+            return value
+    low = s.lower()
+    if low in ("true", "false"):
+        return low == "true"
+    if low in ("null", "none", "~"):
+        return None
+    return value
+
+
+def _coerce_value(value: Any, annotation: Any) -> Any:
+    """Best-effort coercion of a config value to a dataclass field's type."""
+    if value is None or annotation is None:
+        return value
+    try:
+        if annotation is bool:
+            if isinstance(value, str):
+                return value.strip().lower() in ("1", "true", "yes", "on")
+            return bool(value)
+        if annotation is int:
+            return int(float(value)) if isinstance(value, str) else int(value)
+        if annotation is float:
+            return float(value)
+        if annotation is str:
+            return str(value)
+    except (TypeError, ValueError):
+        return value
+    return value
+
+
+def coerce_dataclass_kwargs(cls: type, kwargs: Mapping[str, Any]) -> dict[str, Any]:
+    """Coerce ``kwargs`` to the annotated types of dataclass ``cls``.
+
+    Guards against values arriving as strings (YAML 1.1 quirks, CLI overrides)
+    where a number is expected.
+    """
+    try:
+        hints = get_type_hints(cls)
+    except Exception:  # pragma: no cover - defensive
+        return dict(kwargs)
+    return {k: _coerce_value(v, hints.get(k)) for k, v in dict(kwargs).items()}
+
+
 def load_config(path: str | os.PathLike[str], overrides: Sequence[str] | None = None) -> Config:
     """Load a YAML config file and optionally apply ``key.subkey=value`` overrides.
 
-    Override values are parsed as YAML scalars so that ``lr=1e-3`` becomes a
-    float, ``hidden_size=512`` an int, ``use_cuda=true`` a bool, and
-    ``blocks=[input_conn,activity]`` a list.
+    Override values are parsed as YAML scalars (with an extra numeric fallback, see
+    :func:`parse_scalar`) so that ``lr=1e-3`` becomes a float, ``hidden_size=512``
+    an int, ``use_cuda=true`` a bool, and ``blocks=[input_conn,activity]`` a list.
     """
     with Path(path).open("r", encoding="utf-8") as fh:
         raw = yaml.safe_load(fh) or {}
@@ -132,7 +198,7 @@ def load_config(path: str | os.PathLike[str], overrides: Sequence[str] | None = 
         if "=" not in override:
             raise ValueError(f"Override {override!r} must have the form key.subkey=value")
         key, _, value = override.partition("=")
-        cfg.set_path(key.strip(), yaml.safe_load(value))
+        cfg.set_path(key.strip(), parse_scalar(value))
     return cfg
 
 

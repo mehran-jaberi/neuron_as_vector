@@ -603,6 +603,40 @@ the legacy stress table is superseded — see §6.3 and `AUDIT_REPRESENTATION.md
   learned excitability offset*, not a biophysical parameter. Whether the remaining
   structure carries information beyond that bias is not yet established.
 
+### 7.9 Repaired baseline — numerical health (`baseline_repaired_v1`)
+
+A dynamics audit (`AUDIT_DYNAMICS.md`, `scripts/diagnose.py`) showed that the
+earlier baseline was **numerically saturated**: plain cross-entropy with **no
+homeostasis** drove a common-mode depolarisation (net-positive input/recurrent
+weight means) that pushed the hidden layer to **166 Hz** mean rate (28 % of neurons
+> 200 Hz, V up to ≈ 42·θ with θ = 1), compressing the hidden code and causing severe
+class collapse (test recall for class 1 = 0.000). The LIF **equations were verified
+correct**; the failure was the operating point.
+
+The repair enables the *existing* homeostatic penalty (`l2_spikes = 1e-3`,
+`target_rate_hz = 10`; `configs/baseline_repaired.yaml`); **θ is unchanged** and no
+threshold/architecture change was made.
+
+| | saturated (`baseline_v2`) | **repaired** |
+| - | ------------------------- | ------------ |
+| hidden mean / max rate | 166 / 354 Hz | **21 / 41 Hz** |
+| fraction > 200 Hz | 0.281 | **0.000** |
+| V p99 / θ | 15.2 | **0.98** |
+| FIT / DEV / PROBE / TEST accuracy | 0.583 / 0.495 / 0.440 / 0.588 | **0.440 / 0.242 / 0.307 / 0.427** |
+| median class recall (test) | 0.617 | 0.368 |
+
+**Primary result is stronger in the healthy regime** — and this supersedes the
+r ≈ 0.30 numbers above: **Mantel r = 0.472** (p < 5e-4, z = 14.5, CI [0.394, 0.563]),
+**rate-normalized r = 0.399**, rate-matched r = 0.279, prediction R² = 0.408;
+shuffle/random controls null.
+
+**Honest caveats.** (i) Class collapse is **not resolved** — accuracy dropped and ~3
+classes still have recall < 0.1 (saturation had been acting as a computational
+resource); (ii) the **rate-only** representation still matches the full structural
+one (0.492 vs 0.472), so the structural blocks are not yet shown to beat firing rate;
+(iii) the voltage tails remain large (heavy negative excursions) because the synaptic
+DC gain is ~3, which a future fix should address by rescaling weights or τ_syn.
+
 ---
 
 ## 8. Controls

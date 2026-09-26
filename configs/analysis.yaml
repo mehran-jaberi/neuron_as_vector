@@ -95,10 +95,16 @@ representations:
 # NOTE: the fingerprint is NEVER an input to the representation.
 # ---------------------------------------------------------------------------
 fingerprint:
-  # feature sets (or preset names from src.functional_fingerprint):
-  #   class_rate | class_rate_norm | class_count | class_latency
-  #   class_psth | class_temporal_center | class_temporal_dispersion
-  feature_sets: [class_rate, class_latency]
+  # THE one primary functional target, shared by run_geometry_analysis,
+  # run_function_analysis and run_stress_test (they cannot diverge any more):
+  #   PRIMARY      = tuning               -> 20-d class-conditioned firing-rate profile
+  #   SECONDARY    = tuning_with_latency  -> rate + first-spike latency
+  #   EXPLORATORY  = temporal             -> PSTH + temporal centre/dispersion + latency
+  primary_preset: tuning
+  secondary_preset: tuning_with_latency
+  exploratory_preset: temporal
+  # kept for the legacy single-fingerprint path; equals the primary preset
+  feature_sets: [class_rate]
   standardize: column        # "column" | "none"
   normalize_rows: false
   metric: euclidean          # "euclidean" | "correlation"

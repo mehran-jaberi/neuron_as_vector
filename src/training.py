@@ -23,7 +23,7 @@ import numpy as np
 from .data import SHDRecordings, iterate_batches
 from .evaluation import evaluate_model
 from .model import RecurrentLIFSNN
-from .utils import get_device
+from .utils import coerce_dataclass_kwargs, get_device
 
 
 @dataclass
@@ -56,7 +56,7 @@ class TrainConfig:
     def from_mapping(cls, mapping: Mapping[str, Any] | None) -> "TrainConfig":
         valid = {f for f in cls.__dataclass_fields__}  # type: ignore[attr-defined]
         mapping = {k: v for k, v in dict(mapping or {}).items() if k in valid}
-        return cls(**mapping)
+        return cls(**coerce_dataclass_kwargs(cls, mapping))
 
     @classmethod
     def from_config(cls, cfg: Any, prefix: str = "train") -> "TrainConfig":

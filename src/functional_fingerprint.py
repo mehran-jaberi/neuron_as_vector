@@ -80,6 +80,8 @@ FINGERPRINT_PRESETS: dict[str, tuple[str, ...]] = {
         "class_temporal_dispersion",
         "class_latency",
     ),
+    # tuning + latency (secondary target)
+    "tuning_with_latency": ("class_rate", "class_latency"),
     # tuning + temporal combined (reference / secondary target)
     "tuning_plus_temporal": (
         "class_rate",
@@ -89,6 +91,58 @@ FINGERPRINT_PRESETS: dict[str, tuple[str, ...]] = {
         "class_latency",
     ),
 }
+
+# --------------------------------------------------------------------------
+# The ONE primary functional target (used by every script)
+# --------------------------------------------------------------------------
+#: Preset name of the pre-registered primary fingerprint:
+#: the 20-dimensional class-conditioned firing-rate profile.
+PRIMARY_FINGERPRINT_PRESET = "tuning"
+#: Secondary target (adds first-spike latency).
+SECONDARY_FINGERPRINT_PRESET = "tuning_with_latency"
+#: Exploratory target (time-resolved responses).
+EXPLORATORY_FINGERPRINT_PRESET = "temporal"
+
+#: Canonical preprocessing/distance settings for the primary metric. Every script
+#: must use exactly these (plus the same neurons and the same probe split).
+PRIMARY_FINGERPRINT_SETTINGS: dict[str, Any] = {
+    "standardize": "column",
+    "normalize_rows": False,
+    "metric": "euclidean",
+    "n_psth_bins": 10,
+    "min_spikes_for_latency": 1.0,
+    "eval_split": "probe",
+}
+
+
+def preset_fingerprint_config(preset: str, **overrides: Any) -> "FingerprintConfig":
+    """Canonical fingerprint configuration for a named preset.
+
+    Uses the shared preprocessing/distance settings unless overridden, so a script
+    cannot silently change the metric or the normalisation.
+    """
+    settings = dict(PRIMARY_FINGERPRINT_SETTINGS)
+    settings.update(overrides)
+    return FingerprintConfig(feature_sets=resolve_feature_sets(preset), **settings)
+
+
+def primary_fingerprint_config(**overrides: Any) -> "FingerprintConfig":
+    """The canonical primary fingerprint configuration (do not vary it per script)."""
+    return preset_fingerprint_config(PRIMARY_FINGERPRINT_PRESET, **overrides)
+
+
+def fingerprint_definition(config: "FingerprintConfig", *, dimension: int | None = None) -> dict[str, Any]:
+    """The complete, unambiguous definition of a fingerprint, for result artifacts."""
+    return {
+        "feature_sets": list(config.feature_sets),
+        "dimension": dimension,
+        "standardize": config.standardize,
+        "normalize_rows": bool(config.normalize_rows),
+        "distance_metric": config.metric,
+        "n_psth_bins": int(config.n_psth_bins),
+        "min_spikes_for_latency": float(config.min_spikes_for_latency),
+        "eval_split": config.eval_split,
+    }
 
 
 def resolve_feature_sets(value: Any) -> list[str]:

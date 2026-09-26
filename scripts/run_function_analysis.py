@@ -47,7 +47,13 @@ from _common import (  # noqa: E402
 )
 from _pipeline import build_fingerprints, build_representation_bundle  # noqa: E402
 from src.evaluation import split_half_indices  # noqa: E402
-from src.functional_fingerprint import FINGERPRINT_PRESETS, split_half_reliability  # noqa: E402
+from src.functional_fingerprint import (  # noqa: E402
+    EXPLORATORY_FINGERPRINT_PRESET,
+    FINGERPRINT_PRESETS,
+    PRIMARY_FINGERPRINT_PRESET,
+    fingerprint_definition,
+    split_half_reliability,
+)
 from src.function_analysis import run_function_analysis  # noqa: E402
 from src.utils import save_json  # noqa: E402
 
@@ -89,10 +95,10 @@ def main(argv: list[str] | None = None) -> int:
     fa = cfg.get_path("function_analysis", {}) or {}
     fa = dict(fa)
     presets = {str(k): list(v) if isinstance(v, list) else v for k, v in (fa.get("presets") or DEFAULT_PRESETS).items()}
-    primary_fp = str(fa.get("primary_fingerprint", "tuning"))
+    primary_fp = str(fa.get("primary_fingerprint", PRIMARY_FINGERPRINT_PRESET))
     rate_norm_fp = fa.get("rate_normalized_fingerprint", "tuning_rate_normalized")
     rate_norm_fp = str(rate_norm_fp) if rate_norm_fp else None
-    secondary_fps = [str(v) for v in fa.get("secondary_fingerprints", ["temporal", "tuning_plus_temporal"])]
+    secondary_fps = [str(v) for v in fa.get("secondary_fingerprints", [EXPLORATORY_FINGERPRINT_PRESET, "tuning_plus_temporal"])]
     n_perm = int(fa.get("n_perm", cfg.get_path("geometry.n_perm", 10000)))
     bootstrap = int(fa.get("bootstrap", 2000))
     k_values = [int(k) for k in fa.get("k_values", cfg.get_path("geometry.k_values", [3, 5, 10, 20]))]
@@ -221,6 +227,10 @@ def main(argv: list[str] | None = None) -> int:
                "config": space.config.to_dict(), "meta": space.meta}
         for name, space in fingerprints.items()
     }
+    summary["primary_preset"] = primary_fp
+    summary["primary_fingerprint"] = fingerprint_definition(
+        fingerprints[primary_fp].config, dimension=len(fingerprints[primary_fp].feature_names)
+    )
     summary["split_info"] = recs["split_info"]
     summary["model_extra_keys"] = sorted(extra.keys()) if isinstance(extra, dict) else []
 
