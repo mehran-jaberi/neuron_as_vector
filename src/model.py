@@ -386,6 +386,31 @@ def build_model(cfg: Config | SNNConfig, *, seed: int | None = None, device: Any
     return model
 
 
+ARCHITECTURE_KEYS: tuple[str, ...] = ("n_input", "n_hidden", "n_output", "n_bins", "bin_ms")
+
+
+def architecture_mismatches(
+    expected_model_block: Mapping[str, Any],
+    model: RecurrentLIFSNN | SNNConfig,
+) -> dict[str, tuple[Any, Any]]:
+    """Compare an analysis config's ``model`` block against a model's architecture.
+
+    Returns ``{key: (expected_value, actual_value)}`` for every architecture-defining
+    key that disagrees (``{}`` means they agree). Used to refuse a silent mismatch
+    between an analysis config and a checkpoint, which would otherwise make
+    downstream comparisons (e.g. an untrained-vs-trained model) scientifically
+    invalid without any error.
+    """
+    snn = model if isinstance(model, SNNConfig) else model.cfg
+    have = snn.to_dict()
+    expected = dict(expected_model_block)
+    return {
+        key: (expected.get(key), have.get(key))
+        for key in ARCHITECTURE_KEYS
+        if key in expected and expected.get(key) != have.get(key)
+    }
+
+
 def count_parameters(model: nn.Module) -> dict[str, int]:
     """Parameter counts, split into the blocks that the analysis cares about."""
     out = {}

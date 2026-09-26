@@ -25,7 +25,7 @@ from src.data import (  # noqa: E402
     make_validation_split,
     subset_by_class,
 )
-from src.model import RecurrentLIFSNN, build_model  # noqa: E402
+from src.model import RecurrentLIFSNN, architecture_mismatches, build_model  # noqa: E402
 from src.utils import (  # noqa: E402
     Config,
     describe_device,
@@ -234,6 +234,9 @@ def build_model_from_config(cfg: Config, *, seed: int, device: Any) -> Recurrent
     return model.to(device)
 
 
+# A config/checkpoint architecture mismatch is silent and scientifically invalid
+# (e.g. the untrained "before learning" model would see a different time window
+# than the trained one), so load_checkpoint turns it into a hard error.
 def load_checkpoint(cfg: Config, device: Any, tag: str | None = None) -> tuple[RecurrentLIFSNN, dict[str, Any]]:
     path = checkpoint_path(cfg, tag)
     if not path.exists():
@@ -242,6 +245,15 @@ def load_checkpoint(cfg: Config, device: Any, tag: str | None = None) -> tuple[R
             f"`uv run python scripts/train.py --config configs/baseline.yaml`."
         )
     model, extra = RecurrentLIFSNN.load(str(path), map_location="cpu")
+    mismatch = architecture_mismatches(cfg.get_path("model", {}) or {}, model)
+    if mismatch:
+        detail = ", ".join(f"model.{k}: config={a!r} vs checkpoint={b!r}" for k, (a, b) in mismatch.items())
+        overrides = " ".join(f"--override model.{k}={b}" for k, (_, b) in mismatch.items())
+        raise ValueError(
+            f"The analysis config's model block does not match checkpoint '{path.name}' "
+            f"({detail}). The architecture must agree, otherwise downstream comparisons "
+            f"(e.g. the before/after-learning model) are silently invalid. Fix with: {overrides}"
+        )
     return model.to(device), extra
 
 

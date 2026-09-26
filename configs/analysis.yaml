@@ -20,7 +20,7 @@ paths:
   figures_dir: figures
 
 run:
-  tag: baseline
+  tag: baseline_v2       # corrected 3-way-split checkpoint (700 bins, no leakage)
   device: auto
   verbose: true
   synthetic: false
@@ -31,18 +31,23 @@ run:
 data:
   download: true
   layout: auto
-  val_fraction: 0.1
+  # Whole-speaker splits carved from the official training file. `dev` is used for
+  # model selection; `probe` is locked and is the fingerprint/analysis split.
+  dev_fraction: 0.1
+  probe_fraction: 0.1
   prefer_speaker_aware: true
   split_seed: 0          # FIXED across seeds so only init/optimisation varies.
   debug: false
   max_per_class: null
 
 # Model block: MUST match the checkpoint (used to instantiate the architecture).
+# scripts/_common.load_checkpoint now refuses a mismatch instead of silently
+# building a differently-sized model.
 model:
   n_input: 700
   n_hidden: 256
   n_output: 20
-  n_bins: 500
+  n_bins: 700            # 700 bins x 2 ms = 1400 ms window (matches baseline.yaml)
   bin_ms: 2.0
   tau_mem_ms: 20.0
   tau_syn_ms: 5.0

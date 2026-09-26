@@ -7,7 +7,32 @@ import math
 import numpy as np
 import torch
 
-from src.model import SNNConfig, build_model, lif_voltage_update, surrogate_spike
+from src.model import (
+    SNNConfig,
+    architecture_mismatches,
+    build_model,
+    lif_voltage_update,
+    surrogate_spike,
+)
+
+
+def test_architecture_mismatches_detects_config_checkpoint_disagreement(tiny_snn_config):
+    model = build_model(tiny_snn_config, seed=0)
+    matching = {
+        "n_input": tiny_snn_config.n_input,
+        "n_hidden": tiny_snn_config.n_hidden,
+        "n_output": tiny_snn_config.n_output,
+        "n_bins": tiny_snn_config.n_bins,
+        "bin_ms": tiny_snn_config.bin_ms,
+    }
+    assert architecture_mismatches(matching, model) == {}
+    # a different time window (the classic silent footgun) is detected
+    bad = dict(matching, n_bins=tiny_snn_config.n_bins + 200)
+    mismatch = architecture_mismatches(bad, model)
+    assert set(mismatch) == {"n_bins"}
+    assert mismatch["n_bins"] == (tiny_snn_config.n_bins + 200, tiny_snn_config.n_bins)
+    # an empty / partial config block is not an error (nothing to compare)
+    assert architecture_mismatches({}, model) == {}
 
 
 def test_forward_logits_and_spike_count_shapes(tiny_model, tiny_input, tiny_snn_config):

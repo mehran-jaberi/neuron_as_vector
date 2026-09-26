@@ -51,7 +51,6 @@ import numpy as np
 from _common import (  # noqa: E402
     announce,
     apply_seed,
-    build_model_from_config,
     build_recordings,
     load_checkpoint,
     load_run_config,
@@ -70,7 +69,7 @@ from src.controls import (  # noqa: E402
 from src.evaluation import split_half_indices  # noqa: E402
 from src.functional_fingerprint import FingerprintConfig  # noqa: E402
 from src.geometry_analysis import geometry_function_analysis  # noqa: E402
-from src.model import count_parameters  # noqa: E402
+from src.model import build_model, count_parameters  # noqa: E402
 from src.utils import ensure_dir, save_json  # noqa: E402
 
 
@@ -213,7 +212,7 @@ def main(argv: list[str] | None = None) -> int:
     # ---- before vs after learning ----------------------------------------
     before_after = None
     if bool(cfg.get_path("controls.include_before_after", True)):
-        untrained = build_model_from_config(cfg, seed=seed, device=device)
+        untrained = build_model(model.cfg, seed=seed, device=device)
         nt = count_parameters(untrained)
         print(f"[before/after] untrained model params={nt['total']}")
 

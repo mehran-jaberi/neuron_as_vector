@@ -24,7 +24,6 @@ import numpy as np
 from _common import (  # noqa: E402
     announce,
     apply_seed,
-    build_model_from_config,
     build_recordings,
     load_checkpoint,
     load_run_config,
@@ -36,6 +35,7 @@ from _pipeline import build_fingerprints, build_representation_bundle  # noqa: E
 from src.controls import reliability_suite  # noqa: E402
 from src.evaluation import split_half_indices  # noqa: E402
 from src.functional_fingerprint import FINGERPRINT_PRESETS  # noqa: E402
+from src.model import build_model  # noqa: E402
 from src.rewiring import REWIRE_MODES, rewire_recurrent, rewiring_report  # noqa: E402
 from src.stress_test import (  # noqa: E402
     StressCondition,
@@ -188,7 +188,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # 2. before learning (SAME architecture, SAME initialisation seed, SAME probe)
     if include_before:
-        untrained = build_model_from_config(cfg, seed=seed, device=device)
+        untrained = build_model(model.cfg, seed=seed, device=device)
         before = _build_condition(
             "before_learning", untrained,
             metadata={"role": "untrained model, same architecture and init seed"}, **common,
