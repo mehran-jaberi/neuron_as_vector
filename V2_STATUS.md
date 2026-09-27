@@ -58,6 +58,7 @@ Layer contracts that must not be mixed up:
 | learned residual | a `NeuronRecordBank` (via a deterministic source view) | learned `(n, d_residual)` | yes (self-supervised) | **no** |
 | `NeuronVector` composition | structured vectors + residual vectors | `(n, d)` | — | **no** |
 | functional fingerprint / scientific evaluation | PROBE + class labels | evaluation metrics | — | yes (the only component allowed to) |
+| capacity evaluation (`src/vector_capacity.py`) | a frozen `(n, d)` matrix + PROBE targets | Mantel/kNN/prediction/control metrics | — | yes (targets only, never the representation) |
 
 ---
 
@@ -324,7 +325,7 @@ Allowed: `(n_neurons, k)` feature/weight matrices, `(n_neurons, d)` vectors, the
 ## 9. Tests
 
 ```
-uv run pytest -q    ->  335 passed
+uv run pytest -q    ->  368 passed
 ```
 
 | file | tests | covers |
@@ -334,6 +335,7 @@ uv run pytest -q    ->  335 passed
 | `tests/test_structured_vector.py` | 51 | exact 48-D baseline, prefix dimension policy, Level-1 detail, projection determinism/prefix-stability, block selection, neuron counts, chunking, label-freedom, V2-config integration |
 | `tests/test_residual.py` | 37 | source view and variants, no-labels API, probe-split rejection, relabelled-FIT invariance, masking determinism/targets, architecture and config validation, training diagnostics, SNN-frozen check, reproducibility, persistence with mismatch rejection, CPU precision fallback, memory guards |
 | `tests/test_neuron_vector.py` | 16 | 48/64/100 composition, coordinate order, provenance, `residual_d=0` exactness, config integration, schema/dimension mismatch rejection, determinism, chunking |
+| `tests/test_vector_capacity.py` | 33 | PROBE-only targets and split discipline, individual-stimulus target shape/definition/label-independence, frozen representations, the dimension invariant and matched-total decompositions, residual artifact selection, SNN isolation, reproducibility, memory shapes, result table + figures |
 | pre-existing suite | 127 | model, data, training, evaluation, geometry, prediction, fingerprint, controls, rewiring, permutation, reliability, NSB |
 
 ---
@@ -347,8 +349,10 @@ uv run pytest -q    ->  335 passed
   placeholder features are generated.
 * The structured encoder's projection coordinates are not individually interpretable.
 * The learned residual is a small MLP trained with masked reconstruction on FIT-derived
-  features; **no scientific evaluation of the residual has been performed** (no capacity
-  sweep, no PROBE analysis, no claim that it improves representation quality).
+  features. It has now been evaluated once on PROBE (§11): its presence does not separate the
+  measured primary/class-rate/temporal/CV metrics from the structured-only conditions at
+  matched total dimension, and the residual itself shows seed-to-seed spread of the same order
+  as those differences. No claim of improvement is made or supported.
 * The residual's `raw_view` coordinates are a fixed random projection of the raw
   connectivity, chosen for additional capacity; they are not individually interpretable.
 * Residual training is reproducible on a fixed device/dtype; CUDA is only bitwise
@@ -360,11 +364,154 @@ uv run pytest -q    ->  335 passed
 
 ---
 
-## 11. Next planned stage
+## 11. Scientific capacity evaluation (PROBE)
 
-1. Scientific capacity evaluation of `z_structured` and of `z = [z_structured, z_residual]`
-   at several dimensions, using the existing, unchanged evaluation stack
-   (`NeuronVectors.X` is already an `(n, d)` matrix, so `RepresentationSpace`, Mantel/kNN,
-   cross-validated prediction and the rate/random/shuffle controls apply unchanged) on PROBE —
-   the first stage allowed to touch PROBE.
-2. Only after that: temporal / network-context blocks, and any multi-layer work.
+The **first stage allowed to touch PROBE**. It measures how the information in the neuron
+representation changes with representation capacity, and what the learned residual adds
+beyond the deterministic structured component. It is an **evaluation study**: it reports
+measured values and uncertainty and deliberately produces **no ranking, no "best"
+dimension and no "improves"/"optimal" claim**. The SNN was not re-trained; the residual
+was not tuned on PROBE; the official TEST split was never opened.
+
+### Entry point and artifacts
+
+```bash
+uv run python scripts/evaluate_vector_capacity.py                 # full run, ~10 min
+uv run python scripts/evaluate_vector_capacity.py --quick         # smoke settings
+```
+
+| artifact | location |
+|---|---|
+| machine-readable table | `results/neuron_vector_capacity/results.csv` (14 rows), `results.json` (rows + per-seed summary + targets/preprocessing) |
+| provenance | `results/neuron_vector_capacity/metadata.json` |
+| activity + residual caches (checkpoint/split/seed-keyed) | `results/neuron_vector_capacity/cache/`, `.../residuals/` |
+| figures | `figures/neuron_vector_capacity/figure{1,2,3}_*.{png,pdf}` |
+
+### Conditions (11) and the prespecified comparisons
+
+| condition | total_d | structured_d | residual_d | seeds |
+|---|---|---|---|---|
+| `structured_32`, `structured_48`, `structured_64`, `structured_100`, `structured_128` | 32/48/64/100/128 | = total_d | 0 | — |
+| `full_48+16_seed{0,1,2}` | 64 | 48 | 16 | 0, 1, 2 |
+| `full_48+52_seed{0,1,2}` | 100 | 48 | 52 | 0, 1, 2 |
+
+Matched-total comparisons: `structured_64` vs `full_48+16` and `structured_100` vs
+`full_48+52`; `structured_48` is the common baseline. The two residual families have the
+same total dimension as their structured partners but a **different decomposition** — they
+are never treated as the same construction. No extra residual variants were trained and
+nothing was selected on PROBE.
+
+### Data, checkpoint, split
+
+* checkpoint `checkpoints/sweep_l2_0.pt` (`sha256` first 16 hex `ca6db04913814746`),
+  256 hidden neurons, 700 × 2 ms bins, `readout_mode=sum`, `neuron_param_mode=bias`; frozen
+  for every condition.
+* FIT **5922** samples (speakers 9, 3, 7, 11, 0, 10, 1) — representation construction and
+  residual training only; the residual's normalisation statistics come from FIT only.
+* PROBE **1236** samples (speakers 6, 8) — functional targets and metrics only.
+* split seed 0, strategy `speaker_aware_train_dev_probe`; the official TEST file is never
+  opened (`metadata.data.official_test_loaded = false`). One FIT activity pass and one
+  labelled PROBE pass are collected once and reused by every condition (verified caches).
+
+### Primary functional target (individual-stimulus responses)
+
+`R[h, s] = counts[s, h] / (n_bins · bin_ms / 1000)` Hz — the repository's existing firing-rate
+definition (`count / duration`) applied **per individual stimulus** instead of per class:
+`(n_neurons, n_probe_stimuli) = (256, 1236)`. No averaging across stimuli; each PROBE
+utterance is one column (`fp_stimulus.s####`). One "individual stimulus" is one SHD utterance
+(SHD has no repeated-stimulus identifier — limitation below). The target is label-free; it is
+built by the new `stimulus_response_fingerprint` in `src/functional_fingerprint.py`, which is
+now a registered feature set (`stimulus_response`) but explicitly **not** class-conditioned.
+A rate-magnitude-removed variant (row-L2-normalised profiles) serves as the primary rate control.
+
+### Secondary and exploratory targets (unchanged definitions)
+
+* `class_rate_20d`: the existing PRIMARY preset (`tuning`, 20 class-conditioned mean rates).
+* `temporal` (260-d): the existing exploratory preset — coarse class PSTH (20 classes ×
+  10 bins) + temporal centre + dispersion + (censored) first-spike latency.
+
+### Metrics (all from the existing stack)
+
+Mantel Spearman r on condensed Euclidean distances (representation `RepresentationSpace.X`
+under the canonical preprocessing: column z-scoring, `weighting="uniform"`, no row
+normalisation; target `FingerprintSpace.X`), one-sided neuron-relabelling permutation null
+with **2000 permutations**, **500**-resample neuron bootstrap 95% CI, rate-matched stratified
+Mantel, kNN effect sizes (k ∈ {3, 5, 10, 20}), and out-of-fold ridge / kNN prediction
+(`KFold` over neurons, 5 folds, folds **shared** across conditions and targets, `RidgeCV`
+alphas selected inside the training fold only). Permutation/bootstrap seed 0.
+
+### Measured results (observation, not interpretation)
+
+| representation | total_d | primary r | primary 95% CI | p | z | rate-matched r | rate-norm. r | class-rate r | temporal r | CV R² (ridge) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| structured_32 | 32 | +0.122 | [0.032, 0.227] | 0.0040 | 2.87 | +0.150 | +0.118 | +0.142 | +0.325 | +0.116 |
+| structured_48 | 48 | +0.113 | [0.030, 0.216] | 0.0055 | 2.68 | +0.117 | +0.129 | +0.139 | +0.319 | +0.117 |
+| structured_64 | 64 | +0.127 | [0.047, 0.230] | 0.0010 | 3.04 | +0.136 | +0.155 | +0.155 | +0.336 | +0.116 |
+| structured_100 | 100 | +0.119 | [0.034, 0.224] | 0.0035 | 2.83 | +0.132 | +0.133 | +0.146 | +0.327 | +0.112 |
+| structured_128 | 128 | +0.121 | [0.039, 0.229] | 0.0035 | 2.87 | +0.127 | +0.125 | +0.148 | +0.322 | +0.117 |
+| full_48+16 (seeds 0/1/2) | 64 | +0.114 / +0.123 / +0.113 | all CIs exclude 0 | 0.0025–0.0065 | 2.67–2.90 | +0.116–0.121 | +0.131–0.136 | +0.140–0.151 | +0.316–0.329 | +0.099–0.108 |
+| full_48+52 (seeds 0/1/2) | 100 | +0.129 / +0.119 / +0.128 | all CIs exclude 0 | 0.0010–0.0040 | 2.76–3.01 | +0.121–0.136 | +0.131–0.134 | +0.148–0.160 | +0.322–0.337 | +0.112–0.128 |
+| control_rate_only | 1 | +0.663 | [0.587, 0.727] | 0.0005 | 19.42 | +0.279 | −0.119 | +0.721 | +0.423 | +0.426 |
+| control_random_100 | 100 | −0.054 | [−0.112, 0.026] | 0.936 | −1.50 | −0.039 | +0.035 | −0.060 | −0.002 | −0.015 |
+| control_neuron_shuffle_100 | 100 | +0.041 | [−0.020, 0.124] | 0.159 | 1.02 | +0.049 | −0.023 | +0.048 | +0.020 | −0.024 |
+
+p-values are floored at 1/(2000+1) = 5.0 × 10⁻⁴. Residual seed means (SD over 3 seeds) on
+the primary metric: **0.1169 (0.0042)** for 48+16 and **0.1253 (0.0045)** for 48+52. kNN
+best-k = 3 for every real
+representation (z = 3.3–4.2) and k = 5/20 for the random/shuffle controls (z = −0.28 / 1.42).
+
+**Patterns in the measured values** — stated as observations only:
+
+* the primary correspondence is positive for every structured and residual condition
+  (r ≈ +0.11 … +0.13, all bootstrap CIs excluding 0);
+* it is **flat** across d = 32 → 128 (no monotone trend) and the residual-seed spread is
+  comparable to the differences between total dimensions;
+* on matched totals, `full_48+16` does **not** exceed `structured_64` on the primary metric,
+  and `full_48+52` is within the seed spread of `structured_100`; the same holds for the
+  class-rate, temporal and CV-R² columns;
+* the 1-dimensional **FIT rate-only control reaches r = +0.663**, far above every 32–128-D
+  representation on the same target; after removing response magnitude (rate-normalised
+  target) its r drops to −0.119, and the rate-matched Mantel gives +0.279;
+* random and neuron-shuffle controls are small and not distinguishable from their nulls.
+
+These are descriptive measurements at one checkpoint and one split seed; they are not a
+statement about a "best" dimension, and no post-hoc trend is fitted.
+
+### Documentation deviations and harness corrections (smallest fixes)
+
+* `condition_matrix` selected the residual artifact by **seed only**, which cannot hold two
+  residual dimensions per seed; it now resolves `{residual_d: {seed: artifact}}` (or a flat
+  seed map) and **verifies** `artifact.residual_dim == condition.residual_d`
+  (`select_residual`). Regression-tested.
+* `stimulus_response` was registered in `FINGERPRINT_FEATURE_SETS` (complete configuration /
+  provenance surface) and `class_conditioned_fingerprint` now raises a clear error if it is
+  ever routed through class-conditioned statistics. Regression-tested.
+* the kNN headline in `evaluate_condition` is now taken from the existing
+  `primary_metric_row` instead of a second, differently-ordered selection rule.
+* No existing scientific definition, metric, split or preprocessing convention was changed.
+
+### Limitations (of this evaluation)
+
+* "Individual stimulus" = one SHD utterance; SHD provides no repeated-stimulus identifier, so
+  repeated recordings across speakers cannot be grouped. The primary target therefore
+  preserves utterance-level variance by definition.
+* The primary target has 1236 columns (allowed `(n_neurons, n_stimuli)` target, ~2.5 MB);
+  it is standardised column-wise, so columns with near-zero variance contribute little.
+* p-values come from a neuron-relabelling Mantel null with a resolution floor; the study
+  reports effect sizes, CIs and seed spread and runs no family-wise significance campaign
+  across the 11 conditions.
+* The bootstrap CI uses the repository's naive neuron bootstrap (duplicated neurons are a
+  documented limitation of that implementation).
+* Residuals were trained on CPU in float32 (recorded); residual training reproducibility on
+  CUDA is only as documented for the other models.
+* One checkpoint (`sweep_l2_0.pt`) and one split seed (0); no cross-checkpoint replication.
+
+---
+
+## 12. Next planned stage
+
+1. Temporal / network-context record blocks, using this evaluation layer unchanged.
+2. Only after that: multi-layer support.
+
+This capacity evaluation stage is complete and intentionally stops here: no temporal /
+network-context implementation and no architecture change was made.

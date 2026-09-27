@@ -57,6 +57,13 @@ import numpy as np
 from .utils import Standardizer, sanitize_features
 
 # Feature-set names available for the fingerprint.
+#
+# The first seven families are built from **class-conditioned** statistics by
+# :func:`class_conditioned_fingerprint`. The final entry, ``stimulus_response``, is the
+# primary target of the capacity study and is deliberately *not* class-conditioned: it is
+# built from the per-sample spike counts by :func:`stimulus_response_fingerprint` (one
+# column per individual stimulus), so it is registered here for a complete configuration /
+# provenance surface but must never be passed to :func:`class_conditioned_fingerprint`.
 FINGERPRINT_FEATURE_SETS = (
     "class_rate",
     "class_rate_norm",
@@ -65,6 +72,7 @@ FINGERPRINT_FEATURE_SETS = (
     "class_psth",
     "class_temporal_center",
     "class_temporal_dispersion",
+    "stimulus_response",
 )
 
 # Named presets that map the fingerprint families A / B / C onto feature sets.
@@ -332,6 +340,13 @@ def class_conditioned_fingerprint(
         elif fs == "class_temporal_dispersion":
             parts.append(t_disp.T)
             names += [f"fp_tdispersion.class{c}" for c in range(C)]
+        elif fs == STIMULUS_RESPONSE_FEATURE_SET:
+            raise ValueError(
+                f"{fs!r} is not a class-conditioned feature set: the individual-stimulus "
+                "response target is built from per-sample counts by "
+                "stimulus_response_fingerprint(counts, bin_ms=..., n_bins=...), not from "
+                "class-conditioned statistics"
+            )
         else:  # pragma: no cover - resolve_feature_sets validates
             raise ValueError(f"Unknown fingerprint feature set: {fs}")
 
@@ -348,6 +363,63 @@ def class_conditioned_rate_matrix(
     duration_s = T * bin_ms / 1000.0
     n_per_class = np.where(np.asarray(class_n, dtype=np.float64) > 0, np.asarray(class_n, dtype=np.float64), 1.0)
     return class_psth.sum(axis=2) / (n_per_class.reshape(-1, 1) * max(duration_s, 1e-9))
+
+
+# --------------------------------------------------------------------------
+# Individual-stimulus response target (primary target of the capacity study)
+# --------------------------------------------------------------------------
+#: Feature-set name of the individual-stimulus response target.
+STIMULUS_RESPONSE_FEATURE_SET = "stimulus_response"
+
+
+def stimulus_response_fingerprint(
+    counts: np.ndarray,
+    *,
+    bin_ms: float,
+    n_bins: int,
+) -> tuple[np.ndarray, list[str]]:
+    """Per-neuron response to **each individual stimulus**: ``(n_hidden, n_stimuli)``.
+
+    Definition (reuses the repository's firing-rate definition ``count / duration``,
+    i.e. exactly what :func:`class_conditioned_rate_matrix` computes per class, but
+    here per *sample*):
+
+    .. math::
+
+        R[h, s] = \\frac{\\text{counts}[s, h]}{T \\cdot \\Delta t / 1000} \\quad [\\mathrm{Hz}]
+
+    where ``s`` indexes the evaluated split's samples in their stored order and ``h`` the
+    hidden neurons. **No averaging across stimuli is performed**: every sample of the
+    evaluated split contributes its own column, so stimulus-level variation is preserved
+    (this is the primary functional target of the capacity study). Column ``s`` is named
+    ``fp_stimulus.s<s:04d>``.
+
+    One "individual stimulus" here is one SHD utterance (one recording example). SHD
+    provides no repeated-stimulus identifier that would group utterances across speakers
+    or recordings, so utterances are treated as distinct stimuli by definition; the
+    limitation is documented in ``V2_STATUS.md``.
+    """
+    counts = np.asarray(counts, dtype=np.float64)
+    if counts.ndim != 2:
+        raise ValueError(f"counts must be (n_samples, n_hidden), got {counts.shape}")
+    duration_s = float(n_bins) * float(bin_ms) / 1000.0
+    if duration_s <= 0:
+        raise ValueError(f"invalid stimulus duration: n_bins={n_bins}, bin_ms={bin_ms}")
+    response = counts.T / duration_s  # (n_hidden, n_samples) in Hz
+    names = [f"fp_stimulus.s{s:04d}" for s in range(response.shape[1])]
+    return sanitize_features(response), names
+
+
+def stimulus_response_config(**overrides: Any) -> "FingerprintConfig":
+    """Canonical :class:`FingerprintConfig` for the individual-stimulus target.
+
+    Uses the shared PRIMARY preprocessing/distance settings (column standardisation,
+    Euclidean metric, no row normalisation) so the target is evaluated exactly like every
+    other fingerprint; only the feature set differs.
+    """
+    settings = dict(PRIMARY_FINGERPRINT_SETTINGS)
+    settings.update(overrides)
+    return FingerprintConfig(feature_sets=[STIMULUS_RESPONSE_FEATURE_SET], **settings)
 
 
 # --------------------------------------------------------------------------
