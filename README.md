@@ -18,8 +18,10 @@ The intended target is a [SNUFA](https://snufa.net/) 2026 submission.
 > moved (not deleted) to [`archive/documentation/`](archive/documentation/), and the
 > archived intermediate run artefacts are listed in
 > [`archive/ARCHIVE_MANIFEST.md`](archive/ARCHIVE_MANIFEST.md). The representation
-> architecture is now **frozen** and driven from one control panel (see
-> [V2 neuron-vector pipeline](#v2-neuron-vector-pipeline-stable-entry-point) below).
+> architecture is now **frozen** and driven from one backend through two interfaces: the
+> Jupyter control panel (`notebooks/V2_Control_Panel.ipynb`, primary interactive) and the
+> CLI (`scripts/v2_control_panel.py`, headless/reproducible) - see
+> [V2 neuron-vector pipeline](#v2-neuron-vector-pipeline-stable-entry-point) below.
 
 > **Result in one line** (see [§7](#7-results) for the full analysis): a label-free
 > representation built only from the network's parameters predicts individual
@@ -32,8 +34,27 @@ The intended target is a [SNUFA](https://snufa.net/) 2026 submission.
 
 ## V2 neuron-vector pipeline (stable entry point)
 
-Everything the frozen V2 architecture does is reachable from one control panel
-(`src/v2_pipeline.py` is the stable API; `scripts/v2_control_panel.py` is the CLI):
+There are two interfaces over the **same backend** (`src/v2_pipeline.py`): a Jupyter notebook for
+interactive work and a CLI for headless/reproducible runs. Both resolve the same configuration,
+produce the same run ids and write the same artifacts - neither contains scientific logic of its
+own.
+
+### Interactive control panel (primary): `notebooks/V2_Control_Panel.ipynb`
+
+```bash
+# any Jupyter kernel works (the repository's venv does not ship one; ipywidgets is optional)
+jupyter lab            # then open notebooks/V2_Control_Panel.ipynb
+```
+
+Sections: environment/setup -> presets -> dimensions -> structural blocks -> functional-response
+source -> temporal source -> residual controls -> memory/precision -> checkpoint -> evaluation
+settings -> **validate + resolved preview** -> safety -> **build (FIT)** -> **inspect** ->
+**evaluate (PROBE, optional)** -> run identity -> reproducibility -> parent summary -> recipes.
+Each control is an ordinary editable variable (`ipywidgets` forms are used when available), the
+heavy steps live in their own cells, and a typo or an invalid combination is reported immediately.
+The notebook layer is `src/v2_panel.py` (state -> dotted overrides -> the backend).
+
+### Headless / reproducible control panel: `scripts/v2_control_panel.py`
 
 ```bash
 # inspect: resolve + validate + print the exact plan (loads no data, trains nothing, never evaluates)

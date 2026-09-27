@@ -12,6 +12,7 @@ itself and the tests.
 | document | role |
 |---|---|
 | `README.md` | project overview + the canonical V1 / neuron-space-baseline scientific experiment and its recorded results |
+| `notebooks/V2_Control_Panel.ipynb` | the **primary interactive interface** of the frozen V2 architecture (configure → validate → build → inspect → evaluate); its code layer is `src/v2_panel.py`, and the headless equivalent is `scripts/v2_control_panel.py` |
 | `VECTOR_V2_AUDIT.md` | the design audit behind the V2 architecture (measured memory model, forbidden tensors, design rules) |
 | **`V2_STATUS.md`** (this file) | the implemented V2 architecture: configuration, record bank, structured encoder, learned residual, composition, tests, limitations |
 | `archive/README.md` | what the archive is and the rules for using it |
@@ -484,11 +485,12 @@ count: the whole projection and temporal summarisation happen in NumPy on the CP
 ## 9. Tests
 
 ```
-uv run pytest -q    ->  537 passed
+uv run pytest -q    ->  565 passed
 ```
 
 | file | tests | covers |
 |---|---|---|
+| `tests/test_v2_panel.py` | 28 | the notebook-facing layer: control metadata covering every `V2Config` field (both directions), backend-sourced defaults, immediate and atomic control validation, the dimension invariant, delta-only overrides, state resolution equal to the CLI path, protocol-drift detection, preview/reproducibility/safety blocks, cache inventory, checkpoint enumeration/details/compatibility, the 48-D regression anchor through the panel path, the functional_64 smoke (48+16 with the functional-response source in the residual view), inspection, load-before-build errors, the separate PROBE evaluation, model-free dry run, the fail-fast checkpoint check, the optional-widget fallback, and **the notebook itself**: valid nbformat, unique ids, every code cell compiles, no package installation, no duplicated metric/logic, all required sections and tags, and a kernel-free execution of every `panel:auto` cell (nothing built, nothing written, no PROBE/TEST access) |
 | `tests/test_v2_pipeline.py` | 61 | control panel: default = historical 48-D anchor, dimension semantics (48+0 / 48+16 / 48+52, plus 64/100 structured and 58 temporal), every preset's documented decomposition, dotted overrides (and a warning for unknown keys), validation rejections (dimensions, blocks, `network_context`, multi-layer, precision, memory, mask mode, standardization, targets), dry run loading no data / writing nothing, deterministic and value-based run ids, exact equality with the lower-level modules, artifact round-trip + rejection of wrong run id/dimension/names/hash, residual-protocol cache verification (retrain on mismatch), FIT-only build (no PROBE activity), the parent summary's sections, and the quiet-pytest result handling |
 | `tests/test_v2_config.py` | 59 | configuration defaults, backward compatibility of the four existing configs, dimension invariant, dtype/device/storage validation, token budget, CLI overrides, the residual protocol surface and its acceptance in strict mode |
 | `tests/test_neuron_record.py` | 45 | columnar structure, orientation (incoming row / outgoing column), label-free guarantees, exact 48-D compatibility, memory guards, provenance |
@@ -1089,6 +1091,43 @@ stable to *configure, reproduce, cache and inspect*; it does **not** mean the re
 been shown to be optimal. No best dimension and no best normalisation was established (§11–§12),
 nothing is selected from PROBE, and no new representation source was added in this stage.
 
+### Interface hierarchy
+
+| layer | what it is | entry point |
+|---|---|---|
+| **primary interactive interface** | the Jupyter control panel: configure, validate, build, inspect, evaluate, with editable variables (optional `ipywidgets` forms) and one operation per cell | `notebooks/V2_Control_Panel.ipynb` |
+| notebook-facing state layer | turns a *panel state* (a plain dict) into dotted overrides and calls the backend; no widgets and no scientific logic required | `src/v2_panel.py` (`PANEL_SCHEMA = "v2_panel_state/v1"`) |
+| **headless / reproducible interface** | the CLI control panel used by scripts, CI and `--summary-for-parent` | `scripts/v2_control_panel.py` |
+| **backend** | the stable API both interfaces call: resolve, build, inspect, evaluate | `src/v2_pipeline.py` (`SCHEMA = "v2_pipeline/v1"`) |
+
+Notebook and CLI are two faces of one backend: the same state/preset resolves to the same
+`run_id` and the same artifacts (verified: `historical_48` -> `7b71be5d019bab02` and
+`functional_64` -> `94070d411b2c82a0` from both interfaces). Neither interface contains a metric,
+a distance, an encoder or a fitting routine of its own.
+
+### Notebook control panel (`notebooks/V2_Control_Panel.ipynb`)
+
+The notebook is organised as one section per cell group: environment/setup (robust repo-root
+detection, version report, no dataset read) -> **presets** (asked from the backend, so a new
+preset appears automatically) -> dimensions (the `d = structured_d + residual_d` equation is
+shown and checked immediately; `d` is derived, never stored) -> **structural blocks** (only
+implemented blocks are selectable; `network_context = not implemented` is displayed and not
+offered) -> **functional-response source** -> **temporal source** -> **residual controls** (the
+established protocol is pre-loaded and any drift from it is printed) -> **compute/memory/precision**
+-> **checkpoint** (enumerated by the panel, with architecture, hash and config compatibility)
+-> **evaluation settings** -> **validate + resolved preview** (the notebook's dry run, using the
+real `V2Config` validation) -> **safety** (FIT / PROBE / TEST always displayed; no selectable TEST)
+-> **build/load** (FIT only, cache-aware) -> **inspect** (shape, coordinate groups, finiteness,
+per-group statistics, provenance, content hash) -> **evaluate on PROBE** (explicitly separate,
+loads the frozen artifact and never modifies it) -> run identity/metadata -> reproducibility block
+-> parent summary -> workflow recipes.
+
+Discipline kept in the notebook: it installs nothing, performs no expensive operation implicitly
+(the build/inspect/evaluate cells are separate and tagged), reads no TEST data, and any invalid
+control is rejected in the cell that made it (immediate type/range/choice checks) or by the
+backend when the configuration is validated. `state -> dotted overrides` emits **only the changed
+values**, so the notebook's "change one control" workflow stays auditable.
+
 ### Stable API (`src/v2_pipeline.py`)
 
 One high-level entry point wraps the whole pipeline; scripts no longer need to know the internals
@@ -1114,6 +1153,22 @@ evaluation = run.evaluate()                       # PROBE only: Mantel / predict
 | `parent_summary(...)` | the machine-readable project-state block used for session hand-off |
 | `test_suite_status(...)` | collected test count and (optionally) the recorded full-suite result |
 
+Panel-facing state layer (`src/v2_panel.py`, used by the notebook; the CLI does not need it):
+
+| entry point | role |
+|---|---|
+| `panel_controls()` / `control_index()` / `controls_by_group(...)` | control metadata (name, dotted key, kind, group, choices, help); a test asserts every control maps to a real configuration field **and** that every field is exposed |
+| `default_state(preset=...)` | the baseline state, read from a resolved `V2Config` (so defaults cannot drift) |
+| `set_controls(state, ...)` | immediate type/range/choice/block validation; atomic (never half-applies) |
+| `dimension_check(state)` | the `d = structured_d + residual_d` invariant and the residual/source consistency |
+| `state_to_overrides(state)` | dotted `--override` list containing **only** the changed values |
+| `resolve_state` / `validate_state` | the backend call (`validate_state` additionally verifies the checkpoint architecture, fail-fast) |
+| `resolved_preview` / `preview_lines` | the grouped resolved-configuration preview (the notebook's dry run) |
+| `checkpoint_candidates` / `checkpoint_details` / `checkpoint_mismatches` | checkpoint selector support |
+| `build_from_state` / `load_from_state` / `inspect_artifact` / `inspect_from_state` / `evaluate_from_state` | the notebook's operations (identical to the CLI paths) |
+| `cache_inventory` / `protocol_drift` / `safety_lines` / `reproducibility_lines` / `state_export` | display and audit helpers |
+| `widget_support` / `make_widgets` | optional `ipywidgets` forms; return `None`/report clearly when `ipywidgets` is absent (this environment) |
+
 Public identifiers: `SCHEMA = "v2_pipeline/v1"`, `RUN_ID_SCHEMA = "v2_run_id/v1"`,
 `COMPONENT_SCHEMAS` (the schema of every component a frozen artifact depends on), `DATA_POLICY`,
 `PRESETS`, `PRESET_DECOMPOSITIONS`, `PipelineError`, `ResolvedConfig`, `BuildResult`,
@@ -1121,7 +1176,7 @@ Public identifiers: `SCHEMA = "v2_pipeline/v1"`, `RUN_ID_SCHEMA = "v2_run_id/v1"
 `src.neuron_vector.ARTIFACT_SCHEMA = "neuron_vector_artifact/v1"` and the residual module gained
 `PROTOCOL_FIELDS` / `residual_training_mismatches(...)`.
 
-### Control panel (`scripts/v2_control_panel.py`)
+### Control panel (`scripts/v2_control_panel.py`, headless/reproducible)
 
 ```bash
 uv run python scripts/v2_control_panel.py --list-presets
@@ -1269,11 +1324,12 @@ record-bank storage, and any automatic selection of dimension, normalisation, se
 No execution path was archived: every existing script is either the canonical reproduction of a
 completed scientific stage (`evaluate_vector_capacity.py`, `evaluate_vector_rate_robustness.py`,
 `evaluate_vector_source_extension.py` — the latter two import shared helpers from the first),
-part of the historical V1 pipeline, or referenced by tests (`show_v2_config.py`). The **one
-obvious V2 execution path is now the control panel**; `scripts/show_v2_config.py` remains as the
-configuration-only demonstrator and now points to the panel. The three stage scripts are *not*
-superseded — they hold the studies' prespecified condition logic and their cached artifacts are
-reused through the shared cache-key convention.
+part of the historical V1 pipeline, or referenced by tests (`show_v2_config.py`). There are now
+exactly two active V2 interfaces over one backend — the notebook (`notebooks/V2_Control_Panel.ipynb`
+via `src/v2_panel.py`) and the CLI (`scripts/v2_control_panel.py`) — and `scripts/show_v2_config.py`
+remains the minimal configuration-only demonstrator, pointing at them. The three stage scripts are
+*not* superseded — they hold the studies' prespecified condition logic and their cached artifacts
+are reused through the shared cache-key convention.
 
 ---
 

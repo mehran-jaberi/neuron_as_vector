@@ -712,7 +712,10 @@ def resolve_config(
     This is the function behind ``--dry-run``: it reads the YAML, applies the preset and
     the CLI overrides, resolves the *existing* V2 validation, enforces the pipeline's own
     hard rules (implemented blocks only, single-layer SNN, fp32 model precision) and
-    fingerprints the checkpoint. It never opens a dataset, a bank or a residual.
+    fingerprints the checkpoint (the file bytes, not the model). It never opens a dataset, a
+    bank, a residual or the SNN, and it trains nothing. The architecture of the selected
+    checkpoint is verified when the representation is built - and, for immediate feedback, by
+    :func:`src.v2_panel.validate_state` - not here.
     """
     if evaluation_mode not in SUPPORTED_EVALUATION_MODES:
         raise PipelineError(
@@ -1712,7 +1715,9 @@ CORE_MODULES: tuple[str, ...] = (
     "src/residual.py (learned residual)",
     "src/neuron_vector.py (composition + frozen artifact)",
     "src/v2_pipeline.py (stable API + presets + run identity)",
+    "src/v2_panel.py (notebook-facing control-surface state layer)",
     "src/vector_capacity.py / rate_robustness.py / source_extension.py (evaluation layers)",
+    "notebooks/V2_Control_Panel.ipynb + scripts/v2_control_panel.py (the two interfaces)",
 )
 
 SCIENTIFIC_STATE = (
@@ -1779,9 +1784,10 @@ def parent_summary(
         "=== V2 PARENT SUMMARY ===",
         "",
         "STATUS:",
-        "Representation architecture frozen; one canonical control panel "
-        "(scripts/v2_control_panel.py) drives build/evaluate through src/v2_pipeline.py; "
-        "no new representation source, no network_context, no multi-layer support, TEST never used.",
+        "Representation architecture frozen; one backend (src/v2_pipeline.py) with two interfaces - "
+        "the Jupyter control panel (notebooks/V2_Control_Panel.ipynb, primary interactive) and the "
+        "CLI (scripts/v2_control_panel.py, headless/reproducible); no new representation source, "
+        "no network_context, no multi-layer support, TEST never used.",
         "",
         "TESTS:",
         tests_line,
@@ -1827,6 +1833,9 @@ def parent_summary(
         "checks, and the control panel additionally verifies the training protocol before reuse",
         "",
         "CONTROL PANEL:",
+        "  interactive (primary): notebooks/V2_Control_Panel.ipynb (state layer src/v2_panel.py)",
+        "    edit the controls in place -> validate -> build (FIT) -> inspect -> evaluate (PROBE, optional)",
+        "  headless (reproducible): uv run python scripts/v2_control_panel.py ...",
         "  uv run python scripts/v2_control_panel.py --list-presets",
         "  uv run python scripts/v2_control_panel.py --preset historical_48 --dry-run",
         "  uv run python scripts/v2_control_panel.py --preset functional_64            # build (FIT only)",
