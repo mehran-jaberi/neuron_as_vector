@@ -1,0 +1,101 @@
+# -----------------------------------------------------------------------------
+# v2_example.yaml - V2 CONFIGURATION DEMONSTRATION ONLY.
+#
+# This file exists to show and exercise the new V2 configuration sections
+# (`vector`, `memory`, `precision`, `experiment`) together with the future
+# network keys (`model.model_type`, `model.n_layers`, `model.neurons_per_layer`).
+#
+# It is NOT a scientific experiment: no pipeline reads it automatically and no
+# result depends on it. Inspect / change it with:
+#
+#   uv run python scripts/show_v2_config.py
+#   uv run python scripts/show_v2_config.py --override vector.d=64 \
+#       --override vector.structured_d=48 --override vector.learned_residual_d=16 \
+#       --override vector.residual.enabled=true \
+#       --override memory.record_batch_size=16 \
+#       --override precision.vector_dtype=fp16
+#
+# An existing config without any V2 section still loads with the same defaults
+# shown here (d = structured_d = 48, learned_residual_d = 0, residual disabled).
+# -----------------------------------------------------------------------------
+
+seed: 0
+
+run:
+  tag: v2_example          # bookkeeping only; nothing is trained by this file
+  device: auto             # "auto" | "cpu" | "cuda"
+  verbose: true
+  synthetic: true          # demo config: never touches the SHD data
+
+# ---------------------------------------------------------------------------
+# Existing model block. The SNN implementation is unchanged; `model_type`,
+# `n_layers` and `neurons_per_layer` are the configuration interface for later
+# stages (only model_type=recurrent_lif, n_layers=1 are implemented today).
+# ---------------------------------------------------------------------------
+model:
+  n_input: 700
+  n_hidden: 256            # n in the V2 notation (unchanged name on purpose)
+  n_output: 20
+  n_bins: 700              # unchanged 700-bin / 2 ms baseline
+  bin_ms: 2.0
+  model_type: recurrent_lif
+  n_layers: 1
+  # neurons_per_layer: null   # default: [n_hidden] repeated n_layers times
+
+# ---------------------------------------------------------------------------
+# V2 vector configuration (configuration interface only; no encoder yet).
+#
+# Invariant:  d = structured_d + learned_residual_d
+# At most one of the three may be omitted (derived); the defaults reproduce the
+# current 48-D structural representation with the residual disabled.
+# ---------------------------------------------------------------------------
+vector:
+  d: 48
+  structured_d: 48
+  learned_residual_d: 0
+  # Any subset of:
+  #   intrinsic | input_conn | recurrent_in | recurrent_out   (implemented)
+  #   activity                                               (implemented)
+  #   temporal | network_context                             (not implemented yet)
+  enabled_blocks: [intrinsic, input_conn, recurrent_in, recurrent_out]
+  temporal_resolution: 10    # coarse time bins for the future temporal block
+  context_depth: 0           # graph-context hops for the future network_context block
+  residual:
+    enabled: false           # learned residual: not implemented in this stage
+
+# ---------------------------------------------------------------------------
+# V2 memory controls. Batch sizes default to the existing train block when not
+# set here; record_batch_size defaults to the audit's recommended 32-64 range.
+# ---------------------------------------------------------------------------
+memory:
+  train_batch_size: 128      # audit: ~610 MiB peak at B=128
+  eval_batch_size: 256       # audit: ~490 MiB peak at B=256
+  record_batch_size: 32      # recorded passes retain two (B,T,H) trace sets
+  activity_chunk_size: 32
+  representation_chunk_size: 256
+  device: auto               # "auto" | "cpu" | "cuda"
+  storage: cpu               # "cpu" | "gpu" | "memmap"
+  mixed_precision: false
+  max_input_tokens: 150000000  # B*T*C cap; 0 disables (B=256,T=700,C=700 is 125.4M)
+
+# ---------------------------------------------------------------------------
+# Numerical / storage precision. Capacity (d) and precision are separate
+# concepts: this section never changes d or the scientific result.
+# Only float32 training is implemented today.
+# ---------------------------------------------------------------------------
+precision:
+  vector_dtype: float32      # float32 | float16 | bfloat16 (bfloat16 needs storage=gpu)
+  activity_dtype: float32
+  model_dtype: float32
+
+# ---------------------------------------------------------------------------
+# Experiment controls: all null -> derived from the existing blocks
+# (run.synthetic, data.prefer_speaker_aware, top-level seed). n_fit / n_probe are
+# declared EXPECTED split sizes (checked, never used to re-split the data).
+# ---------------------------------------------------------------------------
+experiment:
+  dataset: null
+  split: null
+  n_fit: null
+  n_probe: null
+  seed: null
