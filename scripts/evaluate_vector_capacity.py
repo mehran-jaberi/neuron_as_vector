@@ -37,7 +37,7 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from _common import PROJECT_ROOT, load_config  # noqa: F401  (adds the project root to sys.path)
+from _common import PROJECT_ROOT, display_path, load_config  # noqa: F401  (adds the project root to sys.path)
 
 from src.capacity_figures import write_all_figures  # noqa: E402
 from src.data import (  # noqa: E402
@@ -362,7 +362,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"[bank] {bank.n_neurons} neurons, blocks={list(bank.block_names)} (cache={fit_from_cache})")
 
     # -- learned residuals (FIT only, one artifact per residual dimension x seed)
-    source_config = ResidualSourceConfig(enabled_blocks=tuple(v2.vector.enabled_blocks))
+    source_config = ResidualSourceConfig.from_v2_config(v2)
     source = build_residual_source(bank, source_config)
     print(f"[residual] source dimension F={source.n_features} (schema {source.schema_hash[:12]})")
 
@@ -489,7 +489,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         csv_path=out_dir / "results.csv",
         json_path=out_dir / "results.json",
     )
-    metadata["outputs"] = {k: str(v.relative_to(PROJECT_ROOT)) for k, v in written.items()}
+    metadata["outputs"] = {k: display_path(v) for k, v in written.items()}
     if not args.no_figures:
         written_figs = write_all_figures(result, figures_dir, curve_condition="structured_48")
         metadata["figures"] = written_figs

@@ -206,12 +206,13 @@ def test_enabled_blocks_normalization_and_validation():
         VectorConfig.from_mapping({"enabled_blocks": []})
 
 
-def test_future_blocks_are_accepted_but_reported_unimplemented():
+def test_blocks_are_accepted_and_reported_implemented_or_not():
     v = VectorConfig.from_mapping(
         {"enabled_blocks": ["intrinsic", "temporal", "network_context"], "context_depth": 2}
     )
     assert v.enabled_blocks == ["intrinsic", "temporal", "network_context"]
-    assert set(v.unimplemented_blocks) == {"temporal", "network_context"}
+    # temporal is genuinely implemented now; network_context is still declared only
+    assert set(v.unimplemented_blocks) == {"network_context"}
     assert v.context_depth == 2
 
 
@@ -484,11 +485,16 @@ def test_strict_mode_rejects_unimplemented_requests():
     with pytest.raises(V2ConfigError):
         V2Config.from_config(multi, strict=True, warn=False)
 
-    blocks = Config({"vector": {"enabled_blocks": ["intrinsic", "temporal"]}})
+    blocks = Config({"vector": {"enabled_blocks": ["intrinsic", "network_context"]}})
     v2 = V2Config.from_config(blocks, warn=False)
-    assert v2.vector.unimplemented_blocks == ["temporal"]
+    assert v2.vector.unimplemented_blocks == ["network_context"]
     with pytest.raises(V2ConfigError):
         V2Config.from_config(blocks, strict=True, warn=False)
+
+    # temporal is implemented, so a temporal-only request no longer trips strict mode
+    temporal = Config({"vector": {"enabled_blocks": ["intrinsic", "temporal"]}})
+    assert V2Config.from_config(temporal, warn=False).vector.unimplemented_blocks == []
+    V2Config.from_config(temporal, strict=True, warn=False)
 
     residual = Config({"vector": {"d": 64, "structured_d": 48, "learned_residual_d": 16, "residual": {"enabled": True}}})
     with pytest.raises(V2ConfigError):

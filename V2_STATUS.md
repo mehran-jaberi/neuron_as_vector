@@ -33,11 +33,27 @@ frozen SNN checkpoint  +  label-free FIT recordings
                  v
         NeuronRecordBank                 <- source information (columnar, label-free)
                  |
-      +----------+-----------+
-      |                      |
-      v                      v
-StructuredVectorEncoder   LearnedResidual (self-supervised, FIT only)
-      |                      |
+    +------------+--------------+-----------------------------+
+    |                           |                             |
+    v                           v                             v
+structural blocks      temporal block (coarse        activity block
+(intrinsic, input,     FIT PSTH bins; only when       (12 summaries + the
+ rec in/out)           requested)                    (n_fit_samples, n)
+                                                     stored counts)
+    |                           |                             |
+    |                           |                             v
+    |                           |              FunctionalResponseSource
+    |                           |              (fixed seeded projection of
+    |                           |               the per-stimulus profile)
+    |                           |                             |
+    +-------------+-------------+-----------------------------+
+                  v
+      +----------+-----------+--------------------+
+      |                      |                    |
+      v                      v                    v
+StructuredVectorEncoder   LearnedResidual (self-supervised, FIT only; may consume
+      |                   the level-0/1 summaries, the raw-connectivity views, the
+      |                   functional-response projection and the temporal block)
       v                      v
  z_structured (d_struct)   z_residual (d_residual)
       |                      |
@@ -54,6 +70,7 @@ Layer contracts that must not be mixed up:
 | layer | consumes | produces | learned? | labels? |
 |---|---|---|---|---|
 | `NeuronRecordBank` | frozen model parameters + label-free FIT statistics | columnar source records | no | **no** |
+| `FunctionalResponseSource` (`src/functional_response.py`) | a bank's stored `(n_fit_samples, n)` FIT counts | deterministic `(n, functional_source_dim)` | no (fixed projection) | **no** |
 | `StructuredVectorEncoder` | a `NeuronRecordBank` | deterministic `(n, d_struct)` | no (no fitted state) | **no** |
 | learned residual | a `NeuronRecordBank` (via a deterministic source view) | learned `(n, d_residual)` | yes (self-supervised) | **no** |
 | `NeuronVector` composition | structured vectors + residual vectors | `(n, d)` | — | **no** |
@@ -77,7 +94,7 @@ v2 = V2Config.from_config(cfg, strict=True, warn=False)                       # 
 
 | section | fields (defaults) |
 |---|---|
-| `vector` | `d`, `structured_d`, `learned_residual_d` (defaults 48/48/0), `enabled_blocks` (the four structural blocks), `temporal_resolution` (10), `context_depth` (0), `residual.enabled` (false) |
+| `vector` | `d`, `structured_d`, `learned_residual_d` (defaults 48/48/0), `enabled_blocks` (the four structural blocks), `temporal_resolution` (10), `context_depth` (0), `functional_source_dim` (64), `functional_projection_seed` (0), `functional_source_normalization` (`raw`\|`neuron_centered`\|`neuron_zscored`), `residual.enabled` (false), `residual.source_functional_response` (false), `residual.source_temporal` (false), `residual.mask_mode` (`coordinate`\|`block`) |
 | `memory` | `train_batch_size` (inherits `train.batch_size`), `eval_batch_size` (inherits `train.eval_batch_size`), `record_batch_size` (32), `activity_chunk_size` (32), `representation_chunk_size` (256), `device` (inherits `run.device`), `storage` (`cpu`\|`gpu`\|`memmap`), `mixed_precision` (false), `max_input_tokens` (150 000 000; `0` disables) |
 | `precision` | `vector_dtype`, `activity_dtype`, `model_dtype` (`float32` \| `float16` \| `bfloat16`; aliases `fp32`/`fp16`/`bf16`) |
 | `model` (existing + future keys) | `n_hidden`, `n_bins`, `bin_ms`, … plus the interface-only `model_type`, `n_layers`, `neurons_per_layer` |
@@ -88,9 +105,16 @@ may be derived; `learned_residual_d = 0` is valid). Hard errors are raised for n
 dimensions, unknown blocks, invalid batch/chunk sizes, unknown dtypes/devices/storage modes,
 impossible precision/device combinations (e.g. half-precision model on CPU, `bfloat16` with
 NumPy-backed CPU storage, GPU storage on a CPU device) and for dense-input tensors exceeding
-`memory.max_input_tokens`. Requests for unimplemented features (multi-layer, `temporal`,
-`network_context`, residual, non-fp32 `model_dtype`) produce warnings, or errors under
-`strict=True`; V2 pipeline code must call `V2Config.require_implemented()`.
+`memory.max_input_tokens`. Requests for features that are still not implemented (multi-layer
+SNNs, the `network_context` block, mixed-precision training) produce warnings, or errors
+under `strict=True`; V2 pipeline code must call `V2Config.require_implemented()`.
+The `temporal` block is now genuinely implemented, so selecting it is not a warning, and
+`residual.source_functional_response`/`source_temporal` are hard-error cross-checked against
+`residual.enabled` + `learned_residual_d > 0` (a source nobody consumes is a contradiction).
+`functional_source_dim` is bounded (1 … 4096) and `temporal_resolution ≤ model.n_bins` is
+enforced. `StructuredVectorEncoder.from_config` still refuses a residual request outright
+(that encoder builds only the deterministic structured part) - build the full vector with
+`neuron_vectors_from_config`.
 
 Helpers: `estimate_input_tokens(B,T,C)`, `dtype_itemsize`, `check_input_token_budget(...)`,
 `MemoryConfig.check_input_budget(...)`. Loading a config without V2 sections reproduces the
@@ -117,7 +141,24 @@ bank = build_neuron_record_bank(model, with_activity=False)                     
 | `recurrent_in` | 14 statistics + 5 incoming/outgoing relationship statistics | `weights (n, n_hidden)`, row `i` = `w_rec[i, :]` = **incoming** | repo convention: `w_rec[i, j]` = from `j` to `i` (`forward` uses `s_prev @ w_rec.T`) |
 | `recurrent_out` | 14 statistics | `weights (n, n_hidden)`, row `i` = `w_rec[:, i]` = **outgoing** (= `recurrent_in.weights.T`) | |
 | `activity` | 12 label-free FIT features + `silent_neuron` / `total_spikes` flags | optional `samples (n_samples, n)` float32 per-sample spike counts | streamed with the existing `ActivityAccumulator` |
-| `temporal`, `network_context` | **declared but not implemented** | — | `get_block` raises; no placeholder features |
+| `temporal` | coarse label-free FIT PSTH bins (`bin_00` …, one mean firing rate per bin) | — | implemented 2026-09-27; built only when requested (see below) |
+| `network_context` | **declared but not implemented** | — | `get_block` raises; no placeholder features |
+
+**Temporal block** (`temporal`, implemented): derived from the label-free **pooled FIT PSTH**
+(`ActivityAccumulatorResult.psth`, `(n_hidden, n_bins)`) by summing each coarse interval and
+dividing by `n_samples x interval_duration_s` — i.e. *the mean FIT firing rate (Hz) of the
+neuron in that interval*. Binning is the repository's existing coarse-PSTH convention,
+`numpy.linspace(0, n_bins, temporal_resolution + 1).round()` with at least one simulation bin
+per coarse bin (canonical: 700 bins x 2 ms at resolution 10 → ten 140 ms bins covering
+0–1400 ms). Coordinates are named `temporal.bin_00` … and each bin's `[start_ms, stop_ms)`,
+`start_bin`/`stop_bin` and definition are recorded in the bank provenance. No class labels,
+no class PSTH, no speaker identity and no time-resolved tensor are involved. The block is
+built **only when requested** — `vector.enabled_blocks` contains `temporal`, or
+`vector.residual.source_temporal=true`, or the builder is called with an explicit
+`temporal_resolution=` — so the default path is byte-for-byte unchanged (`temporal.present is
+false` with an explicit reason in the provenance). Implemented-but-absent blocks (a temporal
+request with no FIT activity) contribute nothing, exactly like `intrinsic` on an untrained
+model.
 
 API: `n_neurons`, `block_names`, `feature_names`, `uses_labels` (always `False`, read-only),
 `get_block`, `block_status()`, `to_structured_matrix(blocks, chunk_size)`,
@@ -129,7 +170,10 @@ class-conditioned arrays is rejected; scrambled FIT labels cannot change the ban
 arrays are 1-D `(n,)` or 2-D `(n, k)` (plus the sample-major counts) — 3-D tensors such as
 `(n_neurons, n_samples, n_time)` are rejected before any flattening; measured on the
 canonical model: structural bank 2.46 MB in 0.11 s; a full FIT activity pass (5922 samples)
-runs in ~62 s at batch 32 with a 205 MB CUDA peak.
+runs in ~62 s at batch 32 with a 205 MB CUDA peak; adding the temporal block costs ~0.14 s
+and `(n, temporal_resolution)` float64 (~20 KB canonical). The stored `(n_fit_samples, n)`
+float32 counts (6.1 MB canonical) are the data behind both the functional-response source
+and the temporal block; they are never transposed as a whole.
 
 ---
 
@@ -162,7 +206,12 @@ encoder = StructuredVectorEncoder.from_config(v2, bank)                        #
 
 Dimension policy: `d ≤ level0` → prefix of Level 0; `level0 < d ≤ source` → Level 0 + prefix
 of Level 1; `d > source` → everything + projected coordinates. On the canonical 256-neuron
-model: `level0 = 48`, `level1 = 93`, `source = 141` (with `activity` enabled: 60 / 101 / 161).
+model: `level0 = 48`, `level1 = 93`, `source = 141` (with `activity` enabled: 60 / 101 / 161;
+with `temporal` enabled at resolution 10 instead: 58 / 151). Every implemented block is
+selectable, so `enabled_blocks = [intrinsic, input_conn, recurrent_in, recurrent_out,
+temporal]` yields exactly the 48 structural summary coordinates followed by the 10 temporal
+bins at `structured_d = 58`; the **default** selection stays the four structural blocks, so
+the historical 48-D output is unchanged whether or not the bank carries a temporal block.
 
 Provenance per coordinate (`kind`, `block`, `source`, `definition`, `uses_labels=False`) and
 per encoder (`level0/1/source/output` dimensions, block selection, projection spec + seed,
@@ -265,6 +314,101 @@ usable. No FP8, no change to SNN training precision.
 `train_masked_mse`, `val_masked_mse`, `optimization_loss_mean`, realised mask fraction, plus
 `best_epoch`/`best_val_loss`.
 
+#### Label-free functional-response source (`src/functional_response.py`)
+
+The bank already stores the per-stimulus response data (`activity.samples`: `(n_fit_samples,
+ n_neurons)` float32 spike counts, 6.1 MB canonical). This module turns it into a compact,
+deterministic, label-free source view:
+
+```
+samples (n_fit_samples, n_neurons)
+  -> explicit per-neuron transform over the sample axis  (raw | neuron_centered | neuron_zscored)
+  -> fixed seeded Gaussian projection of the sample axis
+  -> (n_neurons, functional_source_dim)                  default 64
+```
+
+| property | value |
+|---|---|
+| definition | `activity.samples[s, i]` = spike count of neuron `i` on FIT utterance `s` |
+| split | FIT only (a bank whose activity provenance names probe/test is rejected) |
+| normalisation | `raw` (default; keeps the magnitude/rate information), `neuron_centered` (`v - mean_s v`), `neuron_zscored` (`(v - mean_s v)/std_s v`); applied to the counts **before** the projection and never re-applied |
+| zero-variance rule | `std_s < 1e-8` ⇒ the neuron is **kept** and its profile is exactly zero, so its projected coordinates are exactly zero (`zero_variance_neurons` is recorded) |
+| projection | fixed, data-independent, never fitted or learned: column `j = default_rng([functional_projection_seed, j]).standard_normal(n_samples)/sqrt(n_samples)`; prefix-stable in the dimension |
+| seed | dedicated `functional_projection_seed` (default 0) - never shared with the structured projection seed, the residual mask seed or the training seed |
+| ordering | the stored FIT order is preserved and hashed: `sample_order_hash = sha256(shape\|dtype\|sample-major bytes)`; no label or speaker identity participates |
+| memory | CPU only; statistics accumulated and the projection applied in sample chunks (`chunk x n_neurons`); the `(n_neurons, n_fit_samples)` transpose and any 3-D tensor are never materialised; the projection matrix is `(n_samples, functional_source_dim)` float64 (~3.0 MB canonical) |
+
+```python
+from src.functional_response import FunctionalResponseConfig, build_functional_response_source
+source = build_functional_response_source(bank, FunctionalResponseConfig(source_dim=64))
+source.X                     # (n_neurons, 64)
+source.sample_order_hash
+source.provenance            # source type/split, uses_labels=False, normalisation stats + order,
+                             # zero-variance rule, projection spec + seed, sample-order hash
+```
+
+#### Temporal source in the residual
+
+`include_temporal=True` appends the bank's `temporal` block (all coarse bins, canonical
+`bin_00…` order, mean FIT firing rate in Hz, no further scaling). It is independent of the
+structured encoder's `enabled_blocks`: the residual can consume it even when the structured
+vector does not select it. Requesting it from a bank without the block is an explicit error
+(never a silent skip), and coordinates already contributed by an earlier part of the view are
+skipped with a recorded de-duplication count.
+
+#### Residual source view (expanded)
+
+`build_residual_source(bank, config)` assembles up to five identifiable parts, in order:
+
+| part | flag (default) | dimension |
+|---|---|---|
+| level-0 deterministic summaries | `include_level0` (**true**) | `level0_dim` |
+| level-1 deterministic within-block detail | `include_level1` (**true**) | `source_dim - level0_dim` |
+| fixed raw-connectivity projections | `include_raw_weight_view` (**true**) | `min(raw_view_dim, width)` per weighted block (32) |
+| functional-response projection | `include_functional_response` (**false**) | `functional_source_dim` (64) |
+| coarse temporal block | `include_temporal` (**false**) | `temporal_resolution` (10) |
+
+Canonical budget: 48 + 93 + 96 = **237** by default (unchanged), 301 with the functional
+source, 247 with the temporal block, 311 with both. Because the two new flags default to
+`false`, the feature names - and therefore the schema hash - are identical to the previous
+stage, so existing residual artifacts stay loadable and the historical numbers remain
+reproducible. `ResidualSourceConfig.from_v2_config(v2)` reads `vector.enabled_blocks`,
+`vector.residual.source_functional_response`/`source_temporal`, `vector.functional_source_dim`,
+`functional_projection_seed`, `functional_source_normalization`; the two evaluation scripts use
+it, so the new sources are reachable from a config alone. Every part is identified in
+`provenance.functional_response`, `provenance.temporal`, `provenance.source_blocks` and
+`provenance.source_config`, with the final per-group coordinate counts in
+`provenance.source_groups`.
+
+#### Masking: coordinate vs source-block
+
+`mask_mode` (`vector.residual.mask_mode`, default `coordinate`) selects the strategy of the
+same masked-reconstruction objective:
+
+* `coordinate` - unchanged: `mask_fraction` (0.25) of the coordinates per example, at least
+  `minimum_visible_features` (8) visible;
+* `block` - one whole **source group** per example (`structural` / `functional_response` /
+  `temporal`, classified by feature-name prefix) is withheld, so the model must reconstruct a
+  source from the others. Groups are tried in random order and the first that keeps enough
+  coordinates visible is used; a row falls back to coordinate-level masking when no group
+  satisfies the visibility guarantee. Masks remain deterministic (per-epoch
+  `default_rng([mask_seed, epoch])`, evaluation `[mask_seed, 10^7(+1)]`) and label-free.
+
+#### Per-source training diagnostics
+
+In addition to the existing fields, the history now records the withheld-coordinate MSE of
+each present source group (`train_masked_mse_structural`,
+`train_masked_mse_functional_response`, `train_masked_mse_temporal` and the `val_` variants),
+the realised `mask_mode` and `mask_fraction_realised`. These are **training diagnostics only**;
+no scientific interpretation is attached to them. `provenance.source_diagnostics` lists the
+fields and `provenance.source_groups` the coordinate ranges.
+
+**Persistence:** the new fields flow through the existing `learned_residual/v1` payload
+(`config.mask_mode`, `source_config`, and `source_schema.provenance` with the per-source blocks
+and groups). `ResidualResult.load` still refuses a mismatched feature schema, so a residual
+trained on the expanded source cannot be silently applied to the old source view. No schema
+bump was needed: an older payload without `mask_mode` loads with the default `coordinate`.
+
 ---
 
 ## 6. Full neuron vector (`src/neuron_vector.py`)
@@ -302,6 +446,10 @@ exactly the historical 48-D representation) and instantiates no residual model. 
   split.
 * `NeuronRecordBank`, `StructuredVectorEncoder`, the learned residual and the composition
   expose **no labels parameter**; all their provenance records `uses_labels: False`.
+* The functional-response source and the temporal block are built from the bank's stored FIT
+  counts and pooled FIT PSTH only: no class labels, no class PSTH/rate, no speaker identity,
+  no PROBE, no TEST, no model forward pass. The FIT split guard
+  (`assert_label_free_fit_activity`) is shared by both consumers.
 * FIT is the only data source for representation information. PROBE and the official TEST
   split are never read by representation construction.
 * Normalisation statistics, where used, are derived only from the FIT-derived training
@@ -313,6 +461,15 @@ exactly the historical 48-D representation) and instantiates no residual model. 
 
 Allowed: `(n_neurons, k)` feature/weight matrices, `(n_neurons, d)` vectors, the
 `(n_samples, n_neurons)` activity counts, and compact minibatches of feature vectors.
+
+New arrays of the functional-response / temporal stage (all CPU, all 2-D): the stored counts
+`(n_fit_samples, n_neurons)` float32 (6.1 MB canonical, owned by the bank), the
+`(n_neurons, functional_source_dim)` projected source (~131 KB), the
+`(n_samples, functional_source_dim)` float64 projection matrix (~3.0 MB), a
+`(chunk, n_neurons)` sample-chunk temporary (chunk default 256 → ~0.5 MB), and the
+`(n_neurons, temporal_resolution)` temporal block (~20 KB). GPU transfers are unchanged and
+scale only with `n_neurons x source_features` (a source minibatch), never with the FIT sample
+count: the whole projection and temporal summarisation happen in NumPy on the CPU.
 
 **Forbidden** and rejected by guards: `(n_neurons, n_samples, n_time)`,
 `(n_samples, n_time, n_neurons)`, `(n_neurons, n_samples, d)`, `(n_neurons, n_hidden, d)`,
@@ -326,7 +483,7 @@ Allowed: `(n_neurons, k)` feature/weight matrices, `(n_neurons, d)` vectors, the
 ## 9. Tests
 
 ```
-uv run pytest -q    ->  400 passed
+uv run pytest -q    ->  448 passed
 ```
 
 | file | tests | covers |
@@ -338,6 +495,7 @@ uv run pytest -q    ->  400 passed
 | `tests/test_neuron_vector.py` | 16 | 48/64/100 composition, coordinate order, provenance, `residual_d=0` exactness, config integration, schema/dimension mismatch rejection, determinism, chunking |
 | `tests/test_vector_capacity.py` | 33 | PROBE-only targets and split discipline, individual-stimulus target shape/definition/label-independence, frozen representations, the dimension invariant and matched-total decompositions, residual artifact selection, SNN isolation, reproducibility, memory shapes, result table + figures |
 | `tests/test_rate_robustness.py` | 32 | raw-target equivalence with the first study, exact neuron centering/z-scoring, deterministic zero-variance rule, explicit (non-commuting) pipeline order, mean-rate and row-L2 targets, activity dimensions, checkpoint comparability, PROBE-only/label discipline, representation invariance, 1-D prediction, reproducibility, memory |
+| `tests/test_functional_response.py` | 48 | functional-response shape/definition, deterministic + prefix-stable + seed-dependent projection, sample-order hash, all normalisation modes, zero-variance rule, label-free provenance, chunked == unchunked; temporal bin edges/values/resolution/names/provenance; the 48-D default staying exact and temporal appearing only when requested; residual source expansion, de-duplication, schema persistence + mismatch rejection, both mask modes, per-source diagnostics, SNN-frozen check; `48+0/48+16/48+52` and a temporal structured + residual configuration |
 | pre-existing suite | 127 | model, data, training, evaluation, geometry, prediction, fingerprint, controls, rewiring, permutation, reliability, NSB |
 
 ---
@@ -347,8 +505,9 @@ uv run pytest -q    ->  400 passed
 * Single hidden layer only (`model.n_layers > 1` is configuration-only and rejected in
   strict mode); the record/encoder layers carry a `layer`-agnostic design but no multi-layer
   implementation exists.
-* `temporal` and `network_context` record blocks are declared but not implemented — no
-  placeholder features are generated.
+* `temporal` and `network_context` record blocks: `temporal` is now **implemented** (coarse
+  pooled-FIT-PSTH bins, selectable and available to the residual); `network_context` remains
+  declared but not implemented (no placeholder features).
 * The structured encoder's projection coordinates are not individually interpretable.
 * The learned residual is a small MLP trained with masked reconstruction on FIT-derived
   features. It has now been evaluated once on PROBE (§11): its presence does not separate the
@@ -357,6 +516,19 @@ uv run pytest -q    ->  400 passed
   as those differences. No claim of improvement is made or supported.
 * The residual's `raw_view` coordinates are a fixed random projection of the raw
   connectivity, chosen for additional capacity; they are not individually interpretable.
+* The functional-response source coordinates are likewise a fixed random projection: they are
+  not individually interpretable, and the source view preserves the *statistics* of the
+  per-stimulus profile (through 64 projections), not the per-stimulus responses themselves.
+* The temporal block is a **pooled (population-averaged over FIT utterances) coarse PSTH**,
+  not a per-stimulus temporal profile: it carries the neuron's mean time course, so
+  stimulus-specific temporal structure is not represented by this block.
+* The functional-response projection depends on the order of the FIT utterances; the exact
+  order is pinned by the deterministic split and recorded as a hash, but a different split or
+  sample order would produce a different (still label-free) source view.
+* Enabling the new sources changes the residual input schema (and therefore its schema hash);
+  no residual artifact trained on the old schema can be reused with the new one by design.
+* The new sources have **not** been scientifically evaluated: no PROBE analysis, no capacity
+  sweep and no comparison against the previous configuration was performed in this stage.
 * Residual training is reproducible on a fixed device/dtype; CUDA is only bitwise
   reproducible to the extent documented for the repository's other models.
 * GPU/memmap storage for records and the record-bank serialisation are not implemented
@@ -652,8 +824,12 @@ measured here, not causally attributed.
 
 ## 12. Next planned stage
 
-1. Temporal / network-context record blocks, using this evaluation layer unchanged.
-2. Only after that: multi-layer support.
+1. **Evaluate** the new label-free sources on PROBE with the existing evaluation layer
+   (`scripts/evaluate_vector_capacity.py` / `evaluate_vector_rate_robustness.py`, unchanged):
+   `structured_48 + temporal`, `full + residual(functional_response)`, and the rate-decomposition
+   targets, so the temporal/functional additions are measured the same way as everything else.
+2. Only after that: the `network_context` block, and then multi-layer support.
 
-The capacity evaluation and its rate-confound robustness stage are complete and intentionally
-stop here: no temporal / network-context implementation and no architecture change was made.
+The functional-response source and the coarse temporal block are implemented and tested but
+**not yet evaluated**; no scientific claim is made about them here, and the SNN, the split and
+the official TEST set are untouched.

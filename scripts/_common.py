@@ -118,6 +118,15 @@ def figure_dir(cfg: Config) -> Path:
     return ensure_dir(PROJECT_ROOT / str(cfg.get_path("paths.figures_dir", "figures")))
 
 
+def display_path(path: Path | str) -> str:
+    """Repo-relative path when possible, absolute otherwise (external output directories)."""
+    p = Path(path)
+    try:
+        return str(p.resolve().relative_to(PROJECT_ROOT))
+    except ValueError:
+        return str(p)
+
+
 # --------------------------------------------------------------------------
 # Dataset
 # --------------------------------------------------------------------------

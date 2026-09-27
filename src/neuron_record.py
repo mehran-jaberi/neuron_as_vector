@@ -60,9 +60,13 @@ and :meth:`NeuronRecordBank.to_representation_set` returns the existing
 unchanged.
 
 Not implemented in this stage (and never faked here): the learned residual,
-variable-dimensional encoders, the ``temporal`` and ``network_context`` blocks.
-Those blocks are declared by :data:`src.v2_config.V2_RECORD_BLOCKS` but the bank
-reports them as unimplemented rather than inventing placeholder features.
+variable-dimensional encoders and the ``network_context`` block. That block is
+declared by :data:`src.v2_config.V2_RECORD_BLOCKS` but the bank reports it as
+unimplemented rather than inventing placeholder features. The ``temporal`` block is
+genuinely implemented: it is derived from the label-free pooled FIT PSTH as coarse
+per-neuron firing-rate bins (no class conditioning), and is built only when it is
+requested (``enabled_blocks`` contains ``temporal`` or the residual sources ask for it,
+or an explicit ``temporal_resolution=`` is passed).
 """
 
 from __future__ import annotations
@@ -97,6 +101,12 @@ from .v2_config import (
 #: Schema identifier written into every bank's provenance.
 RECORD_SCHEMA = "neuron_record_bank/v1"
 
+#: Name of the coarse temporal block (matches :data:`src.v2_config.V2_RECORD_BLOCKS`).
+TEMPORAL_BLOCK = "temporal"
+
+#: Default number of coarse temporal bins (matches ``vector.temporal_resolution``).
+DEFAULT_TEMPORAL_RESOLUTION = 10
+
 #: Positional/dtype information that the pristine 48-D compatibility encoder uses.
 STRUCTURAL_BLOCKS: tuple[str, ...] = tuple(FeatureBlock.structural())
 
@@ -107,7 +117,10 @@ BLOCK_SOURCES: dict[str, str] = {
     "recurrent_in": "model parameter w_rec row per neuron (incoming) + label-free statistics",
     "recurrent_out": "model parameter w_rec column per neuron (outgoing) + label-free statistics",
     "activity": "label-free FIT spike statistics collected with the streaming accumulator",
-    "temporal": "not implemented in this stage",
+    "temporal": (
+        "label-free pooled FIT per-neuron PSTH aggregated into coarse temporal bins "
+        "(mean firing rate per bin; no class conditioning)"
+    ),
     "network_context": "not implemented in this stage",
 }
 
@@ -713,6 +726,121 @@ def _recurrent_blocks(model: Any, n_neurons: int) -> tuple[RecordBlock, RecordBl
     return incoming, outgoing
 
 
+#: Activity-split names that must never feed a representation component.
+FORBIDDEN_ACTIVITY_SPLITS: tuple[str, ...] = ("probe", "test")
+
+
+def assert_label_free_fit_activity(bank: "NeuronRecordBank") -> str:
+    """Return the bank's activity split after rejecting PROBE/TEST; error otherwise.
+
+    Shared by every consumer of the label-free FIT statistics (the residual source and
+    the functional-response source) so the FIT-only rule is enforced in one place.
+    """
+    split = str(bank.provenance.get("activity", {}).get("split", "none"))
+    if any(bad in split.lower() for bad in FORBIDDEN_ACTIVITY_SPLITS):
+        raise NeuronRecordError(
+            f"the record bank's activity block was measured on split {split!r}; every "
+            "representation component must use FIT only (never PROBE/TEST)"
+        )
+    return split
+
+
+def temporal_bin_edges(n_bins: int, temporal_resolution: int) -> list[tuple[int, int]]:
+    """Deterministic coarse bin boundaries ``[(lo, hi), ...]`` over ``n_bins`` sim bins.
+
+    Uses the repository's existing coarse-PSTH convention
+    (``np.linspace(0, n_bins, resolution + 1).round()`` with each bin at least one
+    simulation bin), so the temporal coordinates are directly comparable with the
+    temporal fingerprint binning and are reproducible from the configuration alone.
+    """
+    n_bins = int(n_bins)
+    resolution = int(temporal_resolution)
+    if n_bins < 1:
+        raise NeuronRecordError(f"n_bins must be >= 1, got {n_bins}")
+    if resolution < 1:
+        raise NeuronRecordError(f"temporal_resolution must be >= 1, got {resolution}")
+    if resolution > n_bins:
+        raise NeuronRecordError(
+            f"temporal_resolution={resolution} cannot exceed n_bins={n_bins}"
+        )
+    edges = np.linspace(0, n_bins, resolution + 1).round().astype(int)
+    bins: list[tuple[int, int]] = []
+    for index in range(resolution):
+        lo = int(edges[index])
+        hi = int(max(edges[index + 1], lo + 1))
+        hi = min(hi, n_bins)
+        bins.append((lo, hi))
+    return bins
+
+
+def _temporal_block(
+    result: ActivityAccumulatorResult,
+    *,
+    temporal_resolution: int,
+    split_name: str,
+) -> RecordBlock:
+    """Coarse label-free temporal block: mean FIT firing rate per neuron per bin.
+
+    Derived from ``result.psth`` (the pooled per-neuron spike-time histogram summed
+    over the label-free FIT samples) by summing each coarse interval and dividing by
+    ``n_samples * interval_duration_s``. No class labels, class PSTHs or speaker
+    identity are used, and no ``(sample, time, neuron)`` tensor is ever materialised.
+    """
+    bins = temporal_bin_edges(result.n_bins, temporal_resolution)
+    psth = np.asarray(result.psth, dtype=np.float64)
+    if psth.ndim != 2 or psth.shape[0] != int(result.n_hidden):
+        raise NeuronRecordError(
+            f"activity PSTH must be (n_hidden, n_bins) = ({result.n_hidden}, {result.n_bins}), "
+            f"got {psth.shape}"
+        )
+    bin_ms = float(result.bin_ms)
+    n_samples = max(int(result.n_samples), 1)
+    features: dict[str, np.ndarray] = {}
+    bin_info: list[dict[str, Any]] = []
+    for index, (lo, hi) in enumerate(bins):
+        width = int(hi - lo)
+        counts = psth[:, lo:hi].sum(axis=1)
+        rate = counts / (n_samples * width * bin_ms / 1000.0)
+        name = f"bin_{index:02d}"
+        features[name] = np.asarray(rate, dtype=np.float64)
+        bin_info.append({
+            "name": name,
+            "index": int(index),
+            "start_bin": int(lo),
+            "stop_bin": int(hi),
+            "start_ms": float(lo * bin_ms),
+            "stop_ms": float(hi * bin_ms),
+            "duration_ms": float(width * bin_ms),
+            "definition": (
+                f"mean FIT firing rate (Hz) of this neuron in [{lo * bin_ms:g}, {hi * bin_ms:g}) ms"
+            ),
+            "uses_labels": False,
+        })
+    return RecordBlock(
+        name=TEMPORAL_BLOCK,
+        n_neurons=int(result.n_hidden),
+        features=features,
+        orientation=(
+            "feature[k] is the mean label-free FIT firing rate (Hz) of neuron j in the k-th "
+            "coarse temporal interval; no class conditioning, no per-sample time axis stored"
+        ),
+        source=BLOCK_SOURCES[TEMPORAL_BLOCK],
+        metadata={
+            "mode": "fit_population_psth_coarse_bins",
+            "temporal_resolution": int(temporal_resolution),
+            "n_bins": int(result.n_bins),
+            "bin_ms": bin_ms,
+            "n_samples": int(result.n_samples),
+            "split": split_name,
+            "binning": "numpy.linspace(0, n_bins, resolution + 1).round(), >= 1 sim bin per coarse bin",
+            "bins": bin_info,
+            "label_free": True,
+            "class_conditioned": False,
+            "time_resolved_tensor_stored": False,
+        },
+    )
+
+
 def _assert_label_free_accumulator(result: ActivityAccumulatorResult) -> None:
     """Reject an activity accumulator that carries labels or class-conditioned data."""
     problems: list[str] = []
@@ -792,6 +920,7 @@ def build_neuron_record_bank(
     include_tonotopic: bool = False,
     store_sample_counts: bool = True,
     with_activity: bool = True,
+    temporal_resolution: int | None = None,
     device: Any | None = None,
     batch_size: int | None = None,
 ) -> NeuronRecordBank:
@@ -810,6 +939,12 @@ def build_neuron_record_bank(
       only when a chunk size is requested), and ``memory.storage`` (must be CPU-side:
       ``cpu`` or ``memmap`` - GPU storage is not implemented in this stage). The
       dense-input token budget is checked before the activity pass.
+    * ``temporal_resolution`` requests the coarse label-free temporal block. When it is
+      ``None`` the block is built only if the configuration asks for it
+      (``vector.enabled_blocks`` contains ``temporal``, or
+      ``vector.residual.source_temporal`` is true), using
+      ``config.vector.temporal_resolution``; otherwise the block is absent and nothing
+      changes for the historical default path.
 
     The builder takes **no labels argument**: it cannot read class labels, class
     firing rates or any class-conditioned quantity, and it never touches PROBE or
@@ -883,6 +1018,17 @@ def build_neuron_record_bank(
             ),
         )
 
+    # -- coarse temporal block (only when requested; never for the default path) ----
+    temporal_requested, resolved_resolution = _resolve_temporal_request(config, temporal_resolution)
+    temporal_present = False
+    if temporal_requested and resolved_activity is not None:
+        blocks[TEMPORAL_BLOCK] = _temporal_block(
+            resolved_activity,
+            temporal_resolution=int(resolved_resolution),
+            split_name=split_name,
+        )
+        temporal_present = True
+
     provenance = _build_provenance(
         model,
         n_neurons=n_neurons,
@@ -894,8 +1040,32 @@ def build_neuron_record_bank(
         include_tonotopic=include_tonotopic,
         store_sample_counts=store_sample_counts,
         config=config,
+        temporal_requested=temporal_requested,
+        temporal_resolution=resolved_resolution,
+        temporal_present=temporal_present,
+        activity_present=resolved_activity is not None,
     )
     return NeuronRecordBank(n_neurons=n_neurons, blocks=blocks, provenance=provenance)
+
+
+def _resolve_temporal_request(
+    config: V2Config | None, temporal_resolution: int | None
+) -> tuple[bool, int | None]:
+    """Decide whether the coarse temporal block is built, and at which resolution.
+
+    Precedence: an explicit ``temporal_resolution`` argument, then a configuration that
+    asks for it (structured encoder blocks or the residual's temporal source), otherwise
+    the block is not built (the historical default path is unchanged).
+    """
+    if temporal_resolution is not None:
+        return True, int(temporal_resolution)
+    if config is not None:
+        wants = (TEMPORAL_BLOCK in config.vector.enabled_blocks) or bool(
+            config.vector.residual.source_temporal
+        )
+        if wants:
+            return True, int(config.vector.temporal_resolution)
+    return False, None
 
 
 def _build_provenance(
@@ -910,6 +1080,10 @@ def _build_provenance(
     include_tonotopic: bool,
     store_sample_counts: bool,
     config: V2Config | None,
+    temporal_requested: bool = False,
+    temporal_resolution: int | None = None,
+    temporal_present: bool = False,
+    activity_present: bool = False,
 ) -> dict[str, Any]:
     """Machine-readable provenance: what produced each block and what is label-free."""
     intrinsic_info = intrinsic_feature_provenance(model)
@@ -952,6 +1126,34 @@ def _build_provenance(
             "sample_counts_stored": bool(store_sample_counts),
             "collect_voltage": False,
             "label_free": True,
+        },
+        "temporal": {
+            "requested": bool(temporal_requested),
+            "present": bool(temporal_present),
+            "resolution": None if temporal_resolution is None else int(temporal_resolution),
+            "split": split_name if temporal_present else None,
+            "n_samples": (
+                int(blocks[TEMPORAL_BLOCK].metadata.get("n_samples", 0))
+                if temporal_present else None
+            ),
+            "bins": (
+                list(blocks[TEMPORAL_BLOCK].metadata.get("bins", []))
+                if temporal_present else []
+            ),
+            "mode": "fit_population_psth_coarse_bins" if temporal_present else None,
+            "label_free": True,
+            "class_conditioned": False,
+            "uses_labels": False,
+            "reason": (
+                ""
+                if temporal_present
+                else (
+                    "not requested (enable vector.enabled_blocks=[..., 'temporal'] "
+                    "or vector.residual.source_temporal=true, or pass temporal_resolution=)"
+                    if not temporal_requested
+                    else "requested but no label-free FIT activity was supplied to this bank"
+                )
+            ),
         },
         "include_tonotopic_features": bool(include_tonotopic),
         "declared_blocks": list(V2_RECORD_BLOCKS),
@@ -998,6 +1200,9 @@ def structural_matrix_from_record_bank(
 
 __all__ = [
     "RECORD_SCHEMA",
+    "TEMPORAL_BLOCK",
+    "DEFAULT_TEMPORAL_RESOLUTION",
+    "FORBIDDEN_ACTIVITY_SPLITS",
     "STRUCTURAL_BLOCKS",
     "BLOCK_SOURCES",
     "NeuronRecordError",
@@ -1005,5 +1210,7 @@ __all__ = [
     "NeuronRecordBank",
     "build_neuron_record_bank",
     "structural_matrix_from_record_bank",
+    "temporal_bin_edges",
+    "assert_label_free_fit_activity",
     "validate_record_array",
 ]

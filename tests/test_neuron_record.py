@@ -493,18 +493,24 @@ def test_record_batch_size_defaults_to_the_config(tiny_model, synthetic_rec):
 
 
 # --------------------------------------------------------------------------
-# Declared-but-unimplemented blocks
+# Declared blocks: implemented vs not, present vs absent
 # --------------------------------------------------------------------------
-def test_temporal_and_network_context_are_reported_unimplemented(trained_like_model):
+def test_temporal_is_implemented_but_absent_without_a_request(trained_like_model):
     bank = build_neuron_record_bank(trained_like_model, with_activity=False)
-    assert bank.unimplemented_blocks == ("temporal", "network_context")
+    assert bank.unimplemented_blocks == ("network_context",)
     status = bank.block_status()
-    assert status["temporal"]["implemented"] is False
-    assert "not implemented" in status["temporal"]["reason"]
-    with pytest.raises(NeuronRecordError, match="not implemented"):
+    assert status["temporal"]["implemented"] is True
+    assert status["temporal"]["present"] is False
+    assert "not present" in status["temporal"]["reason"]
+    assert status["network_context"]["implemented"] is False
+    assert "not implemented" in status["network_context"]["reason"]
+    with pytest.raises(NeuronRecordError, match="not available"):
         bank.get_block("temporal")
     with pytest.raises(NeuronRecordError, match="not implemented"):
-        bank.to_structured_matrix(blocks=["temporal"])
+        bank.get_block("network_context")
+    # an implemented-but-absent block contributes no columns (same rule as `activity`)
+    X, names = bank.to_structured_matrix(blocks=["temporal"])
+    assert X.shape == (bank.n_neurons, 0) and names == []
     with pytest.raises(NeuronRecordError, match="unknown block"):
         bank.get_block("not_a_block")
 
@@ -536,7 +542,7 @@ def test_provenance_is_machine_readable(trained_like_model, synthetic_rec, tiny_
     assert prov["model"]["n_input"] == tiny_snn_config.n_input
     assert "recurrent_in.weights[i]" in prov["weight_orientation"]
     assert prov["blocks"]["activity"]["uses_labels"] is False
-    assert set(prov["unimplemented_blocks"]) == {"temporal", "network_context"}
+    assert set(prov["unimplemented_blocks"]) == {"network_context"}
     assert isinstance(json.dumps(prov), str)  # machine-readable / serialisable
 
 

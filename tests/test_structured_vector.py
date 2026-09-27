@@ -322,9 +322,13 @@ def test_activity_block_participates_when_enabled(tiny_model, synthetic_rec):
 
 def test_unknown_or_unimplemented_blocks_raise(trained_like_model):
     bank = _bank(trained_like_model)
-    for blocks in (["temporal"], ["network_context"], ["intrinsic", "temporal"]):
+    for blocks in (["network_context"], ["intrinsic", "network_context"]):
         with pytest.raises(StructuredVectorError, match="not implemented"):
             StructuredVectorEncoder(bank, structured_d=16, enabled_blocks=blocks)
+    # `temporal` is implemented but absent from this bank (no FIT activity): it simply
+    # contributes nothing, so a temporal-only request has no features to encode
+    with pytest.raises(StructuredVectorError, match="no features"):
+        StructuredVectorEncoder(bank, structured_d=16, enabled_blocks=["temporal"])
     with pytest.raises(StructuredVectorError, match="unknown block"):
         StructuredVectorEncoder(bank, structured_d=16, enabled_blocks=["not_a_block"])
     with pytest.raises(StructuredVectorError, match="at least one block"):
@@ -505,7 +509,9 @@ def test_from_config_warn_mode_returns_only_the_structured_part(trained_like_mod
 
 
 def test_from_config_rejects_unimplemented_blocks(trained_like_model):
-    cfg = V2Config.from_config(Config({"vector": {"enabled_blocks": ["intrinsic", "temporal"]}}), warn=False)
+    cfg = V2Config.from_config(
+        Config({"vector": {"enabled_blocks": ["intrinsic", "network_context"]}}), warn=False
+    )
     bank = _bank(trained_like_model)
     with pytest.raises(StructuredVectorError, match="not implemented"):
         StructuredVectorEncoder.from_config(cfg, bank)

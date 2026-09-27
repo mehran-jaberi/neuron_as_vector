@@ -131,8 +131,12 @@ def test_source_rejects_unknown_blocks_and_non_bank_inputs():
     bank = _bank()
     with pytest.raises(ResidualError, match="unknown block"):
         build_residual_source(bank, ResidualSourceConfig(enabled_blocks=["nope"]))
+    # `temporal` is implemented, but this bank carries no temporal block (no FIT activity),
+    # so requesting it as a residual source is an explicit error - not a silent skip
     with pytest.raises(ResidualError, match="temporal"):
-        build_residual_source(bank, ResidualSourceConfig(enabled_blocks=["intrinsic", "temporal"]))
+        build_residual_source(bank, ResidualSourceConfig(include_temporal=True))
+    with pytest.raises(ResidualError, match="functional-response|activity"):
+        build_residual_source(bank, ResidualSourceConfig(include_functional_response=True))
     with pytest.raises(ResidualError, match="NeuronRecordBank"):
         build_residual_source(np.zeros((4, 4)))  # type: ignore[arg-type]
 

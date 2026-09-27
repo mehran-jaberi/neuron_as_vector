@@ -31,7 +31,7 @@ import time
 from pathlib import Path
 from typing import Any, Sequence
 
-from _common import PROJECT_ROOT, load_config  # noqa: F401  (adds the project root to sys.path)
+from _common import PROJECT_ROOT, display_path, load_config  # noqa: F401  (adds the project root to sys.path)
 
 from src.capacity_figures import write_rate_robustness_figures  # noqa: E402
 from src.model import RecurrentLIFSNN, architecture_mismatches  # noqa: E402
@@ -259,7 +259,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 continue
             print(f"[{label}] comparable to {reference[0]} (architecture + representation schema)")
 
-        source_config = ResidualSourceConfig(enabled_blocks=tuple(v2.vector.enabled_blocks))
+        source_config = ResidualSourceConfig.from_v2_config(v2)
         source = build_residual_source(bank, source_config)
         residual_cache_key = _cache_key({
             **cache_common, "schema_hash": source.schema_hash,
@@ -387,7 +387,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "evaluation": settings_summary,
         "controls": ["control_rate_only", "control_random_100", "control_neuron_shuffle_100"],
         "preserved_first_study_artifacts": preserved,
-        "outputs": {k: str(v.relative_to(PROJECT_ROOT)) for k, v in written.items()},
+        "outputs": {k: display_path(v) for k, v in written.items()},
         "runtime_seconds": None,
         "notes": [
             "Second stage of the capacity programme: rate/confound decomposition. No representation "

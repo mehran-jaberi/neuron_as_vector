@@ -94,7 +94,7 @@ V2_RECORD_BLOCKS: tuple[str, ...] = (
 #: configuration (so the interface is usable for planning) but are reported as
 #: not implemented and rejected when ``strict=True``.
 IMPLEMENTED_RECORD_BLOCKS = frozenset(
-    {"intrinsic", "input_conn", "recurrent_in", "recurrent_out", "activity"}
+    {"intrinsic", "input_conn", "recurrent_in", "recurrent_out", "activity", "temporal"}
 )
 
 #: Default block selection = the current primary (structural) representation.
@@ -124,6 +124,22 @@ DTYPE_ALIASES: dict[str, str] = {
 SUPPORTED_DTYPES: tuple[str, ...] = ("float32", "float16", "bfloat16")
 
 _BYTES_PER_DTYPE: dict[str, int] = {"float32": 4, "float16": 2, "bfloat16": 2}
+
+#: Default dimension of the compact label-free functional-response source view.
+DEFAULT_FUNCTIONAL_SOURCE_DIM = 64
+
+#: Default seed of the fixed functional-response projection (separate from every other seed).
+DEFAULT_FUNCTIONAL_PROJECTION_SEED = 0
+
+#: Upper sanity bound for ``vector.functional_source_dim`` (the projection matrix is
+#: ``n_fit_samples x functional_source_dim``).
+MAX_FUNCTIONAL_SOURCE_DIM = 4096
+
+#: Normalisation modes of the individual-stimulus functional-response source view.
+FUNCTIONAL_SOURCE_NORMALIZATIONS: tuple[str, ...] = ("raw", "neuron_centered", "neuron_zscored")
+
+#: Masking strategies of the learned residual's reconstruction objective.
+SOURCE_MASK_MODES: tuple[str, ...] = ("coordinate", "block")
 
 
 # --------------------------------------------------------------------------
@@ -208,14 +224,46 @@ def _filter_mapping(cls: type, mapping: Mapping[str, Any] | None) -> dict[str, A
 # --------------------------------------------------------------------------
 @dataclass
 class VectorResidualConfig:
-    """Configuration of the (not yet implemented) learned residual.
+    """Configuration of the learned residual and of the sources it may consume.
 
-    ``enabled`` is the only knob for now. A residual is only meaningful when
-    ``vector.learned_residual_d > 0``; the two are cross-validated in
-    :class:`VectorConfig` so a contradictory combination cannot be constructed.
+    ``enabled``/``learned_residual_d > 0`` cross-check exactly as before. The three new
+    source flags are **opt-in**: with their defaults the residual source view is
+    bit-identical to the previous stage (same feature names, same schema hash), so the
+    historical configuration path is unchanged.
+
+    ``source_functional_response``
+        Include the compact fixed projection of the label-free FIT individual-stimulus
+        response profile (``(n_fit_samples, n_neurons)`` counts).
+    ``source_temporal``
+        Include the coarse label-free FIT temporal block (mean firing rate per coarse
+        bin). Independent of ``vector.enabled_blocks``: the source can consume the block
+        even when the structured encoder does not select it.
+    ``mask_mode``
+        ``coordinate`` (default, the previous behaviour) withholds individual source
+        coordinates; ``block`` withholds one whole source group per example
+        (structural / functional_response / temporal) so a source must be reconstructed
+        from the others.
     """
 
     enabled: bool = False
+    source_functional_response: bool = False
+    source_temporal: bool = False
+    mask_mode: str = "coordinate"
+
+    def __post_init__(self) -> None:
+        self.enabled = _as_bool(self.enabled, "vector.residual.enabled")
+        self.source_functional_response = _as_bool(
+            self.source_functional_response, "vector.residual.source_functional_response"
+        )
+        self.source_temporal = _as_bool(
+            self.source_temporal, "vector.residual.source_temporal"
+        )
+        self.mask_mode = _as_str(self.mask_mode, "vector.residual.mask_mode").lower()
+        if self.mask_mode not in SOURCE_MASK_MODES:
+            raise V2ConfigError(
+                f"vector.residual.mask_mode must be one of {list(SOURCE_MASK_MODES)}, "
+                f"got {self.mask_mode!r}"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -241,6 +289,10 @@ class VectorConfig:
     enabled_blocks: list[str] = field(default_factory=lambda: list(DEFAULT_ENABLED_BLOCKS))
     temporal_resolution: int = 10
     context_depth: int = 0
+    #: Compact label-free FIT individual-stimulus response source (residual input view).
+    functional_source_dim: int = DEFAULT_FUNCTIONAL_SOURCE_DIM
+    functional_projection_seed: int = DEFAULT_FUNCTIONAL_PROJECTION_SEED
+    functional_source_normalization: str = "raw"
     residual: VectorResidualConfig = field(default_factory=VectorResidualConfig)
 
     def __post_init__(self) -> None:
@@ -250,9 +302,6 @@ class VectorConfig:
             raise V2ConfigError(
                 f"vector.residual must be a mapping or VectorResidualConfig, got {type(self.residual)!r}"
             )
-        self.residual = VectorResidualConfig(
-            enabled=_as_bool(self.residual.enabled, "vector.residual.enabled")
-        )
         self.enabled_blocks = _normalize_blocks(self.enabled_blocks)
         if not self.enabled_blocks:
             raise V2ConfigError("vector.enabled_blocks must select at least one block")
@@ -272,6 +321,53 @@ class VectorConfig:
         self.context_depth = _as_int(self.context_depth, "vector.context_depth")
         if self.context_depth < 0:
             raise V2ConfigError(f"vector.context_depth must be >= 0, got {self.context_depth}")
+
+        self.functional_source_dim = _as_int(
+            self.functional_source_dim, "vector.functional_source_dim"
+        )
+        if self.functional_source_dim < 1:
+            raise V2ConfigError(
+                f"vector.functional_source_dim must be >= 1, got {self.functional_source_dim}"
+            )
+        if self.functional_source_dim > MAX_FUNCTIONAL_SOURCE_DIM:
+            raise V2ConfigError(
+                f"vector.functional_source_dim={self.functional_source_dim} exceeds the sanity "
+                f"bound {MAX_FUNCTIONAL_SOURCE_DIM}"
+            )
+        self.functional_projection_seed = _as_int(
+            self.functional_projection_seed, "vector.functional_projection_seed"
+        )
+        if self.functional_projection_seed < 0:
+            raise V2ConfigError(
+                "vector.functional_projection_seed must be >= 0, got "
+                f"{self.functional_projection_seed}"
+            )
+        self.functional_source_normalization = _as_str(
+            self.functional_source_normalization, "vector.functional_source_normalization"
+        ).lower()
+        if self.functional_source_normalization not in FUNCTIONAL_SOURCE_NORMALIZATIONS:
+            raise V2ConfigError(
+                "vector.functional_source_normalization must be one of "
+                f"{list(FUNCTIONAL_SOURCE_NORMALIZATIONS)}, got "
+                f"{self.functional_source_normalization!r}"
+            )
+        self._validate_residual_sources()
+
+    def _validate_residual_sources(self) -> None:
+        """A source can only be requested when the learned residual consumes it."""
+        for name, requested in (
+            ("source_functional_response", self.residual.source_functional_response),
+            ("source_temporal", self.residual.source_temporal),
+        ):
+            if requested and not self.residual.enabled:
+                raise V2ConfigError(
+                    f"vector.residual.{name}=true requires vector.residual.enabled=true"
+                )
+            if requested and self.learned_residual_d <= 0:
+                raise V2ConfigError(
+                    f"vector.residual.{name}=true requires vector.learned_residual_d > 0 "
+                    "(nothing would consume the source)"
+                )
 
     # -- dimension resolution ------------------------------------------------
     def _resolve_dimensions(self) -> None:
@@ -915,6 +1011,12 @@ class V2Config:
             ("vector.enabled_blocks", ", ".join(v.enabled_blocks)),
             ("vector.temporal_resolution", v.temporal_resolution),
             ("vector.context_depth", v.context_depth),
+            ("vector.functional_source_dim", v.functional_source_dim),
+            ("vector.functional_projection_seed", v.functional_projection_seed),
+            ("vector.functional_source_normalization", v.functional_source_normalization),
+            ("vector.residual.source_functional_response", v.residual.source_functional_response),
+            ("vector.residual.source_temporal", v.residual.source_temporal),
+            ("vector.residual.mask_mode", v.residual.mask_mode),
             ("memory.train_batch_size", m.train_batch_size),
             ("memory.eval_batch_size", m.eval_batch_size),
             ("memory.record_batch_size", m.record_batch_size),

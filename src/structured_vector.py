@@ -348,9 +348,11 @@ class StructuredVectorEncoder:
     enabled_blocks:
         Which record blocks may contribute. ``None`` means the canonical default block
         set (:data:`src.v2_config.DEFAULT_ENABLED_BLOCKS`), which reproduces the historical
-        48-D structural representation. Blocks that are declared but not implemented
-        (``temporal``, ``network_context``) raise, and implemented-but-absent blocks
-        (e.g. ``intrinsic`` for an untrained model) simply contribute nothing.
+        48-D structural representation. Every implemented block is selectable (including
+        ``activity`` and the coarse ``temporal`` block); a block that is declared but not
+        implemented (``network_context``) raises, and implemented-but-absent blocks
+        (e.g. ``intrinsic`` for an untrained model, or ``temporal`` when the bank was built
+        without it) simply contribute nothing.
     projection_seed:
         Seed of the fixed Level-2 projection (used only when ``structured_d`` exceeds the
         interpretable source dimension).

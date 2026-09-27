@@ -45,6 +45,13 @@ Scientific boundary (enforced, not merely documented)
 * **No forbidden tensors.** Everything is ``(n_neurons, F)`` features and
   ``(batch, F)`` / ``(batch, d_residual)`` minibatches. No ``(neurons, samples, time)``,
   ``(neurons, samples, d)`` or ``(neurons, neurons, d)`` tensor is ever created.
+* **Source view.** The deterministic view has five optional parts: level-0 summaries,
+  level-1 detail, fixed raw-connectivity projections, the label-free FIT
+  individual-stimulus response projection (:mod:`src.functional_response`) and the coarse
+  label-free FIT temporal block. The last two are **opt-in**; when enabled they still read
+  only the bank's stored FIT structures (``activity.samples`` and the pooled FIT PSTH) -
+  never labels, PROBE, TEST or the SNN. Masking is coordinate-level by default and can be
+  switched to source-group level (``structural`` / ``functional_response`` / ``temporal``).
 
 Reproducibility
 ---------------
@@ -66,14 +73,25 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from .neuron_record import NeuronRecordBank
+from .neuron_record import (
+    TEMPORAL_BLOCK,
+    NeuronRecordBank,
+    assert_label_free_fit_activity,
+)
+from .functional_response import (
+    ACTIVITY_BLOCK,
+    DEFAULT_CHUNK_SIZE as DEFAULT_FUNCTIONAL_CHUNK_SIZE,
+    FunctionalResponseConfig,
+    FunctionalResponseError,
+    build_functional_response_source,
+)
 from .structured_vector import (
     DEFAULT_PROJECTION_SEED,
     StructuredVectorEncoder,
     StructuredVectorError,
 )
 from .utils import get_device, set_seed
-from .v2_config import V2Config
+from .v2_config import SOURCE_MASK_MODES, V2Config
 
 #: Provenance schema of the residual source view.
 SOURCE_SCHEMA = "residual_source/v1"
@@ -87,8 +105,22 @@ EVAL_MASK_OFFSET = 10_000_000
 #: Default width of the fixed raw-connectivity view per weighted block.
 DEFAULT_RAW_VIEW_DIM = 32
 
-#: Activity provenance values that must never be used for representation construction.
-_FORBIDDEN_SPLIT_NAMES = ("probe", "test")
+#: Default dimension of the label-free functional-response projection in the source view.
+DEFAULT_FUNCTIONAL_RESPONSE_VIEW_DIM = 64
+
+#: Source groups used by the residual's per-source diagnostics and by block masking.
+SOURCE_GROUP_STRUCTURAL = "structural"
+SOURCE_GROUP_FUNCTIONAL = "functional_response"
+SOURCE_GROUP_TEMPORAL = "temporal"
+SOURCE_GROUPS: tuple[str, ...] = (
+    SOURCE_GROUP_STRUCTURAL,
+    SOURCE_GROUP_FUNCTIONAL,
+    SOURCE_GROUP_TEMPORAL,
+)
+
+#: Feature-name prefixes that identify the functional-response and temporal groups.
+FUNCTIONAL_FEATURE_PREFIX = "functional_response."
+TEMPORAL_FEATURE_PREFIX = f"{TEMPORAL_BLOCK}."
 
 _SUPPORTED_DTYPES = ("float32", "float16", "bfloat16")
 _SUPPORTED_DEVICES = ("cpu", "cuda", "auto")
@@ -105,7 +137,21 @@ class ResidualError(ValueError):
 # --------------------------------------------------------------------------
 @dataclass
 class ResidualSourceConfig:
-    """Deterministic definition of the residual's input view of a record bank."""
+    """Deterministic definition of the residual's input view of a record bank.
+
+    The five parts of the view, in order:
+
+    1. ``include_level0`` - the bank's deterministic summary features,
+    2. ``include_level1`` - the encoder's deterministic within-block detail,
+    3. ``include_raw_weight_view`` - a fixed seeded projection of the raw connectivity,
+    4. ``include_functional_response`` - a fixed seeded projection of the label-free FIT
+       individual-stimulus response profile (:mod:`src.functional_response`),
+    5. ``include_temporal`` - the coarse label-free FIT temporal block.
+
+    Parts 4 and 5 are **opt-in** (default ``False``): with the defaults the resulting
+    feature names - and therefore the schema hash - are identical to the previous stage, so
+    existing residuals remain loadable and the historical path is unchanged.
+    """
 
     enabled_blocks: Sequence[str] | str | None = None
     include_level0: bool = True
@@ -113,15 +159,46 @@ class ResidualSourceConfig:
     include_raw_weight_view: bool = True
     raw_view_dim: int = DEFAULT_RAW_VIEW_DIM
     projection_seed: int = DEFAULT_PROJECTION_SEED
+    # -- new label-free sources (opt-in) -------------------------------------
+    include_functional_response: bool = False
+    functional_source_dim: int = DEFAULT_FUNCTIONAL_RESPONSE_VIEW_DIM
+    functional_projection_seed: int = 0
+    functional_normalization: str = "raw"
+    functional_chunk_size: int = DEFAULT_FUNCTIONAL_CHUNK_SIZE
+    include_temporal: bool = False
 
     def __post_init__(self) -> None:
-        if not (self.include_level0 or self.include_level1 or self.include_raw_weight_view):
+        if not (
+            self.include_level0
+            or self.include_level1
+            or self.include_raw_weight_view
+            or self.include_functional_response
+            or self.include_temporal
+        ):
             raise ResidualError(
-                "the residual source needs at least one of include_level0, include_level1 or "
-                "include_raw_weight_view"
+                "the residual source needs at least one of include_level0, include_level1, "
+                "include_raw_weight_view, include_functional_response or include_temporal"
             )
         self.raw_view_dim = _positive_int(self.raw_view_dim, "raw_view_dim")
         self.projection_seed = _non_negative_int(self.projection_seed, "projection_seed")
+        self.include_functional_response = bool(self.include_functional_response)
+        self.include_temporal = bool(self.include_temporal)
+        # reuses the functional-response configuration's validation (dimension, seed,
+        # normalization mode, chunk size) rather than duplicating its rules; its errors are
+        # surfaced as ResidualError so this module keeps a single error type
+        try:
+            functional = FunctionalResponseConfig(
+                source_dim=self.functional_source_dim,
+                projection_seed=self.functional_projection_seed,
+                normalization=self.functional_normalization,
+                chunk_size=self.functional_chunk_size,
+            )
+        except FunctionalResponseError as exc:
+            raise ResidualError(str(exc)) from exc
+        self.functional_source_dim = int(functional.source_dim)
+        self.functional_projection_seed = int(functional.projection_seed)
+        self.functional_normalization = functional.normalization
+        self.functional_chunk_size = int(functional.chunk_size)
 
     def to_dict(self) -> dict[str, Any]:
         blocks = self.enabled_blocks
@@ -134,12 +211,49 @@ class ResidualSourceConfig:
             "include_raw_weight_view": bool(self.include_raw_weight_view),
             "raw_view_dim": int(self.raw_view_dim),
             "projection_seed": int(self.projection_seed),
+            "include_functional_response": bool(self.include_functional_response),
+            "functional_source_dim": int(self.functional_source_dim),
+            "functional_projection_seed": int(self.functional_projection_seed),
+            "functional_normalization": self.functional_normalization,
+            "functional_chunk_size": int(self.functional_chunk_size),
+            "include_temporal": bool(self.include_temporal),
         }
+
+    def to_functional_config(self) -> FunctionalResponseConfig:
+        """The functional-response configuration implied by this source config."""
+        return FunctionalResponseConfig(
+            source_dim=self.functional_source_dim,
+            projection_seed=self.functional_projection_seed,
+            normalization=self.functional_normalization,
+            chunk_size=self.functional_chunk_size,
+        )
 
     @classmethod
     def from_mapping(cls, mapping: Mapping[str, Any] | None) -> "ResidualSourceConfig":
         valid = {f for f in cls.__dataclass_fields__}  # type: ignore[attr-defined]
         return cls(**{k: v for k, v in dict(mapping or {}).items() if k in valid})
+
+    @classmethod
+    def from_v2_config(
+        cls, config: V2Config, **overrides: Any
+    ) -> "ResidualSourceConfig":
+        """Build from the V2 configuration (``vector.*`` and ``vector.residual.*``).
+
+        With ``vector.residual.source_functional_response`` / ``source_temporal`` left at
+        their default ``false``, this reproduces exactly the previous stage's source view
+        (same blocks, same raw-view width and seed).
+        """
+        mapping: dict[str, Any] = {
+            "enabled_blocks": list(config.vector.enabled_blocks),
+            "include_functional_response": bool(config.vector.residual.source_functional_response),
+            "functional_source_dim": int(config.vector.functional_source_dim),
+            "functional_projection_seed": int(config.vector.functional_projection_seed),
+            "functional_normalization": config.vector.functional_source_normalization,
+            "functional_chunk_size": int(config.memory.representation_chunk_size),
+            "include_temporal": bool(config.vector.residual.source_temporal),
+        }
+        mapping.update(overrides)
+        return cls.from_mapping(mapping)
 
 
 @dataclass
@@ -214,6 +328,60 @@ def _raw_weight_view(weights: np.ndarray, width: int, *, seed: int, block_index:
     return w @ g
 
 
+def source_group_of_feature(name: str) -> str:
+    """Group of one source coordinate (used for diagnostics and block masking)."""
+    text = str(name)
+    if text.startswith(FUNCTIONAL_FEATURE_PREFIX):
+        return SOURCE_GROUP_FUNCTIONAL
+    if text.startswith(TEMPORAL_FEATURE_PREFIX):
+        return SOURCE_GROUP_TEMPORAL
+    return SOURCE_GROUP_STRUCTURAL
+
+
+def source_groups_from_names(feature_names: Sequence[str]) -> dict[str, list[int]]:
+    """``{group: [coordinate indices]}`` for a source schema (empty groups omitted)."""
+    groups: dict[str, list[int]] = {group: [] for group in SOURCE_GROUPS}
+    for index, name in enumerate(feature_names):
+        groups[source_group_of_feature(name)].append(int(index))
+    return {group: indices for group, indices in groups.items() if indices}
+
+
+def _append_unique(
+    parts: list[np.ndarray],
+    names: list[str],
+    X_new: np.ndarray,
+    names_new: Sequence[str],
+) -> dict[str, Any]:
+    """Append only coordinates that are not already present; report the de-duplication.
+
+    A block that the structured encoder already selects (e.g. ``temporal`` in
+    ``vector.enabled_blocks``) must not appear twice in the source view: adding the same
+    coordinate twice would silently double-weight it and break name uniqueness.
+    """
+    existing = set(names)
+    keep: list[int] = []
+    duplicated: list[str] = []
+    for index, name in enumerate(names_new):
+        if name in existing:
+            duplicated.append(str(name))
+        else:
+            existing.add(name)
+            keep.append(int(index))
+    if keep:
+        parts.append(np.asarray(X_new, dtype=np.float64)[:, keep])
+        names.extend(str(names_new[i]) for i in keep)
+    return {
+        "appended_coordinates": len(keep),
+        "duplicate_coordinates_skipped": len(duplicated),
+        "duplicate_examples": duplicated[:5],
+        "reason": (
+            "coordinates already present in an earlier source part (e.g. the structured "
+            "level-0 prefix already selected this block); never counted twice"
+            if duplicated else ""
+        ),
+    }
+
+
 def build_residual_source(
     bank: NeuronRecordBank,
     config: ResidualSourceConfig | None = None,
@@ -226,9 +394,15 @@ def build_residual_source(
     2. the encoder's **level-1** deterministic within-block detail (when ``include_level1``),
     3. a **fixed seeded projection of the raw connectivity** of each weighted block
        (when ``include_raw_weight_view``) - source information the structured summaries do
-       not expose, which is what gives the residual its additional capacity.
+       not expose,
+    4. a **fixed seeded projection of the label-free FIT individual-stimulus response
+       profile** (when ``include_functional_response``),
+    5. the **coarse label-free FIT temporal block** (when ``include_temporal``).
 
     Only the record bank is read: no labels, no PROBE/TEST data, no model forward pass.
+    Every part is identifiable in the provenance, and the coordinate groups
+    (:func:`source_group_of_feature`) drive the per-source training diagnostics and the
+    optional block masking.
     """
     if not isinstance(bank, NeuronRecordBank):
         raise ResidualError(f"residual source requires a NeuronRecordBank, got {type(bank).__name__}")
@@ -279,10 +453,96 @@ def build_residual_source(
             parts.append(view)
             names.extend(f"{block_name}.raw_view_{j:02d}" for j in range(view.shape[1]))
 
+    functional_info: dict[str, Any] = {
+        "enabled": False,
+        "reason": "include_functional_response=False",
+    }
+    if config.include_functional_response:
+        try:
+            functional = build_functional_response_source(bank, config.to_functional_config())
+        except FunctionalResponseError as exc:
+            raise ResidualError(str(exc)) from exc
+        dedup = _append_unique(parts, names, functional.X, functional.feature_names)
+        functional_info = {"enabled": True, **functional.provenance, **dedup}
+
+    temporal_info: dict[str, Any] = {
+        "enabled": False,
+        "reason": "include_temporal=False",
+    }
+    if config.include_temporal:
+        try:
+            temporal_block = bank.get_block(TEMPORAL_BLOCK)
+        except Exception as exc:
+            raise ResidualError(
+                "include_temporal=True requires a bank built with the coarse temporal block "
+                "(label-free FIT activity plus vector.enabled_blocks containing 'temporal' or "
+                "vector.residual.source_temporal=true, and vector.temporal_resolution set); "
+                f"this bank has none ({exc})"
+            ) from exc
+        temporal_X, temporal_names = temporal_block.to_matrix()
+        dedup = _append_unique(parts, names, temporal_X, temporal_names)
+        temporal_prov = bank.provenance.get("temporal", {})
+        temporal_info = {
+            "enabled": True,
+            "source_type": "coarse_label_free_fit_temporal",
+            "source_split": temporal_prov.get("split"),
+            "uses_labels": False,
+            "input_shape": [int(temporal_X.shape[0]), int(temporal_X.shape[1])],
+            "available_dimension": int(temporal_X.shape[1]),
+            "output_dimension": int(dedup["appended_coordinates"]),
+            "feature_names": list(temporal_names),
+            "normalization": "mean label-free FIT firing rate per coarse bin (Hz), no further scaling",
+            "temporal_resolution": temporal_prov.get("resolution"),
+            "binning": temporal_block.metadata.get("binning"),
+            "bins": list(temporal_prov.get("bins", [])),
+            "class_conditioned": False,
+            "time_resolved_tensor_stored": False,
+            **dedup,
+        }
+
     if not parts:  # pragma: no cover - guarded by ResidualSourceConfig validation
         raise ResidualError("the residual source view is empty")
 
     X = np.concatenate(parts, axis=1)
+    groups = source_groups_from_names(names)
+    source_blocks = [
+        {
+            "name": "level0",
+            "kind": "deterministic_summaries",
+            "dimension": int(level0_dim if config.include_level0 else 0),
+        },
+        {
+            "name": "level1",
+            "kind": "deterministic_detail",
+            "dimension": int((source_dim - level0_dim) if config.include_level1 else 0),
+        },
+        {
+            "name": "raw_connectivity_view",
+            "kind": "fixed_projection_of_raw_weights",
+            "dimension": int(sum(raw_view_dims.values())),
+            "per_block": dict(raw_view_dims),
+        },
+        {
+            "name": "functional_response",
+            "kind": "label_free_fit_individual_stimulus_response",
+            "dimension": int(functional_info.get("output_dimension", 0)),
+            "available_dimension": int(functional_info.get("output_dimension", 0) or 0),
+            "enabled": bool(functional_info.get("enabled")),
+        },
+        {
+            "name": "temporal",
+            "kind": "label_free_fit_coarse_temporal",
+            "dimension": int(temporal_info.get("output_dimension", 0)),
+            "available_dimension": int(temporal_info.get("available_dimension", 0) or 0),
+            "enabled": bool(temporal_info.get("enabled")),
+            "note": (
+                "the residual source always carries the full union of the five parts; a part "
+                "whose coordinates already entered an earlier part contributes nothing new "
+                "here (see duplicate_coordinates_skipped), and source_groups reports the "
+                "final per-group coordinate counts"
+            ),
+        },
+    ]
     provenance = {
         "schema": SOURCE_SCHEMA,
         "uses_labels": False,
@@ -293,6 +553,10 @@ def build_residual_source(
         "raw_view_dimensions": raw_view_dims,
         "raw_view_projection_seed": int(config.projection_seed) if raw_view_dims else None,
         "raw_view_type": "fixed_gaussian_1_over_sqrt_width" if raw_view_dims else None,
+        "functional_response": functional_info,
+        "temporal": temporal_info,
+        "source_blocks": source_blocks,
+        "source_groups": groups,
         "source_config": config.to_dict(),
         "bank": {
             "schema": bank.provenance.get("schema"),
@@ -302,8 +566,10 @@ def build_residual_source(
         },
         "note": (
             "Deterministic view of the label-free record bank: level-0 summaries, level-1 "
-            "deterministic detail and a fixed seeded projection of the raw connectivity. No labels, "
-            "no PROBE, no TEST, no functional fingerprint and no model forward pass."
+            "deterministic detail, a fixed seeded projection of the raw connectivity and "
+            "(when enabled) the label-free FIT individual-stimulus response projection and "
+            "coarse temporal block. No labels, no PROBE, no TEST, no functional fingerprint "
+            "and no model forward pass."
         ),
     }
     return ResidualSource(X=X, feature_names=tuple(names), provenance=provenance)
@@ -311,12 +577,10 @@ def build_residual_source(
 
 def _assert_bank_activity_is_label_free_fit(bank: NeuronRecordBank) -> None:
     """Reject a bank whose activity provenance names a PROBE/TEST split."""
-    split = str(bank.provenance.get("activity", {}).get("split", "none")).lower()
-    if any(bad in split for bad in _FORBIDDEN_SPLIT_NAMES):
-        raise ResidualError(
-            f"the record bank's activity block was measured on split {split!r}; the residual and every "
-            "representation component must use FIT only (never PROBE/TEST)"
-        )
+    try:
+        assert_label_free_fit_activity(bank)
+    except Exception as exc:
+        raise ResidualError(str(exc)) from exc
 
 
 # --------------------------------------------------------------------------
@@ -339,6 +603,7 @@ class ResidualTrainingConfig:
     mask_seed: int = 0
     minimum_visible_features: int = 8
     visible_loss_weight: float = 0.0
+    mask_mode: str = "coordinate"
     normalization: str = "train_standardise"
     val_fraction: float = 0.2
     split_seed: int = 0
@@ -371,6 +636,11 @@ class ResidualTrainingConfig:
             self.minimum_visible_features, "minimum_visible_features"
         )
         self.visible_loss_weight = _non_negative_float(self.visible_loss_weight, "visible_loss_weight")
+        self.mask_mode = str(self.mask_mode).strip().lower()
+        if self.mask_mode not in SOURCE_MASK_MODES:
+            raise ResidualError(
+                f"mask_mode must be one of {list(SOURCE_MASK_MODES)}, got {self.mask_mode!r}"
+            )
         self.normalization = str(self.normalization).lower()
         if self.normalization not in _SUPPORTED_NORMALIZATION:
             raise ResidualError(
@@ -423,7 +693,11 @@ class ResidualTrainingConfig:
                 f"(residual.enabled={config.vector.residual.enabled}). Set "
                 "vector.learned_residual_d > 0 and vector.residual.enabled=true, or skip the residual."
             )
-        mapping: dict[str, Any] = {"residual_dim": dimension, "dtype": config.precision.vector_dtype}
+        mapping: dict[str, Any] = {
+            "residual_dim": dimension,
+            "dtype": config.precision.vector_dtype,
+            "mask_mode": config.vector.residual.mask_mode,
+        }
         mapping.update(overrides)
         return cls.from_mapping(mapping)
 
@@ -565,6 +839,123 @@ def make_mask(
     for row in range(n_rows):
         mask[row, rng.choice(n_features, size=n_mask, replace=False)] = True
     return mask
+
+
+def make_block_mask(
+    n_rows: int,
+    n_features: int,
+    *,
+    groups: Mapping[str, Sequence[int]],
+    mask_fraction: float,
+    minimum_visible_features: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Boolean ``(n_rows, n_features)`` mask that withholds **one whole source group** per row.
+
+    Source-aware masking: for each example one group (``structural`` /
+    ``functional_response`` / ``temporal``) is chosen at random and all of its coordinates
+    are withheld, so the model must reconstruct a source from the others. Groups are tried
+    in random order and the first one that keeps at least ``minimum_visible_features``
+    coordinates visible is used; if no group satisfies that (e.g. a single very large
+    group), the row falls back to the deterministic coordinate-level mask - so the
+    ``minimum_visible_features`` guarantee always holds. Deterministic given ``rng`` and
+    never derived from labels, PROBE or TEST.
+    """
+    if n_rows < 1 or n_features < 1:
+        raise ResidualError(f"mask shape must be positive, got ({n_rows}, {n_features})")
+    min_visible = _positive_int(minimum_visible_features, "minimum_visible_features")
+    if min_visible >= n_features:
+        raise ResidualError(f"minimum_visible_features={min_visible} must be < n_features={n_features}")
+    names = sorted(str(name) for name in groups)
+    indices = {str(name): [int(i) for i in groups[name]] for name in names}
+    sizes = {name: len(values) for name, values in indices.items()}
+    if not names:
+        raise ResidualError("block masking needs at least one source group")
+
+    mask = np.zeros((n_rows, n_features), dtype=bool)
+    fallback_rows: list[int] = []
+    for row in range(n_rows):
+        chosen: str | None = None
+        for position in rng.permutation(len(names)):
+            candidate = names[int(position)]
+            if n_features - sizes[candidate] >= min_visible:
+                chosen = candidate
+                break
+        if chosen is None:
+            fallback_rows.append(row)
+        else:
+            mask[row, indices[chosen]] = True
+    if fallback_rows:
+        fallback = make_mask(
+            len(fallback_rows),
+            n_features,
+            mask_fraction=mask_fraction,
+            minimum_visible_features=min_visible,
+            rng=rng,
+        )
+        mask[np.asarray(fallback_rows, dtype=np.int64)] = fallback
+    return mask
+
+
+def make_source_mask(
+    n_rows: int,
+    n_features: int,
+    *,
+    mode: str,
+    mask_fraction: float,
+    minimum_visible_features: int,
+    rng: np.random.Generator,
+    groups: Mapping[str, Sequence[int]] | None = None,
+) -> np.ndarray:
+    """Dispatch to the configured masking strategy (``coordinate`` or ``block``)."""
+    strategy = str(mode).strip().lower()
+    if strategy == "coordinate":
+        return make_mask(
+            n_rows,
+            n_features,
+            mask_fraction=mask_fraction,
+            minimum_visible_features=minimum_visible_features,
+            rng=rng,
+        )
+    if strategy == "block":
+        if not groups:
+            raise ResidualError("mask_mode='block' requires the source coordinate groups")
+        return make_block_mask(
+            n_rows,
+            n_features,
+            groups=groups,
+            mask_fraction=mask_fraction,
+            minimum_visible_features=minimum_visible_features,
+            rng=rng,
+        )
+    raise ResidualError(f"mask_mode must be one of {list(SOURCE_MASK_MODES)}, got {mode!r}")
+
+
+def group_masked_mse(
+    reconstruction: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    groups: Mapping[str, Sequence[int]],
+) -> dict[str, float]:
+    """Per-source-group MSE on the **withheld** coordinates (training diagnostics only).
+
+    ``nan`` for a group that had no withheld coordinate in this batch, so the caller can
+    distinguish "not masked here" from "perfectly reconstructed". These numbers are
+    diagnostics, not scientific results.
+    """
+    diff_sq = (reconstruction - target) ** 2
+    out: dict[str, float] = {}
+    for name, columns in groups.items():
+        index = torch.as_tensor([int(c) for c in columns], dtype=torch.long, device=mask.device)
+        sub_mask = mask.index_select(1, index)
+        if not bool(sub_mask.any()):
+            out[str(name)] = float("nan")
+            continue
+        denom = sub_mask.sum().clamp(min=1)
+        out[str(name)] = float(
+            ((diff_sq.index_select(1, index) * sub_mask).sum() / denom).item()
+        )
+    return out
 
 
 def apply_mask(x: torch.Tensor, mask: Any) -> torch.Tensor:
@@ -829,6 +1220,7 @@ class ResidualTrainer:
         if not isinstance(source, ResidualSource):
             raise ResidualError(f"fit expects a ResidualSource, got {type(source).__name__}")
         n_rows, n_features = source.n_neurons, source.n_features
+        groups = source_groups_from_names(source.feature_names)
         if config.minimum_visible_features >= n_features:
             raise ResidualError(
                 f"minimum_visible_features={config.minimum_visible_features} must be < source features "
@@ -863,21 +1255,25 @@ class ResidualTrainer:
         )
 
         eval_mask_train = torch.as_tensor(
-            make_mask(
+            make_source_mask(
                 train_idx.size, n_features,
+                mode=config.mask_mode,
                 mask_fraction=config.mask_fraction,
                 minimum_visible_features=config.minimum_visible_features,
                 rng=np.random.default_rng([config.mask_seed, EVAL_MASK_OFFSET]),
+                groups=groups,
             ),
             dtype=torch.bool, device=device,
         )
         eval_mask_val = (
             torch.as_tensor(
-                make_mask(
+                make_source_mask(
                     val_idx.size, n_features,
+                    mode=config.mask_mode,
                     mask_fraction=config.mask_fraction,
                     minimum_visible_features=config.minimum_visible_features,
                     rng=np.random.default_rng([config.mask_seed, EVAL_MASK_OFFSET + 1]),
+                    groups=groups,
                 ),
                 dtype=torch.bool, device=device,
             )
@@ -891,11 +1287,13 @@ class ResidualTrainer:
         for epoch in range(config.epochs):
             encoder.train(True)
             decoder.train(True)
-            mask_all = make_mask(
+            mask_all = make_source_mask(
                 train_idx.size, n_features,
+                mode=config.mask_mode,
                 mask_fraction=config.mask_fraction,
                 minimum_visible_features=config.minimum_visible_features,
                 rng=np.random.default_rng([config.mask_seed, epoch]),
+                groups=groups,
             )
             order = np.random.default_rng([config.seed, epoch, 12345]).permutation(train_idx.size)
             epoch_losses: list[float] = []
@@ -916,12 +1314,15 @@ class ResidualTrainer:
                 optimizer.step()
                 epoch_losses.append(float(loss.detach().item()))
 
-            train_loss = self._evaluate(encoder, decoder, x_train, eval_mask_train)
-            val_loss = (
-                self._evaluate(encoder, decoder, x_val, eval_mask_val)
-                if x_val is not None and eval_mask_val is not None
-                else float("nan")
+            train_loss, train_group_losses = self._evaluate(
+                encoder, decoder, x_train, eval_mask_train, groups
             )
+            if x_val is not None and eval_mask_val is not None:
+                val_loss, val_group_losses = self._evaluate(
+                    encoder, decoder, x_val, eval_mask_val, groups
+                )
+            else:
+                val_loss, val_group_losses = float("nan"), {}
             history.append({
                 "epoch": int(epoch),
                 "train_loss": float(train_loss),
@@ -930,6 +1331,9 @@ class ResidualTrainer:
                 "val_masked_mse": float(val_loss),
                 "optimization_loss_mean": float(np.mean(epoch_losses)) if epoch_losses else float("nan"),
                 "mask_fraction_realised": float(mask_all.mean()),
+                "mask_mode": config.mask_mode,
+                **{f"train_masked_mse_{name}": value for name, value in train_group_losses.items()},
+                **{f"val_masked_mse_{name}": value for name, value in val_group_losses.items()},
             })
 
             score = val_loss if np.isfinite(val_loss) else train_loss
@@ -953,11 +1357,32 @@ class ResidualTrainer:
             "objective": "masked_reconstruction_mse_on_withheld_coordinates",
             "mask_policy": {
                 "type": "random_per_example_deterministic",
+                "mode": config.mask_mode,
                 "mask_fraction": config.mask_fraction,
                 "mask_seed": config.mask_seed,
                 "minimum_visible_features": config.minimum_visible_features,
                 "eval_mask_seed_offset": EVAL_MASK_OFFSET,
                 "masked_coordinates_are_zeroed_in_standardised_input": True,
+                "source_groups": {name: len(values) for name, values in groups.items()},
+                "block_mask_note": (
+                    "mask_mode='block': one whole source group (structural / "
+                    "functional_response / temporal) is withheld per example, with a "
+                    "coordinate-level fallback whenever the visibility guarantee would be "
+                    "violated"
+                    if config.mask_mode == "block"
+                    else "mask_mode='coordinate': individual coordinates are withheld"
+                ),
+            },
+            "source_groups": {name: [int(i) for i in values] for name, values in groups.items()},
+            "source_diagnostics": {
+                "per_source_history_fields": (
+                    [f"train_masked_mse_{name}" for name in groups]
+                    + [f"val_masked_mse_{name}" for name in groups]
+                ),
+                "note": (
+                    "per-source masked reconstruction MSE (withheld coordinates only); training "
+                    "diagnostics, not scientific results"
+                ),
             },
             "seeds": {
                 "global_seed": config.seed,
@@ -1053,13 +1478,16 @@ class ResidualTrainer:
         decoder: ReconstructionDecoder,
         x: torch.Tensor,
         mask: torch.Tensor,
-    ) -> float:
+        groups: Mapping[str, Sequence[int]] | None = None,
+    ) -> tuple[float, dict[str, float]]:
+        """Masked reconstruction loss plus the per-source-group breakdown (diagnostics)."""
         encoder.eval()
         decoder.eval()
         with torch.no_grad():
             reconstruction = decoder(encoder(apply_mask(x, mask)))
             loss = masked_reconstruction_loss(reconstruction, x, mask)
-        return float(loss.detach().cpu().item())
+            per_group = group_masked_mse(reconstruction, x, mask, groups) if groups else {}
+        return float(loss.detach().cpu().item()), per_group
 
 
 # --------------------------------------------------------------------------
@@ -1175,9 +1603,16 @@ __all__ = [
     "RESIDUAL_SCHEMA",
     "EVAL_MASK_OFFSET",
     "DEFAULT_RAW_VIEW_DIM",
+    "DEFAULT_FUNCTIONAL_RESPONSE_VIEW_DIM",
+    "SOURCE_GROUP_STRUCTURAL",
+    "SOURCE_GROUP_FUNCTIONAL",
+    "SOURCE_GROUP_TEMPORAL",
+    "SOURCE_GROUPS",
     "ResidualError",
     "ResidualSourceConfig",
     "ResidualSource",
+    "source_group_of_feature",
+    "source_groups_from_names",
     "ResidualTrainingConfig",
     "ResidualEncoder",
     "ReconstructionDecoder",
@@ -1186,6 +1621,9 @@ __all__ = [
     "build_residual_source",
     "train_residual",
     "make_mask",
+    "make_block_mask",
+    "make_source_mask",
+    "group_masked_mse",
     "apply_mask",
     "masked_reconstruction_loss",
     "feature_schema_hash",
