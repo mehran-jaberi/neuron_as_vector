@@ -12,7 +12,7 @@
 #         --override train.epochs=5 --override model.n_hidden=128
 #
 # -----------------------------------------------------------------------------
-# REPAIRED BASELINE (baseline_repaired_v1) - see AUDIT_DYNAMICS.md
+# REPAIRED BASELINE (baseline_repaired_v1) - see archive/documentation/AUDIT_DYNAMICS.md
 # The dynamics audit found that plain cross-entropy with NO homeostasis drove a
 # common-mode depolarisation that saturated the hidden layer (~160 Hz mean rate,
 # 28% >200 Hz, membrane potentials up to ~42x theta=1.0), which compressed the

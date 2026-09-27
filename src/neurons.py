@@ -717,7 +717,7 @@ def activity_features_from_psth(
     flagged in ``flags["silent_neuron"]`` so analyses can exclude or at least
     identify them.
 
-    Audit note (see ``AUDIT_REPRESENTATION.md``): the earlier ``isi_cv`` /
+    Audit note (see ``archive/documentation/AUDIT_REPRESENTATION.md``): the earlier ``isi_cv`` /
     ``burstiness`` / ``isi_mean_ms`` names were **mislabelled** - they were
     computed from the pooled per-neuron spike-time histogram, not from
     interspike intervals. ``spike_time_cv`` now states what it actually is (the

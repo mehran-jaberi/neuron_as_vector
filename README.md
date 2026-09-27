@@ -10,6 +10,15 @@ the **geometry** of those representations reflects the neurons' **function**.
 
 The intended target is a [SNUFA](https://snufa.net/) 2026 submission.
 
+> **Current implementation status (V2).** The active architecture — V2 configuration,
+> the label-free `NeuronRecordBank`, the deterministic structured encoder, the
+> label-free learned residual and the full-vector composition — is documented in
+> [`V2_STATUS.md`](V2_STATUS.md). The design audit behind it is
+> [`VECTOR_V2_AUDIT.md`](VECTOR_V2_AUDIT.md). Historical audits and stage reports were
+> moved (not deleted) to [`archive/documentation/`](archive/documentation/), and the
+> archived intermediate run artefacts are listed in
+> [`archive/ARCHIVE_MANIFEST.md`](archive/ARCHIVE_MANIFEST.md).
+
 > **Result in one line** (see [§7](#7-results) for the full analysis): a label-free
 > representation built only from the network's parameters predicts individual
 > neurons' functional fingerprints with a Mantel correlation of
@@ -153,7 +162,7 @@ optional row normalisation are configurable
 (`configs/analysis.yaml → representations`). The result is exposed as a
 `RepresentationSpace` (`src/representations.py`) with pairwise distances and full
 feature provenance. A detailed, feature-by-feature audit is in
-[`AUDIT_REPRESENTATION.md`](AUDIT_REPRESENTATION.md).
+[`archive/documentation/AUDIT_REPRESENTATION.md`](archive/documentation/AUDIT_REPRESENTATION.md).
 
 ### 4.1 Generic learned bias vs. genuine dynamical parameters
 
@@ -208,7 +217,7 @@ representation demonstrates that the detector fires. The structural representati
 - Activity block: **12**.
 - `structural + activity`: **60**.
 
-See `AUDIT_REPRESENTATION.md` §7 for the exact feature list.
+See `archive/documentation/AUDIT_REPRESENTATION.md` §7 for the exact feature list.
 
 ---
 
@@ -376,7 +385,7 @@ All numbers are produced by the scripts in §14–§15 and are stored under
 
 > **Representation revision (2026-09-26).** The numbers in §7.2–§7.6 were produced
 > with the *pre-audit* representation (v1). Following the feature audit
-> ([`AUDIT_REPRESENTATION.md`](AUDIT_REPRESENTATION.md)) the representation was
+> ([`archive/documentation/AUDIT_REPRESENTATION.md`](archive/documentation/AUDIT_REPRESENTATION.md)) the representation was
 > corrected: the tonotopic centre-of-mass features were removed from the primary
 > representation, the recurrent in/out orientation was fixed, the learned bias was
 > renamed `learned_bias` and separated from genuine dynamical parameters, and
@@ -576,7 +585,8 @@ is **not** a noise-ceiling artefact.
 **Leakage audit.** The guard confirmed the probe split (speakers `[6,8]`) is
 disjoint from the model-selection `dev` speakers `[2]` for `baseline_v2`. The legacy
 `baseline.pt` **failed** this check (its 2-way validation speakers were `[6,8]`), so
-the legacy stress table is superseded — see §6.3 and `AUDIT_REPRESENTATION.md` §10.3.
+the legacy stress table is superseded — see §6.3 and
+`archive/documentation/AUDIT_REPRESENTATION.md` §10.3.
 
 **Interpretation.**
 
@@ -605,7 +615,7 @@ the legacy stress table is superseded — see §6.3 and `AUDIT_REPRESENTATION.md
 
 ### 7.9 Repaired baseline — numerical health (`baseline_repaired_v1`)
 
-A dynamics audit (`AUDIT_DYNAMICS.md`, `scripts/diagnose.py`) showed that the
+A dynamics audit (`archive/documentation/AUDIT_DYNAMICS.md`, `scripts/diagnose.py`) showed that the
 earlier baseline was **numerically saturated**: plain cross-entropy with **no
 homeostasis** drove a common-mode depolarisation (net-positive input/recurrent
 weight means) that pushed the hidden layer to **166 Hz** mean rate (28 % of neurons
@@ -637,7 +647,7 @@ one (0.492 vs 0.472), so the structural blocks are not yet shown to beat firing 
 (iii) the voltage tails remain large (heavy negative excursions) because the synaptic
 DC gain is ~3, which a future fix should address by rescaling weights or τ_syn.
 
-> **Baseline repair is still in progress — see [`LIF_BASELINE_REPORT.md`](LIF_BASELINE_REPORT.md).**
+> **Baseline repair is still in progress — see [`archive/documentation/LIF_BASELINE_REPORT.md`](archive/documentation/LIF_BASELINE_REPORT.md).**
 > A controlled DEV-selected sweep found that the 160 Hz saturation was caused by a
 > **readout-scale defect**, not by a missing spike penalty: the historical
 > time-averaged readout `logits = (1/T)Σ O_t` makes the logit scale ≈T× too small,

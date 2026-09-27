@@ -508,7 +508,7 @@ d**; only the CPU-side `(n, d)` matrices and `n²` condensed distances scale (n=
 * No representation was implemented; no `d` parameter was added; no learned residual was trained.
 * No config, checkpoint, result, figure, or test was modified.
 * No scientific conclusion was re-derived or revised; the existing 48-D results stand as recorded
-  in `NEURON_SPACE_BASELINE_REPORT.md` (structural Mantel r = 0.174 ± 0.049; weaker than
+  in `archive/documentation/NEURON_SPACE_BASELINE_REPORT.md` (structural Mantel r = 0.174 ± 0.049; weaker than
   rate-only r = 0.388 and activity-only CV R² = 0.711 — i.e. the current representation is
   reproducible but weak, which is exactly the starting point for the unified-record work).
 
