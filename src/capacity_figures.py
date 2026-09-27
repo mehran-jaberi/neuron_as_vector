@@ -494,6 +494,256 @@ def write_rate_robustness_figures(
     return written
 
 
+# --------------------------------------------------------------------------
+# Source-extension figures (functional-response / temporal evaluation)
+# --------------------------------------------------------------------------
+_TARGET_DECOMPOSITION_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("raw", "raw_r"),
+    ("neuron-centered", "centered_r"),
+    ("neuron z-scored", "zscored_r"),
+    ("mean-rate target", "mean_rate_r"),
+)
+
+_ABLATION_COLORS = {
+    "structured": "#1f77b4",
+    "functional_response": "#d62728",
+    "temporal": "#9467bd",
+    "functional_response+temporal": "#2ca02c",
+    "functional_response+temporal|block": "#8c564b",
+    "structured_48": "#1f77b4",
+    "structured_48_plus_temporal": "#9467bd",
+}
+_ABLATION_LABELS = {
+    "structured": "A: structural",
+    "functional_response": "B: + functional response",
+    "temporal": "C: + temporal",
+    "functional_response+temporal": "D: + both",
+    "functional_response+temporal|block": "D: + both (block masking)",
+}
+
+
+def _source_extension_table(payload: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    table = payload.get("condition_table")
+    if not table:
+        raise KeyError("the payload has no 'condition_table' (source-extension results)")
+    return list(table)
+
+
+def _entries(payload: Mapping[str, Any], representation: str) -> list[Mapping[str, Any]]:
+    return [
+        entry for entry in _source_extension_table(payload)
+        if str(entry.get("representation")) == representation
+    ]
+
+
+def _ablation_groups(
+    payload: Mapping[str, Any],
+    metric: str,
+) -> list[tuple[str, str, list[float]]]:
+    """Ordered ``(group_key, display_label, values)`` for the source-ablation comparison."""
+    ablation = payload.get("ablation_table") or []
+    groups: list[tuple[str, str, list[float]]] = []
+    for row in _source_extension_table(payload):
+        if str(row.get("condition_role")) != "deterministic":
+            continue
+        if str(row.get("representation")) not in ("structured_48", "structured_48_plus_temporal"):
+            continue
+        value = _finite(row.get(metric))
+        if np.isfinite(value):
+            groups.append((str(row["representation"]), None, [value]))  # type: ignore[arg-type]
+
+    ordered_keys = [
+        "structured",
+        "functional_response",
+        "temporal",
+        "functional_response+temporal",
+        "functional_response+temporal|block",
+    ]
+    for key in ordered_keys:
+        values = []
+        for row in ablation:
+            source = str(row.get("source_key"))
+            mask = str(row.get("mask_mode"))
+            tag = source if mask != "block" else f"{source}|block"
+            if tag != key:
+                continue
+            value = _finite(row.get(metric))
+            if np.isfinite(value):
+                values.append(value)
+        if values:
+            groups.append((key, _ABLATION_LABELS.get(key, key), values))
+    return groups
+
+
+def source_extension_figure1_target_decomposition(
+    payload: Mapping[str, Any],
+    out_dir: str | Path,
+    *,
+    representation: str = "structured_48",
+    previous_decomposition: Mapping[str, Any] | None = None,
+    formats: Sequence[str] = DEFAULT_FORMATS,
+    dpi: int = DEFAULT_DPI,
+) -> list[Path]:
+    """Target decomposition for one representation, with the previous study overlaid."""
+    plt = _plt()
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    entries = _entries(payload, representation)
+    if not entries:
+        raise KeyError(f"no condition_table rows for representation {representation!r}")
+
+    fig, ax = plt.subplots(figsize=(6.8, 4.2))
+    xs = np.arange(len(_TARGET_DECOMPOSITION_COLUMNS))
+    values, lows, highs = [], [], []
+    for _label, column in _TARGET_DECOMPOSITION_COLUMNS:
+        collected = [v for entry in entries if np.isfinite(v := _finite(entry.get(column)))]
+        values.append(float(np.mean(collected)) if collected else float("nan"))
+        low_column, high_column = column.replace("_r", "_bootstrap_low"), column.replace("_r", "_bootstrap_high")
+        lo = [v for entry in entries if np.isfinite(v := _finite(entry.get(low_column)))]
+        hi = [v for entry in entries if np.isfinite(v := _finite(entry.get(high_column)))]
+        lows.append(float(np.mean(lo)) if lo else float("nan"))
+        highs.append(float(np.mean(hi)) if hi else float("nan"))
+
+    ax.bar(xs, values, width=0.5, color="#1f77b4", alpha=0.8, label=f"this stage ({representation})")
+    for x, value, low, high in zip(xs, values, lows, highs):
+        if np.isfinite(low) and np.isfinite(high):
+            ax.errorbar([x], [value], yerr=[[value - low], [high - value]], fmt="none",
+                        ecolor="#333333", capsize=3, lw=1.2)
+    if previous_decomposition:
+        previous = [
+            _finite(previous_decomposition.get(column)) for _label, column in _TARGET_DECOMPOSITION_COLUMNS
+        ]
+        ax.plot(xs, previous, "o", mfc="none", mec="#7f7f7f", ms=8, mew=1.4,
+                label="previous robustness study (structured_48)")
+    ax.axhline(0.0, color="#999999", lw=1.0)
+    ax.set_xticks(xs)
+    ax.set_xticklabels([label for label, _column in _TARGET_DECOMPOSITION_COLUMNS], fontsize=8)
+    ax.set_ylabel("Mantel Spearman r")
+    ax.set_title(f"Target decomposition: {representation}", fontsize=10)
+    ax.legend(fontsize=8, frameon=False)
+    _clean(ax)
+    _conclusion_note(fig, "bars = mean over checkpoints (seeds where applicable); whiskers = bootstrap CI")
+    return _finish(fig, out_dir / "source_extension_figure1_target_decomposition", formats=formats, dpi=dpi)
+
+
+def source_extension_figure2_source_ablation(
+    payload: Mapping[str, Any],
+    out_dir: str | Path,
+    *,
+    metric: str = "zscored_r",
+    formats: Sequence[str] = DEFAULT_FORMATS,
+    dpi: int = DEFAULT_DPI,
+) -> list[Path]:
+    """The key figure: the source ablation against the neuron z-scored target."""
+    plt = _plt()
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    groups = _ablation_groups(payload, metric)
+    if not groups:
+        raise KeyError("no ablation rows stored in the payload")
+
+    fig, ax = plt.subplots(figsize=(8.2, 4.6))
+    xs = np.arange(len(groups))
+    for x, (key, label, values) in zip(xs, groups):
+        color = _ABLATION_COLORS.get(key, "#333333")
+        mean = float(np.mean(values))
+        std = float(np.std(values, ddof=0))
+        ax.bar([x], [mean], width=0.6, color=color, alpha=0.8)
+        if len(values) > 1:
+            ax.errorbar([x], [mean], yerr=[std], fmt="none", ecolor="#333333", capsize=3, lw=1.2)
+            ax.plot([x] * len(values), values, "k.", ms=4, alpha=0.8)
+        ax.annotate(f"{mean:+.3f}", (x, mean), xytext=(0, 4), textcoords="offset points",
+                    ha="center", fontsize=8, color="#444444")
+    ax.axhline(0.0, color="#999999", lw=1.0)
+    ax.set_xticks(xs)
+    ax.set_xticklabels([label or key for key, label, _values in groups], rotation=18, ha="right", fontsize=8)
+    ax.set_ylabel("Mantel Spearman r (neuron z-scored target)")
+    ax.set_title("Source ablation: rate- and amplitude-independent correspondence", fontsize=10)
+    _clean(ax)
+    _conclusion_note(fig, "bars = mean over checkpoints and residual seeds; dots = individual replicates", y=-0.30)
+    return _finish(fig, out_dir / "source_extension_figure2_source_ablation", formats=formats, dpi=dpi)
+
+
+def source_extension_figure3_raw_vs_shape(
+    payload: Mapping[str, Any],
+    out_dir: str | Path,
+    *,
+    formats: Sequence[str] = DEFAULT_FORMATS,
+    dpi: int = DEFAULT_DPI,
+) -> list[Path]:
+    """Raw-target vs neuron z-scored-target correspondence for the ablation conditions."""
+    plt = _plt()
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ablation = payload.get("ablation_table") or []
+    if not ablation:
+        raise KeyError("no ablation rows stored in the payload")
+
+    fig, ax = plt.subplots(figsize=(6.4, 5.2))
+    plotted: set[str] = set()
+    shape_groups = {key: values for key, _label, values in _ablation_groups(payload, "zscored_r")}
+    for row in ablation:
+        raw = _finite(row.get("raw_r"))
+        shape = _finite(row.get("zscored_r"))
+        if not (np.isfinite(raw) and np.isfinite(shape)):
+            continue
+        source = str(row.get("source_key"))
+        mask = str(row.get("mask_mode"))
+        key = source if mask != "block" else f"{source}|block"
+        ax.scatter([raw], [shape], s=34, color=_ABLATION_COLORS.get(key, "#333333"), alpha=0.85,
+                   label=_ABLATION_LABELS.get(key, key) if key not in plotted else None)
+        plotted.add(key)
+    for (key, label, values) in _ablation_groups(payload, "raw_r"):
+        shape_values = shape_groups.get(key)
+        if shape_values is None or not np.isfinite(np.mean(values)):
+            continue
+        ax.scatter([float(np.mean(values))], [float(np.mean(shape_values))],
+                   marker="D", s=42, edgecolor="#111111", facecolor="none", lw=1.0, zorder=5)
+    ax.axhline(0.0, color="#999999", lw=1.0)
+    ax.axvline(0.0, color="#999999", lw=1.0)
+    ax.set_xlabel("raw-target Mantel r (level + amplitude retained)")
+    ax.set_ylabel("neuron z-scored target Mantel r (shape only)")
+    ax.set_title("Raw vs stimulus-specific shape correspondence", fontsize=10)
+    handles, labels = ax.get_legend_handles_labels()
+    unique: dict[str, Any] = {}
+    for handle, label in zip(handles, labels):
+        unique.setdefault(label, handle)
+    ax.legend(unique.values(), unique.keys(), fontsize=8, frameon=False, loc="best")
+    _clean(ax)
+    _conclusion_note(fig, "points = individual (checkpoint, residual seed) replicates; diamonds = group means")
+    return _finish(fig, out_dir / "source_extension_figure3_raw_vs_shape", formats=formats, dpi=dpi)
+
+
+def write_source_extension_figures(
+    payload: Mapping[str, Any],
+    out_dir: str | Path,
+    *,
+    representation: str = "structured_48",
+    previous_decomposition: Mapping[str, Any] | None = None,
+    formats: Sequence[str] = DEFAULT_FORMATS,
+    dpi: int = DEFAULT_DPI,
+) -> dict[str, list[str]]:
+    """Render the three source-extension figures and return their paths by name."""
+    written: dict[str, list[str]] = {}
+    written["source_extension_figure1_target_decomposition"] = [
+        str(p) for p in source_extension_figure1_target_decomposition(
+            payload, out_dir, representation=representation,
+            previous_decomposition=previous_decomposition, formats=formats, dpi=dpi,
+        )
+    ]
+    written["source_extension_figure2_source_ablation"] = [
+        str(p) for p in source_extension_figure2_source_ablation(
+            payload, out_dir, formats=formats, dpi=dpi
+        )
+    ]
+    written["source_extension_figure3_raw_vs_shape"] = [
+        str(p) for p in source_extension_figure3_raw_vs_shape(
+            payload, out_dir, formats=formats, dpi=dpi
+        )
+    ]
+    return written
+
+
 __all__ = [
     "DEFAULT_FORMATS",
     "DEFAULT_DPI",
@@ -507,4 +757,8 @@ __all__ = [
     "rate_figure2_representation_comparison",
     "rate_figure3_activity_diagnostic",
     "write_rate_robustness_figures",
+    "source_extension_figure1_target_decomposition",
+    "source_extension_figure2_source_ablation",
+    "source_extension_figure3_raw_vs_shape",
+    "write_source_extension_figures",
 ]

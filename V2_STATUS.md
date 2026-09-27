@@ -77,6 +77,7 @@ Layer contracts that must not be mixed up:
 | functional fingerprint / scientific evaluation | PROBE + class labels | evaluation metrics | — | yes (the only component allowed to) |
 | capacity evaluation (`src/vector_capacity.py`) | a frozen `(n, d)` matrix + PROBE targets | Mantel/kNN/prediction/control metrics | — | yes (targets only, never the representation) |
 | rate-confound / robustness (`src/rate_robustness.py`) | a frozen `(n, d)` matrix + PROBE **response-target variants** | the same Mantel/kNN/prediction/control metrics | — | yes (targets only) |
+| source-extension evaluation (`src/source_extension.py`) | a frozen `(n, d)` matrix per **source-ablation arm** + PROBE targets | the same metrics, per arm | — | yes (targets only) |
 
 ---
 
@@ -822,14 +823,133 @@ measured here, not causally attributed.
 
 ---
 
-## 12. Next planned stage
+## 12. Source-extension evaluation (functional-response + temporal)
 
-1. **Evaluate** the new label-free sources on PROBE with the existing evaluation layer
-   (`scripts/evaluate_vector_capacity.py` / `evaluate_vector_rate_robustness.py`, unchanged):
-   `structured_48 + temporal`, `full + residual(functional_response)`, and the rate-decomposition
-   targets, so the temporal/functional additions are measured the same way as everything else.
-2. Only after that: the `network_context` block, and then multi-layer support.
+**Why.** The robustness stage showed that the connectivity/intrinsic representation has a modest
+correspondence with individual-stimulus PROBE responses which disappears once each neuron's mean
+level and amplitude are removed (the neuron z-scored target), while activity-derived
+representations carry substantially more (partly rate-aligned) information. This stage asks
+whether the two new label-free sources added in the previous stage change that picture — in
+particular whether they move the **neuron z-scored** target rather than merely the raw one.
 
-The functional-response source and the coarse temporal block are implemented and tested but
-**not yet evaluated**; no scientific claim is made about them here, and the SNN, the split and
-the official TEST set are untouched.
+### Conditions (focused; not a combinatorial sweep)
+
+Deterministic conditions (no residual):
+
+| condition | decomposition | notes |
+|---|---|---|
+| `structured_48` | 48 | the previous stages' baseline (default block selection) |
+| `structured_48_plus_temporal` | 48 + 10 = 58 | the dimension is read from the encoder plan, never assumed |
+| `activity_only` | 12 | the existing label-free activity summary block |
+| `structural_48_plus_activity` | 60 | the previous robustness study's activity comparison |
+
+Residual source ablation (residual architecture, training protocol and masking fixed; `structured_d = 48`):
+
+| arm | residual source view | source features | isolates |
+|---|---|---|---|
+| A | level-0 + level-1 + raw-connectivity views | 237 | the previous stage's source |
+| B | A + functional-response projection (64) | 301 | the functional-response contribution |
+| C | A + coarse temporal block (10) | 247 | the temporal contribution |
+| D | A + both new sources | 311 | the combined contribution |
+
+* `residual_d = 16` (total 64) for all four arms (the ablation), `residual_d = 52` (total 100) for
+  A/B/D, residual seeds 0/1/2, on three comparable checkpoints.
+* Mask diagnostic: arm D at `residual_d = 16` trained with `mask_mode = "block"` instead of the
+  default `"coordinate"` (same source view, different reconstruction protocol).
+
+### Targets (unchanged from the robustness study)
+
+`raw`, `neuron_centered`, `neuron_zscored` and `mean_rate` with the *identical* pipelines,
+operation order and standardisation, plus the existing `class_rate_20d` and `temporal`
+fingerprints as secondary context. Metric: Mantel Spearman r with 2000 neuron-relabelling
+permutations, a 500-resample neuron-bootstrap 95% CI, the one-sided `greater` null and seed 0 —
+i.e. exactly the previous conventions. kNN is switched off (it was characterised in the earlier
+stages) and ridge cross-validated prediction is retained for the raw and the z-scored target only.
+
+### Source verification (recorded before the scientific run)
+
+The per-checkpoint verification block in `source_extension_metadata.json → source_verification`
+records: the temporal block's mode (`fit_population_psth_coarse_bins`), resolution (10 bins of
+140 ms over 0–1400 ms for the canonical model), units (mean label-free FIT firing rate per neuron
+per interval), sample count, split and `class_conditioned=false`; and the functional-response
+source's definition (`activity.samples`, `(5922, 256)` FIT counts), output dimension (64), fixed
+projection (seed 0, `1/sqrt(n_samples)` Gaussian, prefix-stable, not fitted), normalisation
+(`raw`), zero-variance count, and the `sample_order_hash` of the FIT utterance order. Both are
+`uses_labels=false` and FIT-only.
+
+### Measured results
+
+<!--RESULTS-->
+
+### Source ablations
+
+<!--ABLATIONS-->
+
+### Mask-mode diagnostic
+
+<!--MASK-->
+
+### Checkpoint and seed variability
+
+<!--VARIABILITY-->
+
+### Joining with the previous studies
+
+<!--JOIN-->
+
+### Discipline and compatibility
+
+* New files only: `results/neuron_vector_capacity/source_extension_results.csv` (long table, one
+  row per condition × target × checkpoint × seed), `source_extension_results.json` (the same rows
+  plus the compact `condition_table`, the `ablation_table` and the seed/checkpoint summaries) and
+  `source_extension_metadata.json`. The previous stages' `results.csv`/`results.json`/
+  `metadata.json` and `rate_robustness_*` files are **not** written; their SHA-256 fingerprints
+  are recomputed at run time and recorded in `source_extension_metadata.json →
+  preserved_previous_artifacts`.
+* FIT builds every representation and trains every residual (the FIT-only guard rejects a
+  probe/test bank); PROBE builds the targets and the metrics; the official TEST split is never
+  opened (`data.official_test_loaded = false`).
+* The residual configuration (architecture, epochs, mask fraction, split, seeds) is identical
+  across conditions and was not tuned on the PROBE metric; only the residual's input *view*
+  differs between the ablation arms. The structural-only arm reuses the artifacts cached by the
+  previous stages (identical source schema), which makes the cross-study join exact.
+
+### Figures
+
+`figures/neuron_vector_capacity/source_extension_figure{1,2,3}_*.{png,pdf}`: (1) the target
+decomposition for `structured_48` with the previous robustness study's values overlaid as
+context; (2) the source ablation against the neuron z-scored target (the key figure); (3) raw vs
+z-scored correspondence for the ablation conditions (the Pattern A/B/C reading).
+
+### Limitations
+
+* Single hidden layer, one dataset, one split seed; three checkpoints and three residual seeds, so
+  small differences must be read against the reported variability (checkpoint spread exceeds
+  residual-seed spread in the earlier stages).
+* The functional-response source is a *fixed 64-dimensional projection* of the per-utterance
+  response profile: it preserves overall response structure, not individual stimuli, and its
+  coordinates are not interpretable. Alternative projection dimensions/normalisations were not
+  swept in this stage (they are configuration fields for the future control panel).
+* The temporal block is a **pooled** (population-averaged over FIT utterances) coarse PSTH, so
+  stimulus-specific temporal structure is not represented by it.
+* All statements are descriptive associations at the representation level; no causal language is
+  used, and no representation, source or target is ranked.
+
+---
+
+## 13. Next planned stage
+
+1. **Freeze the feature architecture for the control-panel stage.** The three scientific stages
+   (capacity sweep, rate-confound robustness, source-extension ablation) are complete; the
+   representation architecture of §1–§6 is the candidate stable version. §23 of the
+   source-extension brief lists the configuration surface a future control panel must expose
+   (checkpoint, `n_hidden`, `structured_d`/`residual_d`/`d`, `enabled_blocks`, the functional and
+   temporal source switches, `functional_source_dim`, normalisation, the seeds, `mask_mode`, the
+   memory/chunk sizes, precision and the evaluation target) — all of it already lives in
+   `src/v2_config.V2Config`, which stays the single configuration backend.
+2. Only after that: the `network_context` block, and then multi-layer support (both still
+   unimplemented; no placeholder features exist for them).
+
+The source-extension evaluation is complete (results in
+`results/neuron_vector_capacity/source_extension_*`); no architecture was added in that stage, the
+SNN and the split are untouched, and the official TEST set remains unopened.
