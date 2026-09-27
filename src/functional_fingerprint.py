@@ -399,15 +399,25 @@ def stimulus_response_fingerprint(
     or recordings, so utterances are treated as distinct stimuli by definition; the
     limitation is documented in ``V2_STATUS.md``.
     """
+    response = stimulus_response_matrix(counts, bin_ms=bin_ms, n_bins=n_bins)
+    names = [f"fp_stimulus.s{s:04d}" for s in range(response.shape[1])]
+    return sanitize_features(response), names
+
+
+def stimulus_response_matrix(counts: np.ndarray, *, bin_ms: float, n_bins: int) -> np.ndarray:
+    """The raw individual-stimulus response ``R[h, s]`` in Hz (no standardisation).
+
+    This is the single definition of the primary response quantity; every response
+    target variant (raw / neuron-centered / neuron z-scored / mean rate) is derived from
+    exactly this matrix, so the variants can never drift apart.
+    """
     counts = np.asarray(counts, dtype=np.float64)
     if counts.ndim != 2:
         raise ValueError(f"counts must be (n_samples, n_hidden), got {counts.shape}")
     duration_s = float(n_bins) * float(bin_ms) / 1000.0
     if duration_s <= 0:
         raise ValueError(f"invalid stimulus duration: n_bins={n_bins}, bin_ms={bin_ms}")
-    response = counts.T / duration_s  # (n_hidden, n_samples) in Hz
-    names = [f"fp_stimulus.s{s:04d}" for s in range(response.shape[1])]
-    return sanitize_features(response), names
+    return counts.T / duration_s  # (n_hidden, n_samples) in Hz
 
 
 def stimulus_response_config(**overrides: Any) -> "FingerprintConfig":
@@ -420,6 +430,160 @@ def stimulus_response_config(**overrides: Any) -> "FingerprintConfig":
     settings = dict(PRIMARY_FINGERPRINT_SETTINGS)
     settings.update(overrides)
     return FingerprintConfig(feature_sets=[STIMULUS_RESPONSE_FEATURE_SET], **settings)
+
+
+# --------------------------------------------------------------------------
+# Response-target transformation primitives (evaluation-only: PROBE responses)
+# --------------------------------------------------------------------------
+# These operate on the 2-D ``(n_neurons, n_stimuli)`` response matrix ``R`` ONLY (they
+# are the only shapes involved; no time axis exists anywhere here). They are pure,
+# deterministic and label-free, and are never applied to a representation matrix.
+#
+# Ordering matters and is explicit: a target variant is an *ordered pipeline* of these
+# steps (see :func:`apply_response_pipeline`). ``neuron_center`` and
+# ``column_standardise`` do not commute, so the operation order is part of every target's
+# name and provenance rather than an implicit convention.
+
+#: Per-neuron response std below which a profile is treated as zero-variance.
+ZERO_VARIANCE_STD_EPS = 1e-8
+
+#: Reduce the response matrix to one column (the per-neuron mean over stimuli).
+MEAN_OVER_STIMULI_STEP = "mean_over_stimuli"
+#: Subtract each neuron's mean over stimuli (removes the baseline-rate offset).
+NEURON_CENTER_STEP = "neuron_center"
+#: Subtract each neuron's mean and divide by its std over stimuli.
+NEURON_ZSCORE_STEP = "neuron_zscore"
+#: Column z-scoring across neurons (the canonical fingerprint standardisation).
+COLUMN_STANDARDISE_STEP = "column_standardise"
+#: Row L2 normalisation (removes per-neuron response magnitude; existing rate control).
+ROW_L2_NORMALISE_STEP = "row_l2_normalise"
+
+#: Every step this module understands.
+RESPONSE_PIPELINE_STEPS: tuple[str, ...] = (
+    MEAN_OVER_STIMULI_STEP,
+    NEURON_CENTER_STEP,
+    NEURON_ZSCORE_STEP,
+    COLUMN_STANDARDISE_STEP,
+    ROW_L2_NORMALISE_STEP,
+)
+
+
+def neuron_center(R: np.ndarray) -> np.ndarray:
+    """``R_centered[h, s] = R[h, s] - mean_s R[h, s]`` (per-neuron baseline removed)."""
+    R = np.asarray(R, dtype=np.float64)
+    if R.ndim != 2:
+        raise ValueError(f"neuron_center expects a 2-D (neurons, stimuli) matrix, got {R.shape}")
+    return R - R.mean(axis=1, keepdims=True)
+
+
+def neuron_zscore(
+    R: np.ndarray, *, eps: float = ZERO_VARIANCE_STD_EPS
+) -> tuple[np.ndarray, np.ndarray]:
+    """``(R - mean_s R) / std_s R`` per neuron, with a deterministic zero-variance rule.
+
+    A neuron whose response is constant across the evaluated stimuli has ``std = 0`` and
+    an undefined z-score. The documented rule is: **such a neuron is kept** (never
+    dropped, so the neuron set and ordering never change) and its entire z-scored row is
+    set to ``0.0`` (its stimulus-specific deviation is exactly zero by construction).
+
+    Returns ``(Z, zero_variance_mask)`` where the mask is a boolean ``(n_neurons,)`` array
+    recording which neurons the rule applied to (reported in provenance).
+    """
+    R = np.asarray(R, dtype=np.float64)
+    if R.ndim != 2:
+        raise ValueError(f"neuron_zscore expects a 2-D (neurons, stimuli) matrix, got {R.shape}")
+    mean = R.mean(axis=1, keepdims=True)
+    std = R.std(axis=1, keepdims=True, ddof=0)
+    zero_variance = (std < float(eps)).reshape(-1)
+    safe_std = np.where(std < float(eps), 1.0, std)
+    Z = (R - mean) / safe_std
+    Z[zero_variance] = 0.0
+    return Z, zero_variance
+
+
+def mean_over_stimuli(R: np.ndarray) -> np.ndarray:
+    """``mean_s R[h, s]`` as an ``(n_neurons, 1)`` matrix (the global-rate component)."""
+    R = np.asarray(R, dtype=np.float64)
+    if R.ndim != 2:
+        raise ValueError(f"mean_over_stimuli expects a 2-D (neurons, stimuli) matrix, got {R.shape}")
+    return R.mean(axis=1, keepdims=True)
+
+
+def column_standardise(X: np.ndarray) -> tuple[np.ndarray, dict[str, int]]:
+    """Column z-scoring across neurons (the canonical fingerprint standardisation).
+
+    Uses :class:`src.utils.Standardizer`, i.e. exactly the transform
+    :class:`FingerprintSpace` applies for ``standardize="column"``: zero-variance columns
+    are centred to a constant zero and flagged instead of producing NaNs.
+    """
+    X = np.asarray(X, dtype=np.float64)
+    if X.ndim != 2:
+        raise ValueError(f"column_standardise expects a 2-D matrix, got {X.shape}")
+    standardizer = Standardizer().fit(X)
+    info = {
+        "constant_columns": int(np.asarray(standardizer.constant_mask).sum()),
+        "informative_columns": int(standardizer.n_informative),
+    }
+    return standardizer.transform(X), info
+
+
+def row_l2_normalise(X: np.ndarray) -> np.ndarray:
+    """Row L2 normalisation (removes per-neuron magnitude; the existing rate control)."""
+    X = np.asarray(X, dtype=np.float64)
+    if X.ndim != 2:
+        raise ValueError(f"row_l2_normalise expects a 2-D matrix, got {X.shape}")
+    norms = np.linalg.norm(X, axis=1, keepdims=True)
+    return np.divide(X, np.where(norms > 1e-12, norms, 1.0))
+
+
+def apply_response_pipeline(
+    R: np.ndarray,
+    steps: Sequence[str],
+    *,
+    eps: float = ZERO_VARIANCE_STD_EPS,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Apply an ordered list of :data:`RESPONSE_PIPELINE_STEPS` to the response matrix.
+
+    Returns ``(X, info)``; ``info`` records the step order, the dimensions and the
+    zero-variance / constant-column counts so every target variant is auditable. The
+    result is sanitised exactly like :class:`FingerprintSpace` does (non-finite entries
+    become 0), and the working matrix is copied to C order first - the same thing
+    ``FingerprintSpace`` does with its ``X_raw`` - so the ``raw`` pipeline
+    (``[column_standardise]``) reproduces the existing headline target **bit-for-bit**
+    rather than up to a memory-layout reduction difference.
+    """
+    X = sanitize_features(np.asarray(R, dtype=np.float64))
+    if X.ndim != 2:
+        raise ValueError(f"the response matrix must be 2-D, got {X.shape}")
+    info: dict[str, Any] = {
+        "steps": [str(s) for s in steps],
+        "input_dimension": int(X.shape[1]),
+        "zero_variance_neurons": 0,
+        "constant_columns": 0,
+    }
+    for step in steps:
+        if step == MEAN_OVER_STIMULI_STEP:
+            X = mean_over_stimuli(X)
+        elif step == NEURON_CENTER_STEP:
+            X = neuron_center(X)
+        elif step == NEURON_ZSCORE_STEP:
+            X, zero_variance = neuron_zscore(X, eps=eps)
+            info["zero_variance_neurons"] = int(np.asarray(zero_variance).sum())
+        elif step == COLUMN_STANDARDISE_STEP:
+            X, standardised = column_standardise(X)
+            info["constant_columns"] = int(standardised["constant_columns"])
+        elif step == ROW_L2_NORMALISE_STEP:
+            X = row_l2_normalise(X)
+        else:
+            raise ValueError(
+                f"unknown response-pipeline step {step!r}; valid steps are "
+                f"{list(RESPONSE_PIPELINE_STEPS)}"
+            )
+    X = sanitize_features(X)
+    info["output_dimension"] = int(X.shape[1])
+    info["pipeline"] = " -> ".join(str(s) for s in steps)
+    return X, info
+
 
 
 # --------------------------------------------------------------------------

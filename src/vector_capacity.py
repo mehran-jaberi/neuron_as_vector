@@ -246,6 +246,20 @@ class EvaluationTargets:
         }
 
 
+def assert_held_out_split(split_label: str) -> str:
+    """Reject a FIT/TRAIN label for anything that must come from held-out PROBE data.
+
+    Shared by every target builder so no evaluation-side object can be constructed from
+    the split that the representation is trained on.
+    """
+    split = str(split_label).lower()
+    if "train" in split or "fit" in split:
+        raise VectorCapacityError(
+            f"evaluation targets must come from a held-out PROBE split, got {split_label!r}"
+        )
+    return split
+
+
 def build_evaluation_targets(
     probe_result: ActivityAccumulatorResult,
     *,
@@ -264,11 +278,7 @@ def build_evaluation_targets(
         raise VectorCapacityError(
             f"PROBE targets need an ActivityAccumulatorResult, got {type(probe_result).__name__}"
         )
-    split = str(probe_split_label).lower()
-    if "train" in split or "fit" in split:
-        raise VectorCapacityError(
-            f"evaluation targets must come from a held-out PROBE split, got {probe_split_label!r}"
-        )
+    split = assert_held_out_split(probe_split_label)
 
     X_primary, names_primary = stimulus_response_fingerprint(
         probe_result.counts, bin_ms=probe_result.bin_ms, n_bins=probe_result.n_bins
@@ -430,7 +440,7 @@ def representation_space(
     )
 
 
-def _geometry(
+def geometry_for_target(
     space_matrix: np.ndarray,
     target: FingerprintSpace,
     *,
@@ -439,6 +449,14 @@ def _geometry(
     k_values: Sequence[int],
     include_curves: bool,
 ) -> dict[str, Any]:
+    """The canonical geometry analysis for one frozen representation and one target.
+
+    Thin, public wrapper over :func:`src.geometry_analysis.geometry_function_analysis`
+    with the study's fixed conventions (Mantel Spearman null, rate-matched stratified
+    Mantel and the exploratory partial Mantel both fed by the same FIT rate differences,
+    identical seed/permutations). Every condition and every target variant is evaluated
+    through this single function so their numbers stay comparable.
+    """
     return geometry_function_analysis(
         space_matrix,
         target.X,
@@ -451,6 +469,10 @@ def _geometry(
         primary_bootstrap=settings.bootstrap,
         include_curves=include_curves,
     )
+
+
+#: Backwards-compatible private alias (the first study imported it under this name).
+_geometry = geometry_for_target
 
 
 def evaluate_condition(
@@ -926,10 +948,12 @@ __all__ = [
     "EvaluationSettings",
     "default_conditions",
     "build_evaluation_targets",
+    "assert_held_out_split",
     "fit_rate_reference",
     "rate_absdiff_condensed",
     "representation_space",
     "evaluate_condition",
+    "geometry_for_target",
     "select_residual",
     "condition_matrix",
     "condition_description",

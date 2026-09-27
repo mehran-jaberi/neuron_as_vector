@@ -160,6 +160,8 @@ def cross_validated_ridge(
     Y = np.asarray(Y, dtype=np.float64)
     if X.shape[0] != Y.shape[0]:
         raise ValueError("X and Y must have the same number of neurons")
+    if Y.ndim != 2:
+        raise ValueError(f"Y must be a 2-D (neurons, targets) matrix, got shape {Y.shape}")
     cv, n_splits = _kfold(X.shape[0], n_splits, seed, cv)
     estimator = Pipeline(
         [
@@ -167,7 +169,9 @@ def cross_validated_ridge(
             ("ridge", RidgeCV(alphas=np.asarray(alphas, dtype=np.float64))),
         ]
     )
-    pred = cross_val_predict(estimator, X, Y, cv=cv)
+    # ``cross_val_predict`` squeezes a single-column target to (n,), so restore the
+    # declared (neurons, targets) shape before scoring (no change for m >= 2).
+    pred = np.asarray(cross_val_predict(estimator, X, Y, cv=cv), dtype=np.float64).reshape(Y.shape)
     metrics = regression_metrics(Y, pred)
     metrics.update({"model": "ridge", "n_splits": int(n_splits), "alphas": list(map(float, alphas))})
     return {"predictions": pred, "metrics": metrics}
@@ -192,12 +196,14 @@ def cross_validated_knn(
     Y = np.asarray(Y, dtype=np.float64)
     if X.shape[0] != Y.shape[0]:
         raise ValueError("X and Y must have the same number of neurons")
+    if Y.ndim != 2:
+        raise ValueError(f"Y must be a 2-D (neurons, targets) matrix, got shape {Y.shape}")
     cv, n_splits = _kfold(X.shape[0], n_splits, seed, cv)
     k_eff = int(max(1, min(k, X.shape[0] - 1)))
     estimator = Pipeline(
         [("scale", StandardScaler()), ("knn", KNeighborsRegressor(n_neighbors=k_eff))]
     )
-    pred = cross_val_predict(estimator, X, Y, cv=cv)
+    pred = np.asarray(cross_val_predict(estimator, X, Y, cv=cv), dtype=np.float64).reshape(Y.shape)
     metrics = regression_metrics(Y, pred)
     metrics.update({"model": "knn", "n_splits": int(n_splits), "k": k_eff})
     return {"predictions": pred, "metrics": metrics}

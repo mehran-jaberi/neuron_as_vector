@@ -59,6 +59,7 @@ Layer contracts that must not be mixed up:
 | `NeuronVector` composition | structured vectors + residual vectors | `(n, d)` | — | **no** |
 | functional fingerprint / scientific evaluation | PROBE + class labels | evaluation metrics | — | yes (the only component allowed to) |
 | capacity evaluation (`src/vector_capacity.py`) | a frozen `(n, d)` matrix + PROBE targets | Mantel/kNN/prediction/control metrics | — | yes (targets only, never the representation) |
+| rate-confound / robustness (`src/rate_robustness.py`) | a frozen `(n, d)` matrix + PROBE **response-target variants** | the same Mantel/kNN/prediction/control metrics | — | yes (targets only) |
 
 ---
 
@@ -325,7 +326,7 @@ Allowed: `(n_neurons, k)` feature/weight matrices, `(n_neurons, d)` vectors, the
 ## 9. Tests
 
 ```
-uv run pytest -q    ->  368 passed
+uv run pytest -q    ->  400 passed
 ```
 
 | file | tests | covers |
@@ -336,6 +337,7 @@ uv run pytest -q    ->  368 passed
 | `tests/test_residual.py` | 37 | source view and variants, no-labels API, probe-split rejection, relabelled-FIT invariance, masking determinism/targets, architecture and config validation, training diagnostics, SNN-frozen check, reproducibility, persistence with mismatch rejection, CPU precision fallback, memory guards |
 | `tests/test_neuron_vector.py` | 16 | 48/64/100 composition, coordinate order, provenance, `residual_d=0` exactness, config integration, schema/dimension mismatch rejection, determinism, chunking |
 | `tests/test_vector_capacity.py` | 33 | PROBE-only targets and split discipline, individual-stimulus target shape/definition/label-independence, frozen representations, the dimension invariant and matched-total decompositions, residual artifact selection, SNN isolation, reproducibility, memory shapes, result table + figures |
+| `tests/test_rate_robustness.py` | 32 | raw-target equivalence with the first study, exact neuron centering/z-scoring, deterministic zero-variance rule, explicit (non-commuting) pipeline order, mean-rate and row-L2 targets, activity dimensions, checkpoint comparability, PROBE-only/label discipline, representation invariance, 1-D prediction, reproducibility, memory |
 | pre-existing suite | 127 | model, data, training, evaluation, geometry, prediction, fingerprint, controls, rewiring, permutation, reliability, NSB |
 
 ---
@@ -504,7 +506,147 @@ statement about a "best" dimension, and no post-hoc trend is fitted.
   documented limitation of that implementation).
 * Residuals were trained on CPU in float32 (recorded); residual training reproducibility on
   CUDA is only as documented for the other models.
-* One checkpoint (`sweep_l2_0.pt`) and one split seed (0); no cross-checkpoint replication.
+* One checkpoint (`sweep_l2_0.pt`) and one split seed (0) for the *capacity sweep* itself; the
+  rate-robustness stage below repeats its focused set on three comparable checkpoints.
+
+---
+
+### Rate-confound / robustness analysis (second stage of the same programme)
+
+**Why it was added.** The first study measured a positive primary correspondence
+(r ≈ +0.11 … +0.13) *and* a 1-D FIT **rate-only** control at r = +0.663 against the same
+target. Before any new biological block (temporal / network context) is justified, the
+evaluation has to separate *global firing-rate tendency* from *stimulus-specific response
+structure*. This stage is that methodological checkpoint; it adds **no** representation
+architecture and no new biological features.
+
+**Verified semantics of the pre-existing controls** (read from the code, not inferred from the names):
+
+| name | side | actual definition |
+|---|---|---|
+| `control_rate_only` | representation | the label-free **FIT** mean rate per neuron as a 1-D representation; `RepresentationSpace` column-z-scores it, so its condensed distance is `|rate_i − rate_j| / std_FIT`. The statistic is the Spearman correlation of *that* distance vector with the target's distance vector — not "rates vs responses" |
+| `primary_rate_normalized` (target side) | target | the raw response with each neuron's profile L2-normalised (`FingerprintSpace(standardize="none", normalize_rows=True)`); removes the L2 magnitude, not the mean. Reproduced bit-identically here as the `row_l2_normalised` variant |
+| `rate_matched` | pair-stratified | 5 quantile strata of `|rate_i − rate_j|` (FIT rates); within-stratum Mantel Spearman combined by sample-size-weighted Fisher z, strata held fixed under the relabelling null |
+| `partial_mantel` | exploratory | rank-residualises both distance vectors on rank(`|rate_i − rate_j|`); **secondary only**, not a proof of rate-independence |
+| `mean_rate` (new, target side) | target | the PROBE per-neuron mean response `mean_s R[h,s]` as a 1-D target. A different object from `control_rate_only`: there the rate is the *representation*, here the rate *is* the target |
+
+**The headline target's own standardisation was verified:** `FingerprintSpace(standardize="column")`
+z-scores **across neurons within each stimulus column** (zero-variance columns → constant 0,
+flagged). That removes the *column* mean, not each neuron's mean over stimuli — on `sweep_l2_0`
+the per-neuron mean of the column-standardised target correlates **0.999** with the raw
+per-neuron rate. This is precisely the confound quantified below.
+
+**Target decomposition** (PROBE-only, evaluation-only). `R[h,s] = counts[s,h] / (n_bins·bin_ms/1000)`
+Hz, one column per PROBE utterance (the shared `stimulus_response_matrix`). Each variant is an
+**ordered pipeline** applied to `R`, then wrapped in `FingerprintSpace(standardize="none")`, so
+the transform order is exactly the one named and never re-applied implicitly:
+
+| variant | pipeline (left → right) | nuisance removed |
+|---|---|---|
+| `raw` | `column_standardise` | none at the neuron level — **bit-identical to the first study's primary target** |
+| `neuron_centered` | `neuron_center → column_standardise` | per-neuron baseline `mean_s R` |
+| `neuron_zscored` | `neuron_zscore → column_standardise` | per-neuron baseline **and** amplitude `std_s R` |
+| `mean_rate` | `mean_over_stimuli → column_standardise` | everything except the per-neuron mean |
+| `column_standardised_then_neuron_centered` | `column_standardise → neuron_center` | ordering sensitivity (the two orders do not commute) |
+| `row_l2_normalised` | `row_l2_normalise` | per-neuron L2 magnitude (the first study's existing control) |
+
+Zero-variance rule: `std_s R < 1e-8` ⇒ the neuron is **kept** and its whole z-scored row is set
+to `0.0` (deterministic; 0 such neurons on this data). Ordering is explicit, not assumed: after
+`…→ neuron_center` row means are exactly 0, after `column_standardise → neuron_center` they are
+0 too but the two orders still differ in general (here they agree closely, e.g. structured_48
++0.165 vs +0.167).
+
+**Representations, checkpoints, discipline.** 12 focused conditions: `structured_48/64/100`,
+`full_48+16_seed0/1/2`, `full_48+52_seed0/1/2`, plus the activity diagnostics
+`activity_only` (12-d = the block's own summary features), `activity_source_20` (20-d = the
+block's full deterministic source) and `structural_48_plus_activity` (60-d = the 48 structural
+prefix + the 12 activity features; dimensions derived from the encoder plan, not hard-coded).
+Residuals are the first study's cached artifacts for `sweep_l2_0` and the same protocol
+(FIT-only, 200 epochs, seeds 0/1/2) for the other checkpoints; no new residual families were
+trained. Three checkpoints — `sweep_l2_0.pt`, `nsb_seed1.pt`, `nsb_seed2.pt` — were verified
+**comparable** before aggregation (identical architecture fields and identical representation
+schema: same blocks, feature names and level-0/source dimensions). FIT/PROBE/TEST discipline is
+unchanged (TEST never opened); every target transform is a PROBE-only, evaluation-only transform
+of the 2-D `(neurons, stimuli)` matrix.
+
+```bash
+uv run python scripts/evaluate_vector_rate_robustness.py          # full, ~26 min
+uv run python scripts/evaluate_vector_rate_robustness.py --quick  # smoke settings
+```
+
+| artifact | location |
+|---|---|
+| results (new files; the first study's are untouched) | `results/neuron_vector_capacity/rate_robustness_results.csv` (252 rows) / `rate_robustness_results.json` |
+| provenance | `results/neuron_vector_capacity/rate_robustness_metadata.json` (includes the first study's file hashes, recorded to document that they were not modified) |
+| figures | `figures/neuron_vector_capacity/rate_figure{1,2,3}_*.{png,pdf}` |
+
+**Measured results** (Mantel Spearman r; mean over the 3 checkpoints; residual families also
+averaged over seeds; permutation p ≤ 0.0005 unless noted; 95% neuron-bootstrap CI)
+
+| representation | blocks | d | raw | neuron-centered | neuron z-scored | mean-rate | row-L2 |
+|---|---|---|---|---|---|---|---|
+| `structured_48` | structural | 48 | **+0.146** | +0.167 | +0.030 | +0.095 | +0.081 |
+| `structured_64` | structural | 64 | +0.163 | +0.190 | +0.044 | +0.100 | +0.094 |
+| `structured_100` | structural | 100 | +0.151 | +0.180 | +0.037 | +0.087 | +0.091 |
+| `full_48+16` (3 seeds) | +residual | 64 | +0.149 … +0.154 | +0.171 … +0.175 | +0.031 … +0.036 | +0.095 … +0.099 | +0.084 … +0.085 |
+| `full_48+52` (3 seeds) | +residual | 100 | +0.149 … +0.156 | +0.170 … +0.181 | +0.034 … +0.035 | +0.088 … +0.099 | +0.084 … +0.089 |
+| `activity_only` | activity | 12 | +0.405 | +0.276 | +0.111 | +0.489 | +0.316 |
+| `activity_source_20` | activity | 20 | +0.522 | +0.359 | +0.079 | +0.619 | +0.211 |
+| `structural_48_plus_activity` | structural+activity | 60 | +0.266 | +0.227 | +0.053 | +0.263 | +0.189 |
+| `control_rate_only` | FIT rate | 1 | +0.680 | +0.493 | +0.024 | +0.773 | — |
+| `control_random_100` | random | 100 | +0.006 | +0.007 | +0.009 | +0.006 | — |
+| `control_neuron_shuffle_100` | shuffle | 100 | +0.030 | +0.025 | +0.005 | +0.030 | — |
+
+Uncertainty for the structural baseline (`structured_48`, n = 3 checkpoints): raw +0.1465
+(sd 0.039) CI [0.030, 0.302]; centered +0.1672 (sd 0.044) CI [0.035, 0.336] (p ≤ 0.0010);
+z-scored +0.0295 (sd 0.021) CI [−0.011, 0.115] (**p ≤ 0.384 — not distinguishable from 0**);
+mean-rate target +0.0946 (sd 0.031) CI [+0.003, 0.218]. `activity_source_20`: raw +0.522
+(sd 0.007) CI [0.419, 0.628]; centered +0.359 CI [0.234, 0.495]; z-scored +0.079 CI
+[−0.020, 0.208] (p ≤ 0.037); mean-rate +0.619 CI [0.538, 0.705]. Descriptive differences:
+Δ_centering = +0.021 (structural_48) and Δ_scaling = −0.138; for activity_only Δ_scaling =
+−0.165 and for activity_source_20 −0.280.
+
+**Direct observations** (values only):
+
+* neuron-centering does **not** reduce the structural/residual correspondence
+  (Δ_centering = +0.021 … +0.029); it *reduces* the activity-block correspondence
+  (−0.129 at 12-d, −0.163 at 20-d);
+* neuron-z-scoring collapses the structural/residual correspondence
+  (Δ_scaling = −0.136 … −0.147, leaving +0.030 … +0.044, with CIs spanning 0 for
+  structured_48/100 and p up to 0.38), and lowers the activity ones to +0.111 / +0.079 / +0.053;
+* the mean-rate target alone reaches only +0.087 … +0.100 for the structural/residual
+  conditions but +0.489 / +0.619 for the activity conditions;
+* adding the activity block to the structural prefix raises the raw correspondence from
+  +0.146 (48-d) to +0.266 (60-d) and the CV R² from +0.117 to +0.544;
+* the residual families are within seed spread of their structured partners on every target
+  variant (seed SD within a checkpoint 0.001–0.007);
+* checkpoint variability is larger than seed variability: `structured_48` raw is +0.113
+  (sweep_l2_0, exactly reproducing the first study), +0.200 (nsb_seed1), +0.126 (nsb_seed2),
+  sd ≈ 0.039; z-scored is +0.004 / +0.029 / +0.055;
+* the largest numbers in the study belong to the 1-D FIT rate representation (+0.680 raw,
+  +0.773 against the mean-rate target); random and neuron-shuffle controls stay at ≈ 0.005–0.030.
+
+**Interpretation** (clearly separated from the observations):
+
+* For the connectivity/intrinsic representation, the correspondence with individual-stimulus
+  responses is consistent with per-neuron response *level/amplitude* structure rather than
+  relative stimulus-response *shape*: once baseline and amplitude are removed, the estimate is
+  indistinguishable from the null.
+* The label-free activity block reproduces substantially more of the PROBE functional
+  organisation than connectivity, and a large part of that is rate-aligned; a small
+  stimulus-specific component survives but is not well resolved by 3 checkpoints.
+* The raw target's geometry is largely a firing-rate geometry, which is consistent with the
+  1-D FIT-rate representation reaching +0.680 while the 48-D structural vector reaches +0.146.
+* No representation, target or normalisation is "best": all variants are reported, and no
+  post-hoc trend or ranking is fitted.
+
+**Limitations of this stage.** One "stimulus" is one SHD utterance (no repeated-stimulus id);
+three checkpoints and one split seed only — checkpoint variability is comparable to the effects
+being discussed, so small differences must not be over-read; the bootstrap is the repository's
+naive neuron bootstrap; the numbers depend on the target pipeline, so every variant (and the
+alternative operation order) is reported rather than selecting the most favourable one; the
+activity features are FIT-derived label-free statistics and their stronger correspondence is
+measured here, not causally attributed.
 
 ---
 
@@ -513,5 +655,5 @@ statement about a "best" dimension, and no post-hoc trend is fitted.
 1. Temporal / network-context record blocks, using this evaluation layer unchanged.
 2. Only after that: multi-layer support.
 
-This capacity evaluation stage is complete and intentionally stops here: no temporal /
-network-context implementation and no architecture change was made.
+The capacity evaluation and its rate-confound robustness stage are complete and intentionally
+stop here: no temporal / network-context implementation and no architecture change was made.
