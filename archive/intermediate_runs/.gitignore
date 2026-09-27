@@ -1,0 +1,5 @@
+# Generated binaries from archived intermediate runs: retained on disk, not tracked by git.
+# Same rationale as the root .gitignore rules for checkpoints/ and results/.
+# The manifest (../ARCHIVE_MANIFEST.md) is tracked and documents every file listed here.
+*
+!.gitignore
