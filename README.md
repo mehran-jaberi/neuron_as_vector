@@ -17,7 +17,9 @@ The intended target is a [SNUFA](https://snufa.net/) 2026 submission.
 > [`VECTOR_V2_AUDIT.md`](VECTOR_V2_AUDIT.md). Historical audits and stage reports were
 > moved (not deleted) to [`archive/documentation/`](archive/documentation/), and the
 > archived intermediate run artefacts are listed in
-> [`archive/ARCHIVE_MANIFEST.md`](archive/ARCHIVE_MANIFEST.md).
+> [`archive/ARCHIVE_MANIFEST.md`](archive/ARCHIVE_MANIFEST.md). The representation
+> architecture is now **frozen** and driven from one control panel (see
+> [V2 neuron-vector pipeline](#v2-neuron-vector-pipeline-stable-entry-point) below).
 
 > **Result in one line** (see [§7](#7-results) for the full analysis): a label-free
 > representation built only from the network's parameters predicts individual
@@ -25,6 +27,51 @@ The intended target is a [SNUFA](https://snufa.net/) 2026 submission.
 > **$r = 0.298 \pm 0.051$** across three seeds ($p = 0.000999$ in every seed),
 > and the effect **survives a partial Mantel test controlling for firing rate**
 > ($r = 0.242 \pm 0.061$). Chance and shuffle controls are null.
+
+---
+
+## V2 neuron-vector pipeline (stable entry point)
+
+Everything the frozen V2 architecture does is reachable from one control panel
+(`src/v2_pipeline.py` is the stable API; `scripts/v2_control_panel.py` is the CLI):
+
+```bash
+# inspect: resolve + validate + print the exact plan (loads no data, trains nothing, never evaluates)
+uv run python scripts/v2_control_panel.py --preset historical_48 --dry-run
+
+# build the representation (FIT only; the historical 48-D vector when no preset is given)
+uv run python scripts/v2_control_panel.py --preset historical_48 --build
+
+# evaluate a frozen representation (PROBE only; never implicit, never a side effect of --build)
+uv run python scripts/v2_control_panel.py --preset functional_64 --evaluate
+
+# configuration is the only interface, via the repository's dotted overrides
+uv run python scripts/v2_control_panel.py --preset historical_48 \
+    --override vector.structured_d=64 --override vector.learned_residual_d=0 --dry-run
+
+# machine-readable project state (for handing the work to another session)
+uv run python scripts/v2_control_panel.py --summary-for-parent --run-tests
+```
+
+Presets are ordinary configuration values, not hidden execution paths
+(`d = structured_d + learned_residual_d`; these are the final vector dimensions):
+
+| preset | decomposition |
+|---|---|
+| `historical_48` | 48 = 48 structured + 0 residual (regression anchor) |
+| `structured_64` | 64 = 64 structured + 0 residual |
+| `structured_100` | 100 = 100 structured + 0 residual |
+| `temporal_structured` | 58 = 58 structured + 0 residual |
+| `functional_64` | 64 = 48 structured + 16 residual |
+| `functional_100` | 100 = 48 structured + 52 residual |
+
+`--dry-run` resolves and validates the full configuration and prints the plan (dimensions,
+blocks, residual protocol, memory/precision, checkpoint, data splits) without touching any data;
+`--build` uses FIT only and `--evaluate` uses PROBE only; the official TEST split is never
+accessed. `--list-presets` lists the presets, `--json` prints one machine-readable document and
+`--summary-for-parent` prints the project-state block. See [`V2_STATUS.md` §13](V2_STATUS.md) for
+the frozen architecture, the stable API, run identity, the cache policy and the FIT/PROBE/TEST
+contract; an example configuration lives in [`configs/v2_example.yaml`](configs/v2_example.yaml).
 
 ---
 

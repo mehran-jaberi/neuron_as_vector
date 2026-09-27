@@ -164,8 +164,9 @@ def test_learned_residual_d_can_be_zero():
 def test_consistent_dimensions_pass():
     v2 = _v2(vector={"d": 64, "structured_d": 48, "learned_residual_d": 16, "residual": {"enabled": True}})
     assert v2.vector.d == v2.vector.structured_d + v2.vector.learned_residual_d == 64
-    # the residual is configured but not implemented in this stage -> warning, no error
-    assert any("residual" in w for w in v2.warnings)
+    # the learned residual is implemented, so configuring it is not a warning
+    assert v2.vector.residual_implemented is True
+    assert v2.warnings == []
 
 
 @pytest.mark.parametrize(
@@ -497,8 +498,9 @@ def test_strict_mode_rejects_unimplemented_requests():
     V2Config.from_config(temporal, strict=True, warn=False)
 
     residual = Config({"vector": {"d": 64, "structured_d": 48, "learned_residual_d": 16, "residual": {"enabled": True}}})
-    with pytest.raises(V2ConfigError):
-        V2Config.from_config(residual, strict=True, warn=False)
+    # the learned residual is implemented (src/residual.py), so strict mode accepts it
+    assert V2Config.from_config(residual, warn=False).vector.residual_implemented is True
+    V2Config.from_config(residual, strict=True, warn=False)
 
     # the default configuration is fully implemented, so strict mode passes
     V2Config.from_config(Config({}), strict=True, warn=False)

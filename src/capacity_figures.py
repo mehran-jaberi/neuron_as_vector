@@ -539,18 +539,28 @@ def _entries(payload: Mapping[str, Any], representation: str) -> list[Mapping[st
 def _ablation_groups(
     payload: Mapping[str, Any],
     metric: str,
-) -> list[tuple[str, str, list[float]]]:
-    """Ordered ``(group_key, display_label, values)`` for the source-ablation comparison."""
+) -> list[tuple[str, str | None, list[float]]]:
+    """Ordered ``(group_key, display_label, values)`` for the source-ablation comparison.
+
+    The two deterministic reference conditions are aggregated over checkpoints (one group each),
+    and every ablation arm collects its individual (checkpoint, residual seed) replicates.
+    """
     ablation = payload.get("ablation_table") or []
-    groups: list[tuple[str, str, list[float]]] = []
+    groups: list[tuple[str, str | None, list[float]]] = []
+
+    deterministic: dict[str, list[float]] = {}
     for row in _source_extension_table(payload):
         if str(row.get("condition_role")) != "deterministic":
             continue
-        if str(row.get("representation")) not in ("structured_48", "structured_48_plus_temporal"):
+        representation = str(row.get("representation"))
+        if representation not in ("structured_48", "structured_48_plus_temporal"):
             continue
         value = _finite(row.get(metric))
         if np.isfinite(value):
-            groups.append((str(row["representation"]), None, [value]))  # type: ignore[arg-type]
+            deterministic.setdefault(representation, []).append(value)
+    for representation in ("structured_48", "structured_48_plus_temporal"):
+        if representation in deterministic:
+            groups.append((representation, None, deterministic[representation]))
 
     ordered_keys = [
         "structured",

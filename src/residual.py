@@ -91,7 +91,7 @@ from .structured_vector import (
     StructuredVectorError,
 )
 from .utils import get_device, set_seed
-from .v2_config import SOURCE_MASK_MODES, V2Config
+from .v2_config import RESIDUAL_STANDARDIZATIONS, SOURCE_MASK_MODES, V2Config
 
 #: Provenance schema of the residual source view.
 SOURCE_SCHEMA = "residual_source/v1"
@@ -124,7 +124,8 @@ TEMPORAL_FEATURE_PREFIX = f"{TEMPORAL_BLOCK}."
 
 _SUPPORTED_DTYPES = ("float32", "float16", "bfloat16")
 _SUPPORTED_DEVICES = ("cpu", "cuda", "auto")
-_SUPPORTED_NORMALIZATION = ("train_standardise", "none")
+#: Kept as an alias of the canonical list defined by the configuration layer.
+_SUPPORTED_NORMALIZATION = RESIDUAL_STANDARDIZATIONS
 _SUPPORTED_ACTIVATIONS = ("gelu", "relu", "tanh")
 
 
@@ -684,7 +685,15 @@ class ResidualTrainingConfig:
         residual_dim: int | None = None,
         **overrides: Any,
     ) -> "ResidualTrainingConfig":
-        """Build from the V2 configuration (dimension from `vector.learned_residual_d`, dtype from `precision.vector_dtype`)."""
+        """Build from the V2 configuration.
+
+        The dimension comes from ``vector.learned_residual_d``, the dtype from
+        ``precision.vector_dtype`` and the whole training protocol from
+        ``vector.residual`` (mask mode, seed, split/mask seeds, hidden width, epochs,
+        batch size, learning rate, mask fraction, minimum visible features,
+        validation fraction and standardization). Explicit ``overrides`` still win, so
+        the stage scripts keep the protocol they were written with.
+        """
         dimension = int(config.vector.learned_residual_d) if residual_dim is None else int(residual_dim)
         if dimension <= 0:
             raise ResidualError(
@@ -693,13 +702,77 @@ class ResidualTrainingConfig:
                 f"(residual.enabled={config.vector.residual.enabled}). Set "
                 "vector.learned_residual_d > 0 and vector.residual.enabled=true, or skip the residual."
             )
+        r = config.vector.residual
         mapping: dict[str, Any] = {
             "residual_dim": dimension,
             "dtype": config.precision.vector_dtype,
-            "mask_mode": config.vector.residual.mask_mode,
+            "mask_mode": r.mask_mode,
+            "seed": int(r.seed),
+            "split_seed": int(r.split_seed),
+            "mask_seed": int(r.mask_seed),
+            "hidden_dim": int(r.hidden_dim),
+            "epochs": int(r.epochs),
+            "batch_size": int(r.batch_size),
+            "lr": float(r.learning_rate),
+            "mask_fraction": float(r.mask_fraction),
+            "minimum_visible_features": int(r.minimum_visible_features),
+            "val_fraction": float(r.val_fraction),
+            "normalization": r.standardization,
         }
         mapping.update(overrides)
         return cls.from_mapping(mapping)
+
+
+#: Training-protocol fields a cached artifact must match before it may be reused.
+PROTOCOL_FIELDS: tuple[str, ...] = (
+    "residual_dim",
+    "hidden_dim",
+    "epochs",
+    "batch_size",
+    "lr",
+    "mask_fraction",
+    "mask_seed",
+    "minimum_visible_features",
+    "val_fraction",
+    "split_seed",
+    "seed",
+    "normalization",
+    "mask_mode",
+)
+
+
+def residual_training_mismatches(
+    residual: "ResidualResult",
+    expected: ResidualTrainingConfig,
+) -> dict[str, tuple[Any, Any]]:
+    """Protocol fields where a loaded artifact differs from the requested training config.
+
+    :meth:`ResidualResult.load` verifies the *schema* (feature names, dimensions, hash
+    integrity) but deliberately not the training hyper-parameters, so a caller that reuses
+    cached artifacts keyed only by source schema must check them explicitly: silently
+    reusing an artifact trained under a different protocol would change the numbers without
+    any visible failure. Returns ``{field: (artifact_value, expected_value)}``; an empty
+    dict means the artifact is protocol-compatible.
+    """
+    if not isinstance(residual, ResidualResult):
+        raise ResidualError(
+            f"protocol comparison needs a ResidualResult, got {type(residual).__name__}"
+        )
+    if not isinstance(expected, ResidualTrainingConfig):
+        raise ResidualError(
+            f"protocol comparison needs a ResidualTrainingConfig, got {type(expected).__name__}"
+        )
+    actual = residual.config
+    found: dict[str, tuple[Any, Any]] = {}
+    for name in PROTOCOL_FIELDS:
+        a = getattr(actual, name, None)
+        b = getattr(expected, name, None)
+        if isinstance(a, float) or isinstance(b, float):
+            if a is None or b is None or not np.isclose(float(a), float(b), rtol=0.0, atol=1e-12):
+                found[name] = (a, b)
+        elif a != b:
+            found[name] = (a, b)
+    return found
 
 
 # --------------------------------------------------------------------------
@@ -1614,6 +1687,8 @@ __all__ = [
     "source_group_of_feature",
     "source_groups_from_names",
     "ResidualTrainingConfig",
+    "PROTOCOL_FIELDS",
+    "residual_training_mismatches",
     "ResidualEncoder",
     "ReconstructionDecoder",
     "ResidualTrainer",

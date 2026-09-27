@@ -8,6 +8,12 @@ it. Use it to confirm that ``n_hidden``, ``d``, ``structured_d``,
 ``learned_residual_d``, the batch/chunk sizes, dtype and device can all be changed
 without editing any source code.
 
+.. note::
+   For *execution* the canonical V2 entry point is ``scripts/v2_control_panel.py``
+   (:mod:`src.v2_pipeline`): it resolves the same configuration, supports presets and
+   ``--dry-run``, and additionally builds/evaluates the representation. This script
+   remains the minimal configuration-only demonstrator.
+
 Examples::
 
     uv run python scripts/show_v2_config.py

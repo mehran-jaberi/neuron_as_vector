@@ -484,12 +484,13 @@ count: the whole projection and temporal summarisation happen in NumPy on the CP
 ## 9. Tests
 
 ```
-uv run pytest -q    ->  448 passed
+uv run pytest -q    ->  537 passed
 ```
 
 | file | tests | covers |
 |---|---|---|
-| `tests/test_v2_config.py` | 59 | configuration defaults, backward compatibility of the four existing configs, dimension invariant, dtype/device/storage validation, token budget, CLI overrides |
+| `tests/test_v2_pipeline.py` | 61 | control panel: default = historical 48-D anchor, dimension semantics (48+0 / 48+16 / 48+52, plus 64/100 structured and 58 temporal), every preset's documented decomposition, dotted overrides (and a warning for unknown keys), validation rejections (dimensions, blocks, `network_context`, multi-layer, precision, memory, mask mode, standardization, targets), dry run loading no data / writing nothing, deterministic and value-based run ids, exact equality with the lower-level modules, artifact round-trip + rejection of wrong run id/dimension/names/hash, residual-protocol cache verification (retrain on mismatch), FIT-only build (no PROBE activity), the parent summary's sections, and the quiet-pytest result handling |
+| `tests/test_v2_config.py` | 59 | configuration defaults, backward compatibility of the four existing configs, dimension invariant, dtype/device/storage validation, token budget, CLI overrides, the residual protocol surface and its acceptance in strict mode |
 | `tests/test_neuron_record.py` | 45 | columnar structure, orientation (incoming row / outgoing column), label-free guarantees, exact 48-D compatibility, memory guards, provenance |
 | `tests/test_structured_vector.py` | 51 | exact 48-D baseline, prefix dimension policy, Level-1 detail, projection determinism/prefix-stability, block selection, neuron counts, chunking, label-freedom, V2-config integration |
 | `tests/test_residual.py` | 37 | source view and variants, no-labels API, probe-split rejection, relabelled-FIT invariance, masking determinism/targets, architecture and config validation, training diagnostics, SNN-frozen check, reproducibility, persistence with mismatch rejection, CPU precision fallback, memory guards |
@@ -497,6 +498,7 @@ uv run pytest -q    ->  448 passed
 | `tests/test_vector_capacity.py` | 33 | PROBE-only targets and split discipline, individual-stimulus target shape/definition/label-independence, frozen representations, the dimension invariant and matched-total decompositions, residual artifact selection, SNN isolation, reproducibility, memory shapes, result table + figures |
 | `tests/test_rate_robustness.py` | 32 | raw-target equivalence with the first study, exact neuron centering/z-scoring, deterministic zero-variance rule, explicit (non-commuting) pipeline order, mean-rate and row-L2 targets, activity dimensions, checkpoint comparability, PROBE-only/label discipline, representation invariance, 1-D prediction, reproducibility, memory |
 | `tests/test_functional_response.py` | 48 | functional-response shape/definition, deterministic + prefix-stable + seed-dependent projection, sample-order hash, all normalisation modes, zero-variance rule, label-free provenance, chunked == unchunked; temporal bin edges/values/resolution/names/provenance; the 48-D default staying exact and temporal appearing only when requested; residual source expansion, de-duplication, schema persistence + mismatch rejection, both mask modes, per-source diagnostics, SNN-frozen check; `48+0/48+16/48+52` and a temporal structured + residual configuration |
+| `tests/test_source_extension.py` | 28 | the A/B/C/D source ablation (functional and temporal enabled independently and together, temporal requiring the block), condition/artifact-key identity and validation, `total_d = structured_d + residual_d` with the declared-dimension guard, dimensions derived from the encoder plan, target variants identical to the robustness study, the compact/ablation tables and their deltas, dedicated (non-overwriting) output files, figures, FIT-only sources and probe/test rejection, reproducibility |
 | pre-existing suite | 127 | model, data, training, evaluation, geometry, prediction, fingerprint, controls, rewiring, permutation, reliability, NSB |
 
 ---
@@ -504,17 +506,18 @@ uv run pytest -q    ->  448 passed
 ## 10. Known limitations
 
 * Single hidden layer only (`model.n_layers > 1` is configuration-only and rejected in
-  strict mode); the record/encoder layers carry a `layer`-agnostic design but no multi-layer
-  implementation exists.
+  strict mode *and* by the control panel); the record/encoder layers carry a `layer`-agnostic
+  design but no multi-layer implementation exists.
 * `temporal` and `network_context` record blocks: `temporal` is now **implemented** (coarse
   pooled-FIT-PSTH bins, selectable and available to the residual); `network_context` remains
-  declared but not implemented (no placeholder features).
+  declared but not implemented (no placeholder features) and is rejected by the control panel.
 * The structured encoder's projection coordinates are not individually interpretable.
 * The learned residual is a small MLP trained with masked reconstruction on FIT-derived
-  features. It has now been evaluated once on PROBE (§11): its presence does not separate the
-  measured primary/class-rate/temporal/CV metrics from the structured-only conditions at
-  matched total dimension, and the residual itself shows seed-to-seed spread of the same order
-  as those differences. No claim of improvement is made or supported.
+  features. It has been evaluated twice on PROBE (§11 capacity study, §12 source extension):
+  its presence did not separate the measured primary/class-rate/temporal/CV metrics from the
+  structured-only conditions at matched total dimension, while the functional-response source
+  produced a small, reproducible shift of the neuron z-scored target (§12). No claim of a
+  general improvement is made or supported, and no dimension or normalisation was selected.
 * The residual's `raw_view` coordinates are a fixed random projection of the raw
   connectivity, chosen for additional capacity; they are not individually interpretable.
 * The functional-response source coordinates are likewise a fixed random projection: they are
@@ -528,8 +531,10 @@ uv run pytest -q    ->  448 passed
   sample order would produce a different (still label-free) source view.
 * Enabling the new sources changes the residual input schema (and therefore its schema hash);
   no residual artifact trained on the old schema can be reused with the new one by design.
-* The new sources have **not** been scientifically evaluated: no PROBE analysis, no capacity
-  sweep and no comparison against the previous configuration was performed in this stage.
+* The new sources were evaluated once, at the prespecified dimensions, seeds and checkpoints
+  of §12 (2000 permutations, 500-resample bootstrap, three checkpoints x three residual
+  seeds); §13 adds no science. The measured effects are small, and no dimension or
+  normalisation was selected from them.
 * Residual training is reproducible on a fixed device/dtype; CUDA is only bitwise
   reproducible to the extent documented for the repository's other models.
 * GPU/memmap storage for records and the record-bank serialisation are not implemented
@@ -866,6 +871,25 @@ permutations, a 500-resample neuron-bootstrap 95% CI, the one-sided `greater` nu
 i.e. exactly the previous conventions. kNN is switched off (it was characterised in the earlier
 stages) and ridge cross-validated prediction is retained for the raw and the z-scored target only.
 
+### Run status (the prespecified full run)
+
+| item | value |
+|---|---|
+| tag / schema | `v2srcext` / `neuron_vector_source_extension/v1` |
+| completed | 2026-09-27, wall time 2648.5 s |
+| checkpoints | `sweep_l2_0`, `nsb_seed1`, `nsb_seed2` (all mutually comparable: architecture + representation schema) |
+| conditions × targets × checkpoints | 28 × 6 × 3 = **504 rows** |
+| evaluation | `n_perm = 2000`, `bootstrap = 500`, `n_splits = 5`, `seed = 0` (the robustness study's conventions; no quick-mode settings) |
+| residual artifacts | 72 = 3 checkpoints × {4 arms at `d=16`, block-mask at `d=16`, 3 arms at `d=52`} × 3 seeds; **all reused from cache, none retrained** |
+| artifact protocol audit | every one of the 72 cached artifacts was loaded and its persisted training config checked: 200 epochs, `batch 64`, `lr 1e-3`, `mask_fraction 0.25`, `hidden 64`, `val_fraction 0.2`, `split_seed 0`, `mask_seed 0`, `train_standardise`, and `mask_mode = block` **only** in the `*_maskblock` files — 72/72 conforming |
+| previous stages' files | `results.csv`, `results.json`, `metadata.json`, `rate_robustness_results.{csv,json}`, `rate_robustness_metadata.json` SHA-256 unchanged before/after the run (recorded in `source_extension_metadata.json → preserved_previous_artifacts`) |
+| official TEST | never opened (`official_test_loaded = false`); `data/shd_test.h5` SHA-256 unchanged |
+
+The run was repeated from a clean state and **reproduces the values recorded below exactly**: the
+108 overlapping (representation, checkpoint, residual-seed, target-variant) cells match
+`rate_robustness_results.json` with a maximum absolute difference of **0.000e+00** (0 cells above
+1e-12), so the new rows extend the previous tables rather than replacing them.
+
 ### Source verification (recorded before the scientific run)
 
 The per-checkpoint verification block in `source_extension_metadata.json → source_verification`
@@ -879,23 +903,144 @@ projection (seed 0, `1/sqrt(n_samples)` Gaussian, prefix-stable, not fitted), no
 
 ### Measured results
 
-<!--RESULTS-->
+Mantel Spearman r; deterministic conditions averaged over the 3 checkpoints (SD across
+checkpoints in parentheses); residual conditions over 3 checkpoints x the 3 listed seeds.
+Permutation p <= 0.0005, 2000 permutations, 500-resample bootstrap CIs, seed 0. `class_rate` and
+`temporal` are the secondary targets.
+
+| representation | total_d | raw | neuron-centered | neuron z-scored | mean-rate | class-rate | temporal |
+|---|---|---|---|---|---|---|---|
+| `structured_48` (baseline) | 48 | +0.146 (0.039) | +0.167 | +0.029 (0.021) | +0.095 | +0.166 | +0.301 |
+| `structured_48_plus_temporal` | 58 | +0.335 (0.048) | +0.311 | +0.040 (0.023) | +0.287 | +0.360 | +0.454 |
+| `activity_only` | 12 | +0.405 (0.004) | +0.276 | +0.111 (0.050) | +0.489 | +0.455 | +0.735 |
+| `structural_48_plus_activity` | 60 | +0.266 (0.030) | +0.226 | +0.053 (0.032) | +0.262 | +0.304 | +0.533 |
+
+Residual source ablation, `residual_d = 16` (`total_d = 64`; n = 9 = 3 checkpoints x 3 seeds):
+
+| arm | residual source features | raw | neuron-centered | neuron z-scored | mean-rate | class-rate | temporal |
+|---|---|---|---|---|---|---|---|
+| A structural | 237 | +0.151 (0.037) | +0.173 (0.042) | **+0.033 (0.025)** | +0.097 | +0.170 | +0.308 |
+| B + functional response | 301 | +0.318 (0.039) | +0.322 (0.042) | **+0.063 (0.027)** | +0.234 | +0.332 | +0.417 |
+| C + temporal | 247 | +0.176 (0.036) | +0.193 (0.040) | **+0.032 (0.025)** | +0.123 | +0.196 | +0.330 |
+| D + both | 311 | +0.328 (0.047) | +0.329 (0.050) | **+0.065 (0.029)** | +0.247 | +0.344 | +0.428 |
+| D + both, block masking | 311 | +0.381 (0.048) | +0.376 (0.046) | **+0.078 (0.032)** | +0.292 | +0.401 | +0.469 |
+
+Same ablation at `residual_d = 52` (`total_d = 100`, n = 9): A raw +0.153 (0.031) / z-scored
++0.034 (0.025); B raw +0.447 (0.046) / z-scored +0.094 (0.029); D raw +0.446 (0.057) / z-scored
++0.095 (0.028).
+
+Cross-validated ridge prediction of the target profile from the frozen representation (out-of-fold
+R², shared neuron folds, the robustness study's convention; rule-based, `raw` and `neuron_zscored`
+only). Mean (SD) over the 9 replicates:
+
+| arm | raw R² (`d=16` / `d=52`) | z-scored R² (`d=16` / `d=52`) |
+|---|---|---|
+| A structural | +0.149 (0.035) / +0.156 (0.029) | +0.067 (0.008) / +0.076 (0.009) |
+| B + functional response | +0.709 (0.010) / +0.754 (0.011) | +0.290 (0.032) / +0.354 (0.026) |
+| C + temporal | +0.383 (0.028) / — | +0.071 (0.011) / — |
+| D + both | +0.712 (0.011) / +0.762 (0.007) | +0.287 (0.023) / +0.358 (0.022) |
+| D + both, block masking | +0.636 (0.029) / — | +0.241 (0.041) / — |
+
+Permutation-p counts for the z-scored target (of 9 replicates): p ≤ 0.05 in 9/9 for the
+functional-response arms (B, D at both dimensions; at the 1/2001 floor in 4/9 at `d=16` and 9/9 at
+`d=52`), 9/9 for the block-mask arm, 3/9 for the structural-only and temporal-only arms, and 2/3 for
+the deterministic `structured_48`.
 
 ### Source ablations
 
-<!--ABLATIONS-->
+z-scored target (the primary diagnostic), mean over the 9 replicates with its bootstrap interval
+and the worst-case permutation p across replicates:
+
+| arm | z-scored r | sd | bootstrap CI (min low, max high) | p (max over replicates) | individual values |
+|---|---|---|---|---|---|
+| A structural | +0.033 | 0.025 | [-0.010, +0.129] | 0.3563 | 0.032, 0.027, 0.024, 0.068, 0.062, 0.065, 0.008, 0.005, 0.006 |
+| B + functional response | +0.063 | 0.027 | [+0.014, +0.169] | 0.0050 | 0.060, 0.057, 0.061, 0.098, 0.105, 0.091, 0.032, 0.038, 0.028 |
+| C + temporal | +0.032 | 0.025 | [-0.010, +0.125] | 0.4023 | 0.026, 0.031, 0.023, 0.066, 0.064, 0.064, 0.006, 0.003, 0.004 |
+| D + both | +0.065 | 0.029 | [+0.006, +0.166] | 0.0315 | 0.062, 0.070, 0.065, 0.097, 0.100, 0.103, 0.034, 0.035, 0.021 |
+| D + both, block masking | +0.078 | 0.032 | [+0.012, +0.192] | 0.0195 | 0.070, 0.060, 0.047, 0.128, 0.116, 0.120, 0.073, 0.047, 0.042 |
+
+Difference against the structural arm (matched `total_d = 64`, same residual architecture, protocol
+and seeds): B **+0.167 raw / +0.030 z-scored**, C **+0.025 raw / -0.001 z-scored**, D **+0.177 raw /
++0.032 z-scored**, D with block masking **+0.230 raw / +0.045 z-scored**.
+
+**Direct observations** (values only):
+
+* the functional-response arms (B, D) raise the neuron z-scored correspondence from +0.033
+  (A, structural-only source) to +0.063 / +0.065; their bootstrap intervals exclude 0 and all
+  nine replicates are positive, whereas the A and C intervals include 0 and their worst-case
+  permutation p is 0.36 / 0.40;
+* the temporal source alone (C) leaves the z-scored correspondence unchanged (+0.032 vs +0.033)
+  while raising the raw one (+0.176 vs +0.151) and the mean-rate one (+0.123 vs +0.097);
+* adding the temporal block on top of the functional-response source (D vs B) changes the
+  z-scored value by +0.002 and the raw value by +0.010;
+* at `residual_d = 52` the functional-response arm reaches +0.094 z-scored (A: +0.034) and
+  +0.447 raw (A: +0.153);
+* the deterministic temporal extension (`structured_48_plus_temporal`, 58-D) raises the raw
+  correspondence from +0.146 to +0.335 and the mean-rate one from +0.095 to +0.287, while the
+  z-scored one moves from +0.029 to +0.040;
+* the block-mask advantage seen at `residual_d = 16` (+0.078 vs +0.065) is **not** a consequence of
+  block masking being a better protocol: the same combined source with the default coordinate
+  masking at `residual_d = 52` reaches +0.095, i.e. more than the block-mask arm, and the
+  functional-response arm alone at `d = 52` reaches +0.094; the comparison belongs to the same
+  dimension only;
+* the secondary targets move consistently with the raw target (class-rate +0.170 -> +0.332 for B;
+  temporal +0.308 -> +0.417).
+
+**Interpretation** (separated from the observations, no causal language): the temporal block alone
+behaves like the **Pattern A** template of the brief — it moves the raw correspondence but not the
+rate- and amplitude-independent one — whereas the functional-response source behaves like
+**Pattern C** (both move), with the z-scored shift being the part that separates it from the
+structural-only arm and from the null. Adding the temporal block to the functional-response source
+does not visibly change the z-scored picture at these dimensions. These are representational
+associations on three checkpoints, not statements about what drives functional organisation.
 
 ### Mask-mode diagnostic
 
-<!--MASK-->
+Arm D (`residual_d = 16`) trained with the same source view but `mask_mode="block"` (one whole
+source group withheld per example) instead of the default `"coordinate"`, n = 9 each:
+
+| mask_mode | raw | neuron-centered | z-scored | mean-rate | class-rate | temporal |
+|---|---|---|---|---|---|---|
+| coordinate | +0.328 (0.047) | +0.329 | +0.065 (0.029) | +0.247 | +0.344 | +0.428 |
+| block | +0.381 (0.048) | +0.376 | +0.078 (0.032) | +0.292 | +0.401 | +0.469 |
+
+Training diagnostics for the block-mode arm (sweep_l2_0, seed 0): the best epoch is 76 with a
+validation masked MSE of 0.961 (the last epoch's is 1.054 — i.e. the arm overfits after its best
+epoch), and the last epoch's **training** masked MSE is 0.560, decomposed by source group into
+0.714 (structural, 237 coordinates), 0.089 (functional-response, 64) and 0.030 (temporal, 10); the
+corresponding last-epoch **validation** per-source values are 1.049, 0.444 and 3.449, so the
+temporal group — only 10 coordinates, entirely withheld — is the hardest to reconstruct and
+generalises worst. The coordinate-mode arm reports a smaller total because it withholds individual
+coordinates rather than a whole group. These numbers are **architectural diagnostics only** — they
+are not comparable across mask modes and carry no biological meaning.
 
 ### Checkpoint and seed variability
 
-<!--VARIABILITY-->
+* Within-checkpoint residual-seed SD of the z-scored metric at `residual_d = 16` is 0.001-0.006
+  for every arm (arm B: 0.0016 / 0.0057 / 0.0040 for nsb_seed1 / nsb_seed2 / sweep_l2_0); the
+  seed variability is therefore much smaller than the checkpoint variability.
+* Deterministic conditions, z-scored, per checkpoint (sweep_l2_0 / nsb_seed1 / nsb_seed2):
+  `structured_48` 0.004 / 0.029 / 0.055 (mean 0.029, SD 0.021); `structured_48_plus_temporal`
+  0.008 / 0.048 / 0.063 (mean 0.040, SD 0.023); `activity_only` 0.098 / 0.058 / 0.178
+  (mean 0.111, SD 0.050); `structural_48_plus_activity` 0.023 / 0.038 / 0.098 (mean 0.053,
+  SD 0.032).
+* The functional-response arm's z-scored values are positive in **all nine** replicates
+  (0.028-0.105), while the structural-only and temporal-only arms include values at or below the
+  null (0.003-0.068 and 0.003-0.066). nsb_seed2 supplies the largest values for every arm.
 
 ### Joining with the previous studies
 
-<!--JOIN-->
+The stage is built to join the earlier results, and it does so exactly: the target-variant names,
+condition labels (the A arm reuses `full_48+16_seed0` / `full_48+52_seed0`), checkpoint labels and
+residual seeds are unchanged, and the structural-only artifacts are the previous stages' cached
+ones (identical source schema). Comparing the 108 overlapping
+(representation, checkpoint, residual seed, target variant) cells against
+`rate_robustness_results.json` gives **0 cells differing by more than 1e-12** — the maximum absolute
+difference over the shared cells is **0.000e+00** (e.g. `structured_48` / sweep_l2_0 / raw =
++0.112558 in both; `structured_48` / nsb_seed2 / neuron z-scored = +0.055098 in both;
+`full_48+16_seed0` / sweep_l2_0 / raw = +0.114456 in both). The new rows therefore extend the
+previous tables rather than replacing them, and the join was re-verified cell-by-cell after the
+full run recorded above.
 
 ### Discipline and compatibility
 
@@ -937,16 +1082,207 @@ z-scored correspondence for the ablation conditions (the Pattern A/B/C reading).
 
 ---
 
-## 13. Next planned stage
+## 13. Control panel, stable API and the frozen V2 release
 
-1. **Freeze the feature architecture for the control-panel stage.** The three scientific stages
-   (capacity sweep, rate-confound robustness, source-extension ablation) are complete; the
-   representation architecture of §1–§6 is the candidate stable version. §23 of the
-   source-extension brief lists the configuration surface a future control panel must expose
-   (checkpoint, `n_hidden`, `structured_d`/`residual_d`/`d`, `enabled_blocks`, the functional and
-   temporal source switches, `functional_source_dim`, normalisation, the seeds, `mask_mode`, the
-   memory/chunk sizes, precision and the evaluation target) — all of it already lives in
-   `src/v2_config.V2Config`, which stays the single configuration backend.
+**The representation architecture is frozen for the first stable V2 release.** "Frozen" means
+stable to *configure, reproduce, cache and inspect*; it does **not** mean the representation has
+been shown to be optimal. No best dimension and no best normalisation was established (§11–§12),
+nothing is selected from PROBE, and no new representation source was added in this stage.
+
+### Stable API (`src/v2_pipeline.py`)
+
+One high-level entry point wraps the whole pipeline; scripts no longer need to know the internals
+of `NeuronRecordBank`, `StructuredVectorEncoder` or `ResidualTrainer`:
+
+```python
+from src.v2_pipeline import V2Run
+
+run = V2Run.from_config(preset="functional_64")   # resolve + validate only (no data)
+run.resolved.summary_lines()                      # human-readable resolved configuration
+run.dry_run()                                     # machine-readable plan (loads nothing)
+build = run.build_representation()                # FIT only:  bank -> encoder -> residual -> artifact
+evaluation = run.evaluate()                       # PROBE only: Mantel / prediction / controls
+```
+
+| entry point | role |
+|---|---|
+| `resolve_config(...)` | load YAML + preset + dotted overrides, validate, fingerprint the checkpoint, compute the run id |
+| `dry_run_report(resolved)` | the exact plan (dimensions, blocks, residual action, data splits, outputs) |
+| `build_representation(resolved)` / `V2Run.build_representation()` | build and freeze the `(n_neurons, d)` artifact from FIT |
+| `load_vector_artifact(resolved)` | verified load of a frozen artifact |
+| `evaluate_representation(resolved)` / `V2Run.evaluate()` | evaluate a frozen artifact against PROBE (never rebuilds it) |
+| `parent_summary(...)` | the machine-readable project-state block used for session hand-off |
+| `test_suite_status(...)` | collected test count and (optionally) the recorded full-suite result |
+
+Public identifiers: `SCHEMA = "v2_pipeline/v1"`, `RUN_ID_SCHEMA = "v2_run_id/v1"`,
+`COMPONENT_SCHEMAS` (the schema of every component a frozen artifact depends on), `DATA_POLICY`,
+`PRESETS`, `PRESET_DECOMPOSITIONS`, `PipelineError`, `ResolvedConfig`, `BuildResult`,
+`EvaluationResult`, `V2Run`. The composition layer gained the persisted-artifact format
+`src.neuron_vector.ARTIFACT_SCHEMA = "neuron_vector_artifact/v1"` and the residual module gained
+`PROTOCOL_FIELDS` / `residual_training_mismatches(...)`.
+
+### Control panel (`scripts/v2_control_panel.py`)
+
+```bash
+uv run python scripts/v2_control_panel.py --list-presets
+uv run python scripts/v2_control_panel.py --preset historical_48 --dry-run
+uv run python scripts/v2_control_panel.py --preset historical_48 --build          # default phase
+uv run python scripts/v2_control_panel.py --preset functional_64 --evaluate
+uv run python scripts/v2_control_panel.py --preset historical_48 \
+    --override vector.structured_d=64 --override vector.learned_residual_d=0 --dry-run
+uv run python scripts/v2_control_panel.py --summary-for-parent --run-tests
+```
+
+* **Phases are explicit and separate.** `--build` (FIT only) and `--evaluate` (PROBE only) are
+  independent; building never evaluates. `--dry-run` is the debugging tool: it resolves, validates
+  and prints the plan without loading a dataset, collecting activity, training a residual or
+  touching PROBE. `--json` prints exactly one machine-readable document (resolved configuration
+  plus the plan and/or the build/evaluation result). With no phase flag the panel inspects only.
+* **`--override`** is the repository's existing `dotted.key=value` syntax (same parsing path as
+  `load_config`); an override that matches no known configuration key is *reported as a warning*
+  rather than silently ignored.
+* **No hidden choices.** The panel exposes the checkpoint, `n_hidden`/`model_type`, the dimension
+  triple, `enabled_blocks`, the activity/functional-response/temporal source switches,
+  `functional_source_dim`/`projection_seed`/`normalization`, `temporal_resolution`, the whole
+  residual protocol (`enabled`, `seed`, `split_seed`, `mask_seed`, `hidden_dim`, `epochs`,
+  `batch_size`, `learning_rate`, `mask_fraction`, `minimum_visible_features`, `val_fraction`,
+  `standardization`, `mask_mode`, `source_functional_response`, `source_temporal`), the memory /
+  precision knobs and the evaluation target. It never selects anything from PROBE — it is an
+  interface, not an optimiser.
+* Unsupported requests are rejected up front: `network_context`, `model.n_layers > 1`,
+  non-`float32` `model_dtype`, `mixed_precision`, an inconsistent `d`/`structured_d`/`residual_d`,
+  a residual enabled without residual capacity (or vice versa), a residual source without a
+  residual, unknown blocks/mask modes/standardizations/targets, invalid seeds/sizes and
+  `memory.storage != cpu` (the last one is a warning: the current builders are CPU-side).
+
+### Default configuration (the regression anchor)
+
+With no preset the resolved configuration is exactly the historical one: `d = 48 = 48 structured
++ 0 residual`, `enabled_blocks = intrinsic, input_conn, recurrent_in, recurrent_out`, residual
+disabled, no functional-response/temporal source, `readout_mode=sum` etc. from the existing model
+block. Verified on the real checkpoint `sweep_l2_0.pt`:
+
+| comparison (control panel default) | result |
+|---|---|
+| vs `StructuredVectorEncoder(bank, structured_d=48)` | `max abs diff = 0.000e+00` |
+| vs `structural_matrix_from_record_bank(bank)` (existing object API) | `max abs diff = 0.000e+00` |
+| vs `neuron_vectors_from_config(v2, bank, residual=None)` | `max abs diff = 0.000e+00` |
+| coordinate names vs the encoder | identical |
+| residual instantiated / loaded when `learned_residual_d = 0` | no (`residual_cache = None`, `used = False`) |
+
+The same artifact contract is exercised in `tests/test_v2_pipeline.py` on a synthetic bank.
+
+### Available presets
+
+Presets are **ordinary configuration values** (a bag of `vector.*` leaves applied before the CLI
+overrides), never hidden execution paths. Each pins the *split*; `d` is always derived from it, so
+overriding one component stays consistent.
+
+| preset | decomposition | note |
+|---|---|---|
+| `historical_48` | 48 = 48 structured + 0 residual | the regression anchor (default blocks) |
+| `structured_64` | 64 = 64 structured + 0 residual | level-0 48 + first 16 level-1 coordinates |
+| `structured_100` | 100 = 100 structured + 0 residual | level-0 48 + 52 level-1 coordinates (source = 141) |
+| `temporal_structured` | 58 = 58 structured + 0 residual | default blocks + 10 coarse temporal bins (resolution 10) |
+| `functional_64` | 64 = 48 structured + 16 residual | residual consumes structural + functional-response |
+| `functional_100` | 100 = 48 structured + 52 residual | same source, larger residual |
+
+`functional_64` / `functional_100` reproduce the source-extension study's arm **B**
+(`structured + functional_response`) decompositions; `temporal_structured` is the deterministic
+temporal condition. No preset exists for a configuration that is not implemented.
+
+### Run identity
+
+```
+run_id = sha256[:16]( canonical_json( {component schemas, vector config (dimensions, blocks,
+          temporal resolution, functional-source settings, the whole residual protocol),
+          vector/activity dtype, checkpoint id} ) )
+```
+
+Only *values* enter the identity. The same configuration + checkpoint always yields the same id;
+any representation-relevant change (including a residual protocol change) yields a different one;
+evaluation settings, memory/chunk sizes, the preset **label** and the wall clock deliberately do
+**not**. Because the payload is the resolved configuration dict, adding or renaming a
+configuration field also changes the id: an artifact built by an older code version is therefore
+never reused silently - it is simply not found and gets rebuilt. The exact hashed payload is
+recorded as `run_identity` in the resolved configuration, so the derivation can be re-checked
+from an artifact (`sha256(canonical_json(run_identity))[:16] == run_id`, tested).
+
+### Caching policy
+
+Four artifact types, each with its own integrity contract; nothing is ever adapted silently:
+
+| artifact | location | verified on reuse |
+|---|---|---|
+| FIT / PROBE activity accumulator | `results/neuron_vector_capacity/cache/{role}_activity_<key>.npz` (+ `.json`) | the stored cache metadata must equal the requested metadata exactly (checkpoint, split, role, n, labels) |
+| learned residual | `results/neuron_vector_capacity/residuals/<base>_dres<d>_seed<s>[_maskblock].pt` | `learned_residual/v1` schema, feature names, feature-schema hash, `input_dim`, `residual_dim` **and the training protocol** (`PROTOCOL_FIELDS`) |
+| frozen neuron vector | `results/neuron_vector_capacity/vectors/<run_id>.npz` | `neuron_vector_artifact/v1` schema, run id, `d`/`structured_d`/`residual_d`, coordinate names, matrix content hash |
+| evaluation result | `results/neuron_vector_capacity/evaluations/evaluation_<key>.json` | keyed by run id + evaluation settings |
+
+The cache path convention is shared with the stage scripts (same base key: checkpoint fingerprint,
+`n_bins`/`bin_ms`, split seed/strategy, data source, source-schema hash and block selection), so
+the residual artifacts trained by the earlier stages are reused rather than retrained — verified:
+`functional_64` on `sweep_l2_0` reused `8e04b24b64cc65a9_dres16_seed0.pt` (exactly the
+source-extension arm-B artifact). Because `ResidualResult.load` deliberately does not compare
+hyper-parameters, the pipeline adds that check itself: an artifact trained under a different
+protocol is rejected and retrained, and the mismatching fields are reported.
+
+### FIT / PROBE / TEST execution policy
+
+| split | allowed use | enforcement |
+|---|---|---|
+| FIT (`shd_train.h5`, speaker-aware split) | representation construction (`NeuronRecordBank`), residual training | the bank rejects labelled/class-conditioned accumulators; the residual source requires a FIT-only bank |
+| DEV | not used by the control panel at all (model selection belongs to training) | the panel never builds DEV recordings |
+| PROBE (held out) | evaluation targets and metrics only | `build_response_targets`/`build_evaluation_targets` assert the held-out PROBE split; the representation is loaded from a frozen artifact and never rebuilt from PROBE |
+| TEST (official) | never | neither `src/v2_pipeline.py` nor `scripts/v2_control_panel.py` contains any reference to the test recordings; every payload records `official_test_loaded = false`; a test asserts the absence of the test-file token in both sources |
+
+### Frozen architecture (release summary)
+
+```
+frozen SNN checkpoint + label-free FIT
+        -> NeuronRecordBank (columnar, label-free)
+        -> {structural blocks | activity block | functional-response source | temporal block}
+        -> StructuredVectorEncoder (deterministic, no fitted state)
+        -> LearnedResidual (optional, FIT-only, self-supervised)
+        -> NeuronVector  z = [z_structured, z_residual]      (n_neurons, d)
+        -> frozen neuron-vector artifact
+        -> PROBE evaluation (Mantel / prediction / controls, unchanged machinery)
+```
+
+Explicitly **not implemented** in this release: `network_context = not implemented` and
+`multi-layer = not implemented`. Also not implemented: mixed-precision training, GPU/memmap
+record-bank storage, and any automatic selection of dimension, normalisation, seed or mask mode.
+
+### Known limitations
+
+* Single hidden layer, one dataset (SHD), one fixed split seed; three checkpoints and three
+  residual seeds, so small differences must be read against the reported variability.
+* The presets are *documented configuration*, not validated optima; the evaluation outcome for a
+  preset is whatever the existing metrics report, and no preset is claimed to be "best".
+* The scientific statements of §11–§12 remain descriptive associations at the representation
+  level (no causal language, no ranking); the frozen architecture is not evidence of optimality.
+* The artifact store is local and git-ignored (`results/`, `figures/`), and the control panel is a
+  configuration/build/evaluate surface, not a full analysis UI.
+
+### Cleanup of execution paths (§22)
+
+No execution path was archived: every existing script is either the canonical reproduction of a
+completed scientific stage (`evaluate_vector_capacity.py`, `evaluate_vector_rate_robustness.py`,
+`evaluate_vector_source_extension.py` — the latter two import shared helpers from the first),
+part of the historical V1 pipeline, or referenced by tests (`show_v2_config.py`). The **one
+obvious V2 execution path is now the control panel**; `scripts/show_v2_config.py` remains as the
+configuration-only demonstrator and now points to the panel. The three stage scripts are *not*
+superseded — they hold the studies' prespecified condition logic and their cached artifacts are
+reused through the shared cache-key convention.
+
+---
+
+## 14. Next planned stage
+
+1. **The architecture is frozen; the next work is scientific, not architectural.** Use the control
+   panel to state and reproduce representation configurations (§13) for the next study — for
+   example a prespecified dimension or normalisation comparison — and report it with the existing
+   evaluation layer.
 2. Only after that: the `network_context` block, and then multi-layer support (both still
    unimplemented; no placeholder features exist for them).
 

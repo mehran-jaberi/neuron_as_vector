@@ -138,6 +138,10 @@ MAX_FUNCTIONAL_SOURCE_DIM = 4096
 #: Normalisation modes of the individual-stimulus functional-response source view.
 FUNCTIONAL_SOURCE_NORMALIZATIONS: tuple[str, ...] = ("raw", "neuron_centered", "neuron_zscored")
 
+#: Standardisation modes of the learned residual's input view (the canonical list; the
+#: residual implementation imports it from here so the rule lives in exactly one place).
+RESIDUAL_STANDARDIZATIONS: tuple[str, ...] = ("train_standardise", "none")
+
 #: Masking strategies of the learned residual's reconstruction objective.
 SOURCE_MASK_MODES: tuple[str, ...] = ("coordinate", "block")
 
@@ -243,12 +247,32 @@ class VectorResidualConfig:
         coordinates; ``block`` withholds one whole source group per example
         (structural / functional_response / temporal) so a source must be reconstructed
         from the others.
+
+    The remaining fields are the **training protocol** of the learned residual. Their
+    defaults are exactly the protocol the capacity / rate-robustness / source-extension
+    studies used (200 epochs, batch 64, Adam lr 1e-3, mask fraction 0.25, a 0.2 neuron
+    validation split inside FIT, coordinate masking, train-split standardisation), so an
+    existing config reproduces those artifacts unchanged. They are exposed here so that a
+    control panel can *state* and reproduce the protocol from the one configuration system
+    instead of hard-coding it in a script.
     """
 
     enabled: bool = False
     source_functional_response: bool = False
     source_temporal: bool = False
     mask_mode: str = "coordinate"
+    # -- training protocol (defaults = the established protocol) --------------
+    seed: int = 0
+    split_seed: int = 0
+    mask_seed: int = 0
+    hidden_dim: int = 64
+    epochs: int = 200
+    batch_size: int = 64
+    learning_rate: float = 1e-3
+    mask_fraction: float = 0.25
+    minimum_visible_features: int = 8
+    val_fraction: float = 0.2
+    standardization: str = "train_standardise"
 
     def __post_init__(self) -> None:
         self.enabled = _as_bool(self.enabled, "vector.residual.enabled")
@@ -264,13 +288,61 @@ class VectorResidualConfig:
                 f"vector.residual.mask_mode must be one of {list(SOURCE_MASK_MODES)}, "
                 f"got {self.mask_mode!r}"
             )
+        for name in ("seed", "split_seed", "mask_seed"):
+            value = _as_int(getattr(self, name), f"vector.residual.{name}")
+            if value < 0:
+                raise V2ConfigError(f"vector.residual.{name} must be >= 0, got {value}")
+            setattr(self, name, value)
+        for name in ("hidden_dim", "epochs", "batch_size", "minimum_visible_features"):
+            value = _as_int(getattr(self, name), f"vector.residual.{name}")
+            if value < 1:
+                raise V2ConfigError(f"vector.residual.{name} must be >= 1, got {value}")
+            setattr(self, name, value)
+        try:
+            learning_rate = float(self.learning_rate)
+        except (TypeError, ValueError) as exc:
+            raise V2ConfigError(
+                f"vector.residual.learning_rate must be a number, got {self.learning_rate!r}"
+            ) from exc
+        if not learning_rate > 0:
+            raise V2ConfigError(
+                f"vector.residual.learning_rate must be > 0, got {learning_rate}"
+            )
+        self.learning_rate = learning_rate
+        for name in ("mask_fraction", "val_fraction"):
+            try:
+                value = float(getattr(self, name))
+            except (TypeError, ValueError) as exc:
+                raise V2ConfigError(f"vector.residual.{name} must be a number") from exc
+            setattr(self, name, value)
+        if not 0.0 <= self.mask_fraction < 1.0:
+            raise V2ConfigError(
+                f"vector.residual.mask_fraction must be in [0, 1), got {self.mask_fraction}"
+            )
+        if not 0.0 <= self.val_fraction < 0.5:
+            raise V2ConfigError(
+                f"vector.residual.val_fraction must be in [0, 0.5), got {self.val_fraction}"
+            )
+        self.standardization = _as_str(
+            self.standardization, "vector.residual.standardization"
+        ).lower()
+        if self.standardization not in RESIDUAL_STANDARDIZATIONS:
+            raise V2ConfigError(
+                "vector.residual.standardization must be one of "
+                f"{list(RESIDUAL_STANDARDIZATIONS)}, got {self.standardization!r}"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_mapping(cls, mapping: Mapping[str, Any] | None) -> "VectorResidualConfig":
-        return cls(**_filter_mapping(cls, mapping))
+        raw = dict(mapping or {})
+        # `normalization` is accepted as a synonym so an existing residual-style key is
+        # never silently dropped; `standardization` is the documented name.
+        if "normalization" in raw and "standardization" not in raw:
+            raw["standardization"] = raw["normalization"]
+        return cls(**_filter_mapping(cls, raw))
 
 
 @dataclass
@@ -425,8 +497,8 @@ class VectorConfig:
 
     @property
     def residual_implemented(self) -> bool:
-        """False in this stage: the learned residual is configuration-only."""
-        return False
+        """True: the learned residual is implemented (:mod:`src.residual`)."""
+        return True
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -954,8 +1026,10 @@ class V2Config:
         """Resolve a :class:`Config` into a validated :class:`V2Config`.
 
         ``strict=True`` turns "requested but not implemented in this stage"
-        warnings (multi-layer, not-yet-implemented blocks, learned residual) into
-        :class:`V2ConfigError`; ``warn=True`` prints them to stdout.
+        warnings (multi-layer SNN, not-yet-implemented record blocks,
+        mixed-precision training) into :class:`V2ConfigError`; ``warn=True`` prints them
+        to stdout. The learned residual and the temporal block *are* implemented, so
+        selecting them is not a warning.
         """
         snn = SNNConfig.from_config(cfg)
         train = TrainConfig.from_config(cfg)
@@ -1017,6 +1091,17 @@ class V2Config:
             ("vector.residual.source_functional_response", v.residual.source_functional_response),
             ("vector.residual.source_temporal", v.residual.source_temporal),
             ("vector.residual.mask_mode", v.residual.mask_mode),
+            ("vector.residual.seed", v.residual.seed),
+            ("vector.residual.split_seed", v.residual.split_seed),
+            ("vector.residual.mask_seed", v.residual.mask_seed),
+            ("vector.residual.hidden_dim", v.residual.hidden_dim),
+            ("vector.residual.epochs", v.residual.epochs),
+            ("vector.residual.batch_size", v.residual.batch_size),
+            ("vector.residual.learning_rate", v.residual.learning_rate),
+            ("vector.residual.mask_fraction", v.residual.mask_fraction),
+            ("vector.residual.minimum_visible_features", v.residual.minimum_visible_features),
+            ("vector.residual.val_fraction", v.residual.val_fraction),
+            ("vector.residual.standardization", v.residual.standardization),
             ("memory.train_batch_size", m.train_batch_size),
             ("memory.eval_batch_size", m.eval_batch_size),
             ("memory.record_batch_size", m.record_batch_size),
@@ -1091,8 +1176,6 @@ def validate_v2_config(v2: V2Config, *, strict: bool = False) -> list[str]:
         unimplemented.append(
             f"vector.enabled_blocks includes not-yet-implemented block(s) {vec.unimplemented_blocks}"
         )
-    if vec.residual.enabled:
-        unimplemented.append("vector.residual.enabled=true (learned residual)")
     if prec.model_dtype != "float32":
         unimplemented.append(f"precision.model_dtype='{prec.model_dtype}' (mixed-precision training)")
     if unimplemented:

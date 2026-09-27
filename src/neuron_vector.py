@@ -21,7 +21,10 @@ existing deterministic structured vector exactly and instantiates no residual mo
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import numpy as np
@@ -37,6 +40,9 @@ from .v2_config import V2Config
 
 #: Provenance schema of a composed neuron-vector set.
 SCHEMA = "neuron_vector/v1"
+
+#: Schema of a *persisted* neuron-vector artifact (the frozen ``(n, d)`` matrix on disk).
+ARTIFACT_SCHEMA = "neuron_vector_artifact/v1"
 
 
 class NeuronVectorError(ValueError):
@@ -288,6 +294,187 @@ def default_residual_source_config(residual: ResidualResult) -> ResidualSourceCo
     return ResidualSourceConfig.from_mapping(residual.source_config)
 
 
+# --------------------------------------------------------------------------
+# Persisted artifact (the frozen representation on disk)
+# --------------------------------------------------------------------------
+def _matrix_digest(X: np.ndarray) -> str:
+    """SHA-256 of the matrix bytes in a canonical (C-contiguous float64) layout."""
+    canonical = np.ascontiguousarray(np.asarray(X, dtype=np.float64))
+    return hashlib.sha256(canonical.tobytes()).hexdigest()
+
+
+@dataclass
+class NeuronVectorArtifact:
+    """A frozen ``(n_neurons, d)`` representation plus everything needed to verify it.
+
+    This is the on-disk form of a built representation. It is **frozen**: it carries the
+    resolved dimensions, the coordinate names, the run identity and the provenance of the
+    build, so a later evaluation (or another process) can reuse exactly the same matrix and
+    can *prove* it is the same one (schema + dimension + name + run-id + content hash).
+    """
+
+    X: np.ndarray
+    feature_names: tuple[str, ...]
+    structured_d: int
+    residual_d: int
+    run_id: str = ""
+    provenance: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.X = np.asarray(self.X, dtype=np.float64)
+        if self.X.ndim != 2:
+            raise NeuronVectorError(f"artifact matrix must be 2-D, got shape {self.X.shape}")
+        self.feature_names = tuple(str(n) for n in self.feature_names)
+        self.structured_d = int(self.structured_d)
+        self.residual_d = int(self.residual_d)
+        self.run_id = str(self.run_id)
+        self.provenance = dict(self.provenance)
+        if self.X.shape[1] != len(self.feature_names):
+            raise NeuronVectorError(
+                f"artifact has {self.X.shape[1]} columns but {len(self.feature_names)} coordinate names"
+            )
+        if self.X.shape[1] != self.structured_d + self.residual_d:
+            raise NeuronVectorError(
+                "artifact violates d = structured_d + residual_d: "
+                f"{self.X.shape[1]} != {self.structured_d} + {self.residual_d}"
+            )
+        self.provenance.setdefault("schema", ARTIFACT_SCHEMA)
+        self.provenance.setdefault("uses_labels", False)
+        self.provenance.setdefault("full_dimension", int(self.X.shape[1]))
+
+    @property
+    def n_neurons(self) -> int:
+        return int(self.X.shape[0])
+
+    @property
+    def d(self) -> int:
+        return int(self.X.shape[1])
+
+    @classmethod
+    def from_vectors(
+        cls,
+        vectors: NeuronVectors,
+        *,
+        run_id: str = "",
+        provenance: Mapping[str, Any] | None = None,
+    ) -> "NeuronVectorArtifact":
+        """Freeze composed vectors (the values are copied, not referenced)."""
+        if not isinstance(vectors, NeuronVectors):
+            raise NeuronVectorError(f"expected NeuronVectors, got {type(vectors).__name__}")
+        prov = dict(vectors.provenance)
+        if provenance:
+            prov.update(dict(provenance))
+        return cls(
+            X=np.array(vectors.X, dtype=np.float64, copy=True),
+            feature_names=vectors.feature_names,
+            structured_d=vectors.structured_d,
+            residual_d=vectors.residual_d,
+            run_id=run_id,
+            provenance=prov,
+        )
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "schema": ARTIFACT_SCHEMA,
+            "run_id": self.run_id,
+            "shape": [self.n_neurons, self.d],
+            "structured_d": self.structured_d,
+            "residual_d": self.residual_d,
+            "coordinate_order": "structured coordinates first, residual coordinates last",
+            "matrix_sha256": _matrix_digest(self.X),
+            "uses_labels": False,
+        }
+
+    def save(self, path: str | Path) -> Path:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            p,
+            X=np.asarray(self.X, dtype=np.float64),
+            feature_names=np.asarray(self.feature_names, dtype=str),
+            structured_d=np.asarray([self.structured_d], dtype=np.int64),
+            residual_d=np.asarray([self.residual_d], dtype=np.int64),
+            run_id=np.asarray([self.run_id], dtype=str),
+            matrix_sha256=np.asarray([_matrix_digest(self.X)], dtype=str),
+            provenance=np.asarray([json.dumps(self.provenance, sort_keys=True, default=str)], dtype=str),
+            schema=np.asarray([ARTIFACT_SCHEMA], dtype=str),
+        )
+        return p
+
+    @classmethod
+    def load(
+        cls,
+        path: str | Path,
+        *,
+        expected_run_id: str | None = None,
+        expected_feature_names: Sequence[str] | None = None,
+        expected_d: int | None = None,
+        expected_structured_d: int | None = None,
+        expected_residual_d: int | None = None,
+        verify_hash: bool = True,
+    ) -> "NeuronVectorArtifact":
+        """Load a frozen artifact, refusing anything that does not match what was asked for.
+
+        Every check is explicit: schema, dimensions (``d``, ``structured_d``,
+        ``residual_d``), coordinate names, run identity and (by default) the content
+        hash. A mismatch raises :class:`NeuronVectorError`; nothing is adapted silently.
+        """
+        p = Path(path)
+        if not p.exists():
+            raise FileNotFoundError(f"neuron-vector artifact not found: {p}")
+        with np.load(str(p), allow_pickle=False) as data:
+            schema = str(data["schema"][0])
+            if schema != ARTIFACT_SCHEMA:
+                raise NeuronVectorError(
+                    f"unsupported neuron-vector artifact schema {schema!r}; expected {ARTIFACT_SCHEMA!r}"
+                )
+            X = np.asarray(data["X"], dtype=np.float64)
+            names = tuple(str(n) for n in data["feature_names"])
+            structured_d = int(data["structured_d"][0])
+            residual_d = int(data["residual_d"][0])
+            run_id = str(data["run_id"][0])
+            stored_hash = str(data["matrix_sha256"][0])
+            provenance = json.loads(str(data["provenance"][0]))
+        artifact = cls(
+            X=X,
+            feature_names=names,
+            structured_d=structured_d,
+            residual_d=residual_d,
+            run_id=run_id,
+            provenance=provenance,
+        )
+        if verify_hash and _matrix_digest(artifact.X) != stored_hash:
+            raise NeuronVectorError(f"{p} failed its content-hash integrity check")
+        if expected_run_id is not None and str(expected_run_id) != artifact.run_id:
+            raise NeuronVectorError(
+                f"artifact run_id={artifact.run_id!r} does not match the requested "
+                f"run_id={expected_run_id!r}"
+            )
+        if expected_feature_names is not None and tuple(expected_feature_names) != artifact.feature_names:
+            raise NeuronVectorError(
+                "incompatible artifact: the requested coordinate names do not match the "
+                f"artifact ({len(tuple(expected_feature_names))} vs {len(artifact.feature_names)} "
+                "coordinates)"
+            )
+        for name, expected in (
+            ("d", expected_d),
+            ("structured_d", expected_structured_d),
+            ("residual_d", expected_residual_d),
+        ):
+            if expected is None:
+                continue
+            actual = {
+                "d": artifact.d,
+                "structured_d": artifact.structured_d,
+                "residual_d": artifact.residual_d,
+            }[name]
+            if int(expected) != int(actual):
+                raise NeuronVectorError(
+                    f"incompatible artifact: {name}={actual} but {int(expected)} was requested"
+                )
+        return artifact
+
+
 def residual_source_for(bank: NeuronRecordBank, residual: ResidualResult) -> Any:
     """Build the exact source view a trained residual expects from ``bank`` (verifies nothing)."""
     return build_residual_source(bank, default_residual_source_config(residual))
@@ -295,8 +482,10 @@ def residual_source_for(bank: NeuronRecordBank, residual: ResidualResult) -> Any
 
 __all__ = [
     "SCHEMA",
+    "ARTIFACT_SCHEMA",
     "NeuronVectorError",
     "NeuronVectors",
+    "NeuronVectorArtifact",
     "build_neuron_vectors",
     "neuron_vectors_from_config",
     "default_residual_source_config",
