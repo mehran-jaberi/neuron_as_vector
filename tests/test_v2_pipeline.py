@@ -29,6 +29,7 @@ from src.utils import Config, load_config
 from src.v2_config import RESIDUAL_STANDARDIZATIONS, V2Config
 from src.v2_pipeline import (
     DATA_POLICY,
+    DEFAULT_CONFIG_PATH,
     PRESET_DECOMPOSITIONS,
     SCHEMA,
     PipelineError,
@@ -136,6 +137,19 @@ def test_default_configuration_is_the_historical_48(panel_config_path, panel_che
     assert r.v2.vector.unimplemented_blocks == []
     text = "\n".join(r.summary_lines())
     assert "d = 48" in text and "structured = 48" in text and "residual   = 0" in text
+
+
+def test_relative_config_path_is_anchored_to_the_repo_root(monkeypatch, tmp_path):
+    """Regression: the documented default config must resolve from any working directory.
+
+    A notebook kernel started in ``notebooks/`` has a cwd that is not the repo root. The relative
+    default path used to be handed straight to ``load_config``, which raised FileNotFoundError
+    there; the checkpoint and the output directory were already anchored to the repo root.
+    """
+    monkeypatch.chdir(tmp_path)
+    r = resolve_config()
+    assert Path(r.config_path).is_absolute()
+    assert Path(r.config_path) == PROJECT_ROOT / DEFAULT_CONFIG_PATH
 
 
 @pytest.mark.parametrize(

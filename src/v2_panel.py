@@ -911,8 +911,11 @@ def checkpoint_mismatches(path: str | Path, config_path: str | Path = DEFAULT_CO
     checkpoint = Path(path)
     if not checkpoint.is_absolute():
         checkpoint = PROJECT_ROOT / checkpoint
+    config_file = Path(config_path)
+    if not config_file.is_absolute():
+        config_file = PROJECT_ROOT / config_file
     model, _ = RecurrentLIFSNN.load(str(checkpoint), map_location="cpu")
-    cfg = load_config(config_path)
+    cfg = load_config(config_file)
     mismatches = architecture_mismatches(cfg.get_path("model", {}) or {}, model)
     return {"compatible": not mismatches, "mismatches": {k: list(v) for k, v in mismatches.items()}}
 

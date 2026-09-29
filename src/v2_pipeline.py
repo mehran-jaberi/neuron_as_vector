@@ -727,6 +727,10 @@ def resolve_config(
             f"unknown evaluation_target {evaluation_target!r}; use 'all' or one of "
             f"{sorted(k for k in EVALUATION_TARGETS if k != 'all')}"
         )
+    # Anchor a relative config path to the repository root, exactly like the checkpoint and the
+    # output directory below. Without this the documented defaults only resolve when the process
+    # happens to run from the repo root (e.g. a notebook kernel started in ``notebooks/`` fails).
+    config_path = _resolve_path(config_path)
     cfg = load_config(config_path)
     cfg_before_overrides = cfg.to_dict()
     if preset is not None:

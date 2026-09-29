@@ -304,6 +304,14 @@ def test_preview_and_reproducibility_blocks(panel_state):
     assert panel.safety_lines()[2].startswith("TEST")
 
 
+def test_checkpoint_mismatches_anchors_a_relative_config_path(monkeypatch, tmp_path, tiny_checkpoint):
+    """Regression: a relative config path is resolved against the repo root, not the cwd."""
+    monkeypatch.chdir(tmp_path)
+    result = panel.checkpoint_mismatches(tiny_checkpoint, panel.DEFAULT_CONFIG_PATH)
+    assert set(result) == {"compatible", "mismatches"}
+    assert isinstance(result["mismatches"], dict)
+
+
 def test_cache_inventory_and_checkpoints(tiny_config_path, tiny_checkpoint):
     inventory = panel.cache_inventory(config_path=tiny_config_path, checkpoint=tiny_checkpoint)
     assert inventory["presets"] == list(available_presets())
