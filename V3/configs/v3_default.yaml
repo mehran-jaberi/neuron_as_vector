@@ -1,0 +1,62 @@
+# V3 primary configuration.
+#
+# A neuron's internal state is a genuine D-dimensional vector; D dimensions
+# participate directly in the neuron's recurrent dynamics, its interaction with
+# the other neurons, and spike generation.  See ../README.md.
+#
+# Everything the experiment needs is here; N and D are never hard-coded in the
+# model, the data loader or the notebook.
+
+# ---- run identity ----
+tag: v3_vector_d1000
+seed: 0
+
+# ---- data (SHD, official event-based files) ----
+train_h5: data/shd_train.h5
+test_h5: data/shd_test.h5
+n_inputs: 700
+n_classes: 20
+bin_ms: 4.0            # one dynamical step == one 4 ms bin
+n_bins: 250            # T = 250 steps -> a 1000 ms window (96.6% of train spans)
+binary_input: true     # >=1 event in a bin -> 1 (standard SHD encoding)
+val_fraction: 0.10     # stratified split of the TRAIN file only (monitoring)
+split_seed: 0
+cache_events: true
+max_train_samples: 0   # 0 = full FIT split
+
+# ---- model ----
+n_neurons: 64          # N
+state_dim: 1000        # D
+mix_rank: 64           # rank of the shared intra-neuron mixing operator
+tau_ms: 20.0           # state leak time constant
+input_gain: 5.0        # scale of the shared input projection init
+surrogate_beta: 4.0
+surrogate_gamma: 1.0
+readout: sum           # spike-count readout
+rate_reg: 1.0e-4       # firing-rate regulariser weight (0 disables)
+rate_target_hz: 10.0   # target rate used for threshold init and the regulariser
+emit_identity_init: true
+
+# ---- training ----
+batch_size: 128
+epochs: 20
+learning_rate: 1.0e-3
+weight_decay: 0.0
+grad_clip: 1.0
+optimizer: adam
+lr_schedule: cosine
+warmup_frac: 0.03
+label_smoothing: 0.0
+
+# ---- precision / device ----
+device: cuda
+dtype: float16
+amp: true
+grad_checkpoint_chunks: 10
+select_best_val: true
+
+# ---- io ----
+out_dir: results
+ckpt_dir: checkpoints
+figure_dir: figures
+log_every: 0
