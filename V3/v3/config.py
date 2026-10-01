@@ -64,7 +64,8 @@ class V3Config:
 
     # ---- training --------------------------------------------------------
     batch_size: int = 32
-    epochs: int = 30
+    epochs: int = 20             # primary control of how much training is done
+    max_train_batches: int | None = None  # None = all batches; int = cap per epoch
     learning_rate: float = 2.0e-3
     weight_decay: float = 0.0
     grad_clip: float = 1.0
@@ -135,6 +136,8 @@ class V3Config:
             raise ValueError("alpha = dt/tau must be in (0, 1]")
         if self.grad_checkpoint_chunks < 1:
             raise ValueError("grad_checkpoint_chunks must be >= 1")
+        if self.max_train_batches is not None and int(self.max_train_batches) < 1:
+            raise ValueError("max_train_batches must be null (all batches) or >= 1")
 
     # ------------------------------------------------------------------ #
     def to_dict(self) -> dict:
