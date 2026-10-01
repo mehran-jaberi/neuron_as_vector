@@ -39,7 +39,7 @@ emit_identity_init: true
 
 # ---- training ----
 batch_size: 128
-epochs: 20             # primary control of how much training is performed
+epochs: 5            # primary control of how much training is performed
 max_train_batches: null  # null = use all training batches; an integer caps every
                          # epoch at that many batches (debug / smoke runs only;
                          # evaluation and testing always use the full splits)
