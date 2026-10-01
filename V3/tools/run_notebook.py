@@ -19,6 +19,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from queue import Empty
 
 V3_ROOT = Path(__file__).resolve().parent.parent
 NOTEBOOK = V3_ROOT / "V3_SHD_experiment.ipynb"
@@ -32,6 +33,14 @@ except Exception:  # noqa: BLE001
 
 def _text(v) -> str:
     return "".join(v) if isinstance(v, list) else str(v)
+
+
+def _console(text: str) -> None:
+    try:
+        sys.stdout.write(text)
+    except UnicodeEncodeError:
+        sys.stdout.write(text.encode("ascii", "replace").decode("ascii"))
+    sys.stdout.flush()
 
 
 def execute(notebook: Path, max_cells: int | None, cell_timeout: float, out: Path) -> int:
@@ -62,19 +71,15 @@ def execute(notebook: Path, max_cells: int | None, cell_timeout: float, out: Pat
                 continue
             print(f"\n[nb] ---- cell {count} ({len(code)} chars) ----", flush=True)
             t0 = time.perf_counter()
-            outputs, exec_count, err = _run_cell(kc, code, cell_timeout)
+            outputs, exec_count, err = _run_cell(kc, code, cell_timeout, km=km)
             cell["outputs"], cell["execution_count"] = outputs, exec_count
             dt = time.perf_counter() - t0
-            for o in outputs:
-                if o["output_type"] == "stream":
-                    try:
-                        sys.stdout.write(_text(o["text"]))
-                    except UnicodeEncodeError:
-                        sys.stdout.write(_text(o["text"]).encode("ascii", "replace").decode("ascii"))
-                    sys.stdout.flush()
             print(f"[nb] ---- cell {count} done in {dt:.1f}s"
                   + (" (ERROR)" if err else "") + " ----", flush=True)
             if err:
+                for o in outputs:
+                    if o["output_type"] == "error":
+                        _console("\n".join(o["traceback"]) + "\n")
                 print(f"[nb] FAILED at cell {count}; notebook left partially executed", flush=True)
                 break
         print(f"\n[nb] total {time.perf_counter() - t_all:.1f}s for {count} code cells", flush=True)
@@ -86,12 +91,14 @@ def execute(notebook: Path, max_cells: int | None, cell_timeout: float, out: Pat
         km.shutdown_kernel(now=True)
 
 
-def _run_cell(kc, code: str, timeout: float):
+def _run_cell(kc, code: str, timeout: float, km=None):
     msg_id = kc.execute(code, store_history=True, allow_stdin=False)
     outputs: list[dict] = []
     exec_count = None
     err = False
     deadline = time.perf_counter() + timeout
+    last_live = time.perf_counter()
+    last_beat = time.perf_counter()
 
     def push(o: dict) -> None:
         if (o["output_type"] == "stream" and outputs
@@ -106,7 +113,18 @@ def _run_cell(kc, code: str, timeout: float):
         remaining = deadline - time.perf_counter()
         if remaining <= 0:
             raise TimeoutError(f"cell exceeded {timeout:.0f}s")
-        msg = kc.get_iopub_msg(timeout=min(remaining, 60.0))
+        try:
+            msg = kc.get_iopub_msg(timeout=30.0)
+        except Empty:
+            # the kernel is busy but silent (stdout/stderr can stay buffered for a
+            # long time, e.g. tqdm bars written with '\r'); just keep waiting.
+            if km is not None and not km.is_alive():
+                raise RuntimeError("kernel died while executing a cell") from None
+            if time.perf_counter() - last_beat > 300:
+                print(f"[nb] ... still running ({time.perf_counter() - last_beat:.0f}s quiet)",
+                      flush=True)
+                last_beat = time.perf_counter()
+            continue
         if msg["parent_header"].get("msg_id") != msg_id:
             continue
         mtype, content = msg["msg_type"], msg["content"]
@@ -115,6 +133,15 @@ def _run_cell(kc, code: str, timeout: float):
                 idle = True
         elif mtype == "stream":
             push({"output_type": "stream", "name": content["name"], "text": content["text"]})
+            now = time.perf_counter()
+            text = _text(content["text"])
+            if content["name"] == "stderr":
+                if "\n" in text or now - last_live > 20.0:
+                    _console(text)
+                    last_live = now
+            else:
+                _console(text)
+                last_live = now
         elif mtype == "execute_result":
             push({"output_type": "execute_result", "data": content["data"],
                   "metadata": content.get("metadata", {}),

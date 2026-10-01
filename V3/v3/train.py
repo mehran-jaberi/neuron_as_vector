@@ -74,10 +74,18 @@ def _to_device(x: np.ndarray, cfg: V3Config, device: torch.device) -> torch.Tens
 
 @torch.no_grad()
 def _rate_stats(spikes: torch.Tensor, cfg: V3Config) -> dict:
+    """Per-neuron firing-rate statistics for a whole split.
+
+    ``spikes`` is ``(n_samples, T, N)``.  The rate is the mean per-step spike
+    probability divided by the bin duration; the mean must therefore be taken over
+    **both** the sample and the time axis (summing over the split and dividing only
+    by ``T`` would inflate the rate by the number of samples).
+    """
     s = spikes.float()
     n_steps = s.shape[1]
     counts = s.sum(dim=(0, 1))
-    rate = counts / n_steps / (cfg.bin_ms / 1000.0)
+    per_step = counts / max(1, s.shape[0]) / max(1, n_steps)
+    rate = per_step / (cfg.bin_ms / 1000.0)
     return {
         "rate_mean_hz": float(rate.mean()),
         "rate_median_hz": float(rate.median()),

@@ -3,6 +3,11 @@
 > **Question.** How much of the official SHD test set can a population of
 > $D = 1000$ **vector-valued** spiking neurons classify correctly?
 
+> **Answer (executed, 3 epochs, single seed).** **71.78%** — 1625 of the 2264
+official SHD test samples. The identical population with scalar neurons
+($D=1$, same 64 neurons, same training) reaches **26.55%**. See [§8](#8-results)
+and `RESULTS.md`. The YAML's default 20-epoch schedule is the deferred next run.
+
 This folder is an independent experiment. It is **not** an extension of V2 and
 does not import, modify or reproduce any of the V2 architecture
 (`src/`, `scripts/`, `configs/` of the repository root are untouched). It is also
@@ -96,7 +101,7 @@ $$
 | shared $W_{in}$, shared rank-$R$ mixing, shared $W_{emit}$ | the naive per-neuron $D\times D$ recurrent matrix would cost $N D^2 \approx 6.4\times10^7$ parameters *per neuron*. Sharing keeps the **state** genuinely $D$-dimensional while making the parameters affordable. |
 | `sum` readout, not `mean` | a mean readout shrinks the logit scale by $T$; the cross-entropy is then cheapest to reduce by raising firing rates, which saturates the population. Spike counts keep the logit scale in a sane range. |
 | zero-initialised $W_{cls}$ | with a spike-count readout the logit scale grows with the firing rate, so a random readout init starts far from the loss basin. Zero init gives exactly $-\ln 20 \approx 3.0$ initial cross-entropy. |
-| per-neuron threshold initialisation, then trained | $\theta_i$ is set to the empirical $(1-p)$ quantile of the neuron's pre-spike potential ($p = \text{rate}\cdot\Delta t$) so every neuron starts at the target firing rate. It stays trainable; why it matters is documented in `RESULTS.md`. |
+| per-neuron threshold initialisation, then trained | `theta` enters additively, so a neuron fires when `raw_i(t) > -theta_i`; `theta_i` is initialised to the **negated** empirical $(1-p)$ quantile of the neuron's raw pre-spike potential ($p = \text{rate}\cdot\Delta t$) so every neuron starts at the target firing rate. It stays trainable; why it matters is documented in `RESULTS.md`. |
 | firing-rate regulariser ($\lambda = 10^{-4}$, target 10 Hz) | guards against the rate/saturation feedback loop (higher rate $\to$ larger population signal $\to$ larger drive $\to$ higher rate) |
 
 ### What $N$ and $D$ mean
@@ -172,6 +177,29 @@ tensor are genuinely fp16 (the notebook prints their dtypes, and
 This is only possible because `tanh` bounds the state, so no fp16 overflow
 occurs — unlike the fp16 problems seen in the Brian 2 experiment.
 
+### GPU memory (the one thing that really bites)
+
+The 250-step backprop-through-time graph is the memory driver. Training uses
+chunked gradient checkpointing (`grad_checkpoint_chunks`), which stores the state
+only at chunk boundaries — measured peak over a full epoch at
+`N=64, D=1000, T=250, batch=128`: **1108 MiB allocated / 1148 MiB reserved**, with
+`nvidia-smi` reporting ~1.7 GiB in use and ~2.2 s per batch.
+
+Two traps, both measured on the 6 GiB RTX 3060 Laptop:
+
+* An **un-checkpointed** 250-step forward *with gradients enabled* allocates
+  **8.4 GiB** at `D=1000` — more than the device has. NVIDIA's WDDM driver then
+  silently pages GPU memory to host RAM and every subsequent training step runs
+  roughly **150× slower** (measured: 333 s/batch instead of 2.2 s/batch, an ETA
+  of 5 h 16 m for the first epoch). Every diagnostic in the notebook therefore
+  runs under `torch.no_grad()` and frees its tensors, and the notebook prints the
+  live CUDA footprint right after those checks so the condition is visible.
+  If you add your own diagnostics, keep this in mind.
+* `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` is set before the first CUDA
+  allocation (in `v3/__init__.py`, `setdefault` so your own setting wins). It is
+  not what makes training fast, but it keeps the allocator's reserved pool at the
+  true peak instead of letting fragmentation drift it upwards.
+
 If CUDA is unavailable the code falls back to `device=cpu, dtype=float32` for
 debugging only. The project is not designed around CPU execution.
 
@@ -197,7 +225,13 @@ jupyter lab            # open V3/V3_SHD_experiment.ipynb  (ipykernel is installe
 ```
 
 Set `V3_QUICK=1` before launching the notebook kernel to run a minutes-long
-smoke of the identical code path.
+smoke of the identical code path. `V3_OVERRIDES` takes a JSON object of
+configuration overrides and lets you shorten or vary a run without editing the
+notebook:
+
+```powershell
+$env:V3_OVERRIDES='{"epochs": 3}'; .venv\Scripts\python.exe V3\tools\run_notebook.py
+```
 
 Artifacts written per run (all under `V3/`):
 
@@ -216,9 +250,63 @@ results/summary.json                   vector-vs-scalar summary (CLI --variant b
 
 ## 8. Results
 
-<!-- RESULTS:BEGIN -->
-_See `RESULTS.md` for the executed numbers._
-<!-- RESULTS:END -->
+**Executed** (`V3_SHD_experiment.ipynb`, top to bottom, 19/19 code cells, no errors,
+712 s wall). The committed execution used a short **3-epoch** schedule
+(`V3_OVERRIDES='{"epochs": 3}'`); the YAML default is `epochs: 20` and that
+full run is the deferred next step (see below). Both variants use the identical
+code path, data, readout, optimizer and epoch count.
+
+| | vector `D=1000` | scalar baseline `D=1` |
+|---|---|---|
+| trainable parameters | 2,025,440 | 6,335 |
+| FIT accuracy (final epoch) | 90.35% | 24.29% |
+| VAL accuracy (final epoch) | 86.89% | 24.63% |
+| **TEST correct / total** | **1625 / 2264** | **601 / 2264** |
+| **TEST accuracy** | **71.78%** | **26.55%** |
+| test errors | 639 | 1663 |
+| per-class accuracy min / median / max | 37.0% / 72.0% / 100.0% | 0.0% / 25.4% / 68.8% |
+| classes below 10% recall | **0** | 5 |
+| English (0–9) / German (10–19) | 74.91% / 68.42% | 23.18% / 29.57% |
+| mean / median / max firing rate | 24.09 / 21.55 / 95.45 Hz | 10.72 / 5.21 / 66.23 Hz |
+| silent neurons (of 64) | 0 | 10 |
+| peak CUDA memory (train) | 1283 MiB allocated / 1330 MiB reserved | 144 MiB |
+| test pass wall time | 18.8 s for all 2264 samples | 10.3 s |
+| training wall time (3 epochs) | 445.5 s (161/137/132 s per epoch) | 151.0 s |
+
+**The vector population beats the scalar population by +45.23 percentage points**
+(71.78% vs 26.55%) with the same 64 neurons, the same input, the same readout and
+the same training procedure. The scalar baseline is still at chance-plus
+(FIT 24.3%, five classes with <10% recall, 10 of its 64 neurons silent), i.e. it has
+barely started to learn after 3 epochs, whereas the vector population is already
+at 71.78% test accuracy — above the repository's own V2 LIF baseline
+(59.98%, N=256, 20 epochs) and close to the ~71% usually quoted for a plain
+recurrent SHD baseline. The full 20-epoch run is expected to go further.
+
+Training progressed as (vector):
+
+| epoch | train loss | train acc | val loss | val acc | rate | spikes/sample | epoch time |
+|---|---|---|---|---|---|---|---|
+| 1 | 1.7030 | 45.33% | 0.9983 | 67.16% | 19.21 Hz | 1229 | 160.7 s |
+| 2 | 0.7629 | 77.26% | 0.6061 | 83.82% | 23.65 Hz | 1514 | 136.6 s |
+| 3 | 0.4701 | 88.01% | 0.4903 | 86.89% | 24.72 Hz | 1582 | 131.5 s |
+
+Figures written to `V3/figures/<tag>/`: training curves, test confusion matrix,
+per-class accuracy, and input/spike rasters for representative test and FIT samples.
+
+### Deferred: the full 20-epoch run
+
+The committed notebook execution uses 3 epochs to keep the turnaround short. To
+produce the full result, run the identical code path with the YAML's 20 epochs:
+
+```powershell
+# notebook, 20 epochs, ~65 min (43 min vector + 22 min scalar)
+.venv\Scripts\python.exe V3\tools\run_notebook.py
+# or the equivalent CLI invocation (same functions, same seeds)
+.venv\Scripts\python.exe V3\run_experiment.py --variant both
+```
+
+Expected cost: ≈ 2.2 min per vector epoch and ≈ 0.7 min per scalar epoch of GPU
+work, plus ~30% host-side event binning (`TODO.md`).
 
 ## 9. Layout
 

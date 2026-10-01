@@ -1,5 +1,16 @@
 # V3 TODO
 
+## Immediate next step (deferred by request)
+
+- [x] get a measured full-dimensional result — done at **3 epochs**: vector
+      `D=1000` = **71.78%** (1625/2264), scalar `D=1` = **26.55%** (601/2264) on the
+      official SHD test set (see `RESULTS.md`)
+- [ ] **run the full 20-epoch schedule** (the value already in
+      `configs/v3_default.yaml`):
+      `.venv\Scripts\python.exe V3\tools\run_notebook.py` — ≈ 43 min for the
+      vector model + ≈ 22 min for the scalar baseline, plus evaluation. No code
+      change is needed; the notebook picks `epochs: 20` up from the YAML.
+
 Everything below is **not implemented**. Nothing in this file is wired into the
 active interface; if a feature is implemented it works, if it is not it lives here.
 
@@ -46,8 +57,17 @@ active interface; if a feature is implemented it works, if it is not it lives he
 
 ## Performance
 
-- [ ] CUDA kernel optimisation / custom fused step (biggest lever)
+- [ ] overlap host-side event binning with GPU compute (a `DataLoader` with
+      worker processes, or a one-off pre-binned cache). Measured: the GPU drops
+      to ~20% utilisation once every few batches while the host rebuilds the
+      dense `(B, T, C)` tensor with `np.bincount`, which costs ~30% of the epoch
+      (3.1 min/epoch observed end-to-end vs 2.1 min/epoch of pure GPU work)
+- [ ] CUDA kernel optimisation / custom fused step (biggest lever: the Python
+      250-step loop, not the FLOPs, is the bottleneck — ~2.2 s/batch and
+      58 samples/s at N=64, D=1000, T=250, batch 128)
 - [ ] memory optimisation (gradient checkpointing is already used; chunks=10)
+      and memory instrumentation: log `max_memory_reserved` per epoch, and guard
+      against ever building an un-checkpointed 250-step graph (~8.4 GiB at D=1000)
 - [ ] larger `N`, larger `D`, longer `T`
 - [ ] `bf16` comparison against `fp16`
 - [ ] multi-GPU / gradient accumulation to raise the effective batch size

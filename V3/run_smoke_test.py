@@ -29,7 +29,7 @@ sys.path.insert(0, str(V3_ROOT))
 from v3.config import V3Config, parameter_groups  # noqa: E402
 from v3.data import BatchIterator, SHDEventStore, make_split, official_test_split  # noqa: E402
 from v3.model import VectorNeuronPopulation, surrogate_spike  # noqa: E402
-from v3.train import evaluate, fit, set_seed  # noqa: E402
+from v3.train import _rate_stats, evaluate, fit, set_seed  # noqa: E402
 
 OK = "[OK]  "
 FAIL = "[FAIL]"
@@ -177,6 +177,36 @@ def test_parameter_update(device: torch.device) -> None:
 
 
 # ---------------------------------------------------------------------- #
+def test_rate_stats() -> None:
+    banner("8. firing-rate statistics are per-sample normalised")
+    cfg = V3Config(n_bins=250, bin_ms=4.0)
+    # 10 samples, 250 steps, 8 neurons; neuron j fires every (j+1)-th step
+    s = torch.zeros(10, 250, 8)
+    for j in range(8):
+        s[:, :: (j + 1), j] = 1.0
+    st = _rate_stats(s, cfg)
+    st1 = _rate_stats(s[:1], cfg)
+    # a firing *rate* is intensive: it must not change with the number of samples.
+    # (the earlier bug summed over the split but divided only by T, so the 10-sample
+    #  result was 10x the 1-sample result)
+    check("mean rate is invariant to the number of samples",
+          abs(st["rate_mean_hz"] - st1["rate_mean_hz"]) < 1e-6,
+          f"{st['rate_mean_hz']:.4f} Hz vs {st1['rate_mean_hz']:.4f} Hz")
+    check("spikes per sample is invariant to the number of samples",
+          abs(st["spikes_per_sample"] - st1["spikes_per_sample"]) < 1e-6,
+          f"{st['spikes_per_sample']:.3f} vs {st1['spikes_per_sample']:.3f}")
+    # hand-computed from the construction: counts are 250,125,84,63,50,42,36,32
+    # (tolerance is fp32: the rates are computed as count/T/dt in float32)
+    check("mean rate matches the hand-computed value",
+          abs(st["rate_mean_hz"] - 85.25) < 1e-4, f"{st['rate_mean_hz']:.4f} Hz (expected 85.25)")
+    check("spikes per sample matches the hand-computed value",
+          abs(st["spikes_per_sample"] - 682.0) < 1e-6, str(st["spikes_per_sample"]))
+    check("no neuron is silent in this construction", st["silent_neurons"] == 0)
+    check("max rate is the always-firing neuron", abs(st["rate_max_hz"] - 250.0) < 1e-4,
+          f"{st['rate_max_hz']:.2f} Hz")
+
+
+# ---------------------------------------------------------------------- #
 def test_full_size_probe(device: torch.device) -> None:
     banner("7. full-size probe (N=64, D=1000, T=250, B=32) -- timing + memory")
     if device.type != "cuda":
@@ -220,6 +250,7 @@ def main() -> int:
     test_scalar_baseline(device)
     test_parameter_update(device)
     test_real_shd(device)
+    test_rate_stats()
     test_full_size_probe(device)
     banner("summary")
     if _failures:

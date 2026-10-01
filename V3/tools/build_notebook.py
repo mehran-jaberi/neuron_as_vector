@@ -140,16 +140,19 @@ model, the data loader or this notebook.  `D` and `N` are ordinary keys.
 """)
 
 py(r"""
+import json as _json
+
 CONFIG_FILE = V3_ROOT / "configs" / "v3_default.yaml"
 
 # Set V3_QUICK=1 in the environment to run a minutes-long smoke of the same
-# code path (small N, small D, few samples, few epochs).
+# code path (small N, small D, few samples, few epochs).  V3_OVERRIDES accepts a
+# JSON object of configuration overrides, e.g.
+#   V3_OVERRIDES='{"epochs": 2, "max_train_samples": 512}'
 QUICK = bool(int(os.environ.get("V3_QUICK", "0")))
 QUICK_OVERRIDES = dict(n_neurons=16, state_dim=64, mix_rank=8, n_bins=60,
-                       batch_size=16, epochs=2, max_train_samples=256, val_fraction=0.15)
-
-# explicit, visible overrides on top of the YAML file
-OVERRIDES: dict = {}
+                       batch_size=16, epochs=2, max_train_samples=256,
+                       val_fraction=0.15, tag="v3_quick_smoke")
+OVERRIDES: dict = _json.loads(os.environ.get("V3_OVERRIDES", "{}"))
 
 cfg = V3Config.from_yaml(CONFIG_FILE).with_overrides(**OVERRIDES)
 if QUICK:
@@ -158,6 +161,7 @@ cfg = cfg.resolved()
 
 print(f"config file : {CONFIG_FILE}")
 print(f"mode        : {'QUICK SMOKE' if QUICK else 'PRIMARY'}")
+print(f"overrides   : {OVERRIDES if OVERRIDES else '{}  (none)'}")
 print(f"device/dtype: {cfg.device} / {cfg.dtype}")
 print(f"tag         : {cfg.tag}")
 print(f"N (neurons) : {cfg.n_neurons}")
@@ -299,24 +303,36 @@ print(f"rate after calibration: {float(model.rate_hz(sp).mean()):.2f} Hz  "
 
 py(r"""
 # ---- structural check: the state really is (B, N, D) and really is fp16 ----
-x = torch.from_numpy(probe).to(device, non_blocking=True)
-z0 = model.init_state(x.shape[0], device)
-a = (x.reshape(-1, cfg.n_inputs).to(cfg.torch_dtype) @ model.w_in.to(cfg.torch_dtype)
-     ).reshape(x.shape[0], cfg.n_bins, cfg.state_dim)
-z1, s1, p1 = model._segment(z0, a)
+# Pure sanity check, so it runs under no_grad and frees its tensors: at D=1000 an
+# un-checkpointed 250-step forward *with* gradients builds an ~8 GiB graph, which
+# exceeds this 6 GiB device and would leave the notebook paging for the whole
+# session (measured: 333 s/batch instead of 2.2 s/batch).
+with torch.no_grad():
+    x = torch.from_numpy(probe).to(device, non_blocking=True)
+    z0 = model.init_state(x.shape[0], device)
+    a = (x.reshape(-1, cfg.n_inputs).to(cfg.torch_dtype) @ model.w_in.to(cfg.torch_dtype)
+         ).reshape(x.shape[0], cfg.n_bins, cfg.state_dim)
+    z1, s1, p1 = model._segment(z0, a)
 
-print(f"state z          : shape {tuple(z0.shape)}  dtype {z0.dtype}")
-print(f"state after 1 step: shape {tuple(z1.shape)}  dtype {z1.dtype}")
-print(f"spikes           : shape {tuple(s1.shape)}  values {sorted(set(s1.unique().tolist()))}")
-print(f"input projection a: shape {tuple(a.shape)}  dtype {a.dtype}")
+    print(f"state z          : shape {tuple(z0.shape)}  dtype {z0.dtype}")
+    print(f"state after 1 step: shape {tuple(z1.shape)}  dtype {z1.dtype}")
+    print(f"spikes           : shape {tuple(s1.shape)}  values {sorted(set(s1.unique().tolist()))}")
+    print(f"input projection a: shape {tuple(a.shape)}  dtype {a.dtype}")
 
-# the D coordinates must be coupled: perturbing coordinate 0 must move the others
-zb, _, _ = model._segment(torch.zeros_like(z1), a[:, :1])
-zt = torch.zeros_like(z1); zt[:, :, 0] = 0.9
-za, _, _ = model._segment(zt, a[:, :1])
-delta = (za[:, :, 1:] - zb[:, :, 1:]).abs().max().detach()
-print(f"coupling |delta z[1:]| from perturbing z[0] alone: {float(delta):.3e}"
-      + ("   (D=1: no other coordinate exists)" if cfg.state_dim == 1 else ""))
+    # the D coordinates must be coupled: perturbing coordinate 0 must move the others
+    zb, _, _ = model._segment(torch.zeros_like(z1), a[:, :1])
+    zt = torch.zeros_like(z1)
+    zt[:, :, 0] = 0.9
+    za, _, _ = model._segment(zt, a[:, :1])
+    delta = (za[:, :, 1:] - zb[:, :, 1:]).abs().max().detach()
+    print(f"coupling |delta z[1:]| from perturbing z[0] alone: {float(delta):.3e}"
+          + ("   (D=1: no other coordinate exists)" if cfg.state_dim == 1 else ""))
+
+del x, z0, z1, s1, p1, a, zb, zt, za
+torch.cuda.empty_cache()
+print(f"live CUDA memory after the sanity checks: "
+      f"{torch.cuda.memory_allocated() / 2**20:.0f} MiB allocated / "
+      f"{torch.cuda.memory_reserved() / 2**20:.0f} MiB reserved")
 
 # ---- surrogate gradient: autograd of gamma*u/(1+beta|u|) must match our backward ----
 u = torch.linspace(-3, 3, 25, dtype=torch.float64, requires_grad=True)
@@ -335,11 +351,16 @@ print(f"spike forward is a Heaviside: {surrogate_spike(torch.tensor([-1.0, 0.0, 
 
 py(r"""
 # ---- precision audit: what is fp16 and what is necessarily fp32 ----
+with torch.no_grad():
+    probe_logits, _ = model(torch.from_numpy(probe).to(device, non_blocking=True))
 print("parameter dtypes (fp32 master weights, kept fp32 by the optimizer):")
 print("   ", sorted({str(p.dtype) for p in model.parameters()}))
 print(f"state dtype used in the dynamics: {model.state_dtype}")
-print("logits dtype (computed in fp32 for a stable loss):",
-      str(model(torch.from_numpy(probe).to(device, non_blocking=True))[0].dtype))
+print(f"logits dtype (computed in fp32 for a stable loss): {probe_logits.dtype}")
+print(f"live CUDA memory now: {torch.cuda.memory_allocated() / 2**20:.0f} MiB allocated / "
+      f"{torch.cuda.memory_reserved() / 2**20:.0f} MiB reserved")
+del probe_logits
+torch.cuda.empty_cache()
 if device.type == "cuda":
     print(f"autocast: {cfg.amp}   GradScaler: enabled (fp16 activation gradients are rescaled)")
 """)
