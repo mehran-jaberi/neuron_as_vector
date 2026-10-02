@@ -17,13 +17,13 @@ test_h5: data/shd_test.h5
 n_inputs: 700
 n_classes: 20
 # Temporal discretization.  num_time_steps is DERIVED: T = duration / bin.
-#   1000 ms / 4 ms -> 250 steps  (default reference; float16 state)
-#   1000 ms / 2 ms -> 500 steps  (supported 2 ms experiment)
+#   1000 ms / 2 ms -> 500 steps  (DEFAULT; float16 state)
+#   1000 ms / 4 ms -> 250 steps  (historical reference discretization)
 # time_bin_ms is BOTH the SHD bin width AND the model integration step dt,
-# so alpha = dt/tau changes with it (4/tau vs 2/tau).
+# so alpha = dt/tau changes with it (2/tau vs 4/tau).
 timing:
   sequence_duration_ms: 1000
-  time_bin_ms: 4
+  time_bin_ms: 2
 binary_input: true     # >=1 event in a bin -> 1 (standard SHD encoding)
 val_fraction: 0.10     # stratified split of the TRAIN file only (monitoring)
 split_seed: 0
@@ -47,7 +47,7 @@ emit_identity_init: true
 
 # ---- training ----
 batch_size: 128
-epochs: 5            # primary control of how much training is performed
+epochs: 20            # primary control of how much training is performed
 max_train_batches: null  # null = use all training batches; an integer caps every
                          # epoch at that many batches (debug / smoke runs only;
                          # evaluation and testing always use the full splits)

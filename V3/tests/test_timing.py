@@ -18,10 +18,17 @@ from v3.model import VectorNeuronPopulation
 # ---------------------------------------------------------------------- #
 # timing derivation
 # ---------------------------------------------------------------------- #
-def test_default_timing_is_the_4ms_reference():
+def test_default_timing_is_the_2ms_reference():
     t = TimingConfig()
-    assert t.time_bin_ms == 4.0
+    assert t.time_bin_ms == 2.0
     assert t.sequence_duration_ms == 1000.0
+    assert t.num_time_steps == 500
+    assert t.simulation_dt_ms == 2.0
+    t.validate()
+
+
+def test_4ms_timing_gives_250_steps():
+    t = TimingConfig(sequence_duration_ms=1000.0, time_bin_ms=4.0)
     assert t.num_time_steps == 250
     assert t.simulation_dt_ms == 4.0
     t.validate()
@@ -78,7 +85,7 @@ def test_default_yaml_loads():
     from v3.config import V3_ROOT
 
     cfg = V3Config.from_yaml(V3_ROOT / "configs" / "v3_default.yaml")
-    assert cfg.num_time_steps == 250 and cfg.time_bin_ms == 4.0
+    assert cfg.num_time_steps == 500 and cfg.time_bin_ms == 2.0
     assert cfg.shuffle_train is True and cfg.shuffle_val is False
 
 

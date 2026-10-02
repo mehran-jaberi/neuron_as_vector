@@ -127,7 +127,7 @@ def test_real_shd(device: torch.device) -> None:
     small = Split("fit_small", sub, store.labels[sub], store.speakers[sub])
     check("split sizes", len(small) == 64 and len(val_split) > 0, f"{len(small)} / {len(val_split)}")
     xb = store.batch(sub[:4])
-    check("binning produces (B,T,C)", xb.shape == (4, 250, 700), str(xb.shape))
+    check("binning produces (B,T,C)", xb.shape == (4, cfg.n_bins, 700), str(xb.shape))
     check("binned input is binary", set(np.unique(xb).tolist()) <= {0.0, 1.0})
 
     model = VectorNeuronPopulation(cfg).to(device)
@@ -187,6 +187,10 @@ def test_rate_stats() -> None:
     s = torch.zeros(10, cfg.n_bins, 8)
     for j in range(8):
         s[:, :: (j + 1), j] = 1.0
+    # hand-computed expected counts from the construction (robust to T/dt)
+    counts = torch.tensor([int(np.ceil(cfg.n_bins / (j + 1))) for j in range(8)],
+                          dtype=torch.float64)
+    exp_mean, exp_spikes, exp_max = float(counts.mean()), float(counts.sum()), float(counts.max())
     st = _rate_stats(s, cfg)
     st1 = _rate_stats(s[:1], cfg)
     # a firing *rate* is intensive: it must not change with the number of samples.
@@ -198,20 +202,20 @@ def test_rate_stats() -> None:
     check("spikes per sample is invariant to the number of samples",
           abs(st["spikes_per_sample"] - st1["spikes_per_sample"]) < 1e-6,
           f"{st['spikes_per_sample']:.3f} vs {st1['spikes_per_sample']:.3f}")
-    # hand-computed from the construction: counts are 250,125,84,63,50,42,36,32
-    # (tolerance is fp32: the rates are computed as count/T/dt in float32)
+    # hand-computed from the construction (tolerance is fp32: count/T/dt in float32)
     check("mean rate matches the hand-computed value",
-          abs(st["rate_mean_hz"] - 85.25) < 1e-4, f"{st['rate_mean_hz']:.4f} Hz (expected 85.25)")
+          abs(st["rate_mean_hz"] - exp_mean) < 1e-4,
+          f"{st['rate_mean_hz']:.4f} Hz (expected {exp_mean:.4f})")
     check("spikes per sample matches the hand-computed value",
-          abs(st["spikes_per_sample"] - 682.0) < 1e-6, str(st["spikes_per_sample"]))
+          abs(st["spikes_per_sample"] - exp_spikes) < 1e-6, str(st["spikes_per_sample"]))
     check("no neuron is silent in this construction", st["silent_neurons"] == 0)
-    check("max rate is the always-firing neuron", abs(st["rate_max_hz"] - 250.0) < 1e-4,
-          f"{st['rate_max_hz']:.2f} Hz")
+    check("max rate is the always-firing neuron", abs(st["rate_max_hz"] - exp_max) < 1e-4,
+          f"{st['rate_max_hz']:.2f} Hz (expected {exp_max:.2f})")
 
 
 # ---------------------------------------------------------------------- #
 def test_full_size_probe(device: torch.device) -> None:
-    banner("7. full-size probe (N=64, D=1000, T=250, B=32) -- timing + memory")
+    banner(f"7. full-size probe (N=64, D=1000, T={V3Config().n_bins}, B=32) -- timing + memory")
     if device.type != "cuda":
         print("no CUDA -- skipped")
         return
@@ -221,7 +225,7 @@ def test_full_size_probe(device: torch.device) -> None:
     groups = parameter_groups(cfg)
     check("analytic parameter count matches", groups["total"] == model.n_parameters(),
           f"{model.n_parameters():,} params")
-    x = (torch.rand(32, 250, 700, device=device) < 0.045).to(cfg.torch_dtype)
+    x = (torch.rand(32, cfg.n_bins, 700, device=device) < 0.045).to(cfg.torch_dtype)
     y = torch.randint(0, 20, (32,), device=device)
     model.train()
     torch.cuda.reset_peak_memory_stats()

@@ -20,8 +20,8 @@ Implemented (see `README.md` §11 for the full description):
 - [x] the notebook registers completed runs through the **same**
       `v3.registry.register_run` entry point as the CLI (no second format)
 - [x] timing block (`sequence_duration_ms`, `time_bin_ms`) with the step count
-      **derived** and validated as an integer: 4 ms -> 250 steps (default),
-      2 ms -> 500 steps (supported); `time_bin_ms` is also the model `dt`
+      **derived** and validated as an integer: 2 ms -> 500 steps (**default**),
+      4 ms -> 250 steps (historical reference); `time_bin_ms` is also the model `dt`
 - [x] verified data order: fixed stratified FIT/VAL split, FIT shuffled per epoch
       (`shuffle_train`), deterministic VAL (`shuffle_val`), fresh state per batch
 - [x] focused tests in `V3/tests/` (noise, quantization, phase gating, timing,
@@ -90,7 +90,7 @@ active interface; if a feature is implemented it works, if it is not it lives he
 - [ ] multiple seeds per configuration (the single-seed result has no error bar)
 - [ ] stronger baselines: tuned LIF/ALIF SHD baselines, and the V2 LIF model
       (`sweep_l2_0`, test 0.5998) as an external reference point
-- [ ] `tau_ms` / `dt_ms` / `bin_ms` sweep (currently T=250 x 4 ms fixed)
+- [ ] `tau_ms` / `dt_ms` / `bin_ms` sweep (currently T=500 x 2 ms fixed)
 - [ ] speaker-held-out validation (the current VAL split is stratified, not
       speaker-independent - it cannot measure speaker generalisation)
 - [ ] learning-curve / dataset-size scaling

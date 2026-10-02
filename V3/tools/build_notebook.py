@@ -152,7 +152,7 @@ CONFIG_FILE = V3_ROOT / "configs" / "v3_default.yaml"
 #   V3_OVERRIDES='{"epochs": 2, "max_train_samples": 512}'
 QUICK = bool(int(os.environ.get("V3_QUICK", "0")))
 QUICK_OVERRIDES = dict(n_neurons=16, state_dim=64, mix_rank=8,
-                       timing=TimingConfig(sequence_duration_ms=240.0, time_bin_ms=4.0),
+                       timing=TimingConfig(sequence_duration_ms=240.0, time_bin_ms=2.0),
                        batch_size=16, epochs=2, max_train_samples=256,
                        val_fraction=0.15, tag="v3_quick_smoke")
 OVERRIDES: dict = _json.loads(os.environ.get("V3_OVERRIDES", "{}"))

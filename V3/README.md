@@ -102,7 +102,7 @@ $$
 | choice | reason |
 |---|---|
 | $\tanh$ on the vector argument | hard-bounds the state ($\lvert z\rvert \le 1$), which is what makes pure `fp16` safe. It is applied to $\mathbf m_i+\mathbf d_i$, so it does **not** decouple the $D$ coordinates; the coupling comes from $W_{down}W_{up}$, $W_{in}$ and $\mathbf h$. Any pointwise nonlinearity would do — it is not part of the hypothesis. |
-| state leak $\alpha = \Delta t/\tau$, $\tau = 20$ ms | standard leaky-integrator dynamics; $\Delta t$ = one 4 ms bin, so each bin is one dynamical step |
+| state leak $\alpha = \Delta t/\tau$, $\tau = 20$ ms | standard leaky-integrator dynamics; $\Delta t$ = one 2 ms bin, so each bin is one dynamical step |
 | $1/\sqrt N$ on the population signal | mean-field scaling: a sum of $N$ unit contributions has magnitude $\sim\sqrt N$; without it the drive (and the firing rate) grows with $N$ |
 | shared $W_{in}$, shared rank-$R$ mixing, shared $W_{emit}$ | the naive per-neuron $D\times D$ recurrent matrix would cost $N D^2 \approx 6.4\times10^7$ parameters *per neuron*. Sharing keeps the **state** genuinely $D$-dimensional while making the parameters affordable. |
 | `sum` readout, not `mean` | a mean readout shrinks the logit scale by $T$; the cross-entropy is then cheapest to reduce by raising firing rates, which saturates the population. Spike counts keep the logit scale in a sane range. |
@@ -127,7 +127,7 @@ baseline population *through the identical code path*.
 * Official event-based files: `data/shd_train.h5` (8156 samples, speakers
   `{0,1,2,3,6,7,8,9,10,11}`) and `data/shd_test.h5` (2264 samples, speakers
   `{0..11}` — speakers 4 and 5 never occur in the training file).
-* Events are binned onto `T x C = 250 x 700` with **4 ms bins** (a 1000 ms
+* Events are binned onto `T x C = 500 x 700` with **2 ms bins** (a 1000 ms
   window, one dynamical step per bin) and **binarised** (≥1 event in a bin → 1,
   the standard SHD encoding). The event/temporal structure is preserved; nothing
   is collapsed into a static feature vector.
@@ -185,11 +185,14 @@ occurs — unlike the fp16 problems seen in the Brian 2 experiment.
 
 ### GPU memory (the one thing that really bites)
 
-The 250-step backprop-through-time graph is the memory driver. Training uses
-chunked gradient checkpointing (`grad_checkpoint_chunks`), which stores the state
-only at chunk boundaries — measured peak over a full epoch at
+The 250-step (4 ms) backprop-through-time graph is the memory driver. Training
+uses chunked gradient checkpointing (`grad_checkpoint_chunks`), which stores the
+state only at chunk boundaries — measured peak over a full epoch at
 `N=64, D=1000, T=250, batch=128`: **1108 MiB allocated / 1148 MiB reserved**, with
-`nvidia-smi` reporting ~1.7 GiB in use and ~2.2 s per batch.
+`nvidia-smi` reporting ~1.7 GiB in use and ~2.2 s per batch. These figures were
+measured at the historical 4 ms discretization; the current default is 2 ms
+(`T=500`), which roughly doubles the step count (and therefore the time and
+memory per epoch) — reduce `grad_checkpoint_chunks` only if VRAM requires it.
 
 Two traps, both measured on the 6 GiB RTX 3060 Laptop:
 
@@ -324,7 +327,7 @@ V3/
   V3_SHD_experiment.ipynb       the primary deliverable, executed top to bottom
   configs/v3_default.yaml       every experimental parameter, in one place
   v3/config.py                  the configuration dataclass
-  v3/data.py                    SHD loading, 4 ms event binning, FIT/VAL/TEST splits
+  v3/data.py                    SHD loading, event binning at the configured bin width, FIT/VAL/TEST splits
   v3/model.py                   the vector-neuron population (the science)
   v3/train.py                   training / evaluation loops
   v3/experiment.py              orchestration used by BOTH the notebook and the CLI
@@ -495,6 +498,11 @@ Doubling $N$ (64→128) or $D$ (1000→2000) did not improve on the 79.81%
 reference, which is why this stage tests imprecision rather than more neurons or
 more dimensions.
 
+> **Note.** The 79.81% reference was measured at the **4 ms** discretization
+> (`T = 250`). The current default is **2 ms** (`T = 500`, `alpha = 0.1`); when
+> comparing against 79.81%, either run the 4 ms reference (`time_bin_ms: 4`) or
+> re-measure the reference at 2 ms.
+
 ## 13. Temporal resolution and data order
 
 ### Timing
@@ -505,7 +513,7 @@ is **derived**, never stored:
 ```yaml
 timing:
   sequence_duration_ms: 1000
-  time_bin_ms: 4          # T = 1000 / 4 = 250
+  time_bin_ms: 2          # T = 1000 / 2 = 500   (DEFAULT)
 ```
 
 `time_bin_ms` is both the SHD bin width **and** the model integration step `dt`
@@ -513,8 +521,8 @@ timing:
 
 | `time_bin_ms` | steps `T` | window | `alpha` (tau=20 ms) | status |
 |---|---|---|---|---|
-| 4 ms | 250 | 1000 ms | 0.2 | **default benchmark discretization** |
-| 2 ms | 500 | 1000 ms | 0.1 | **supported experimental resolution** |
+| 2 ms | 500 | 1000 ms | 0.1 | **default discretization** |
+| 4 ms | 250 | 1000 ms | 0.2 | historical reference (`time_bin_ms: 4`) |
 
 Events are binned **directly from the original timestamps** at the requested
 `time_bin_ms` (never by splitting the 4 ms bins in half). The same 1000 ms window
@@ -522,8 +530,8 @@ and the same truncation policy are used at both resolutions: events with
 `t < 1000 ms` are kept (`t = 0` goes to bin 0), the bin index is clamped to the
 last bin, and events at/after the cutoff are dropped. A non-integer
 `sequence_duration_ms / time_bin_ms` is rejected at configuration time. Switching
-to 2 ms changes `T`, `alpha` and the input tensor shape
-(`[B, 250, 700]` → `[B, 500, 700]`) with no special-casing anywhere.
+the default 2 ms to 4 ms changes `T`, `alpha` and the input tensor shape
+(`[B, 500, 700]` → `[B, 250, 700]`) with no special-casing anywhere.
 
 ### Data order (verified by `V3/tests/test_shuffle_and_state.py`)
 

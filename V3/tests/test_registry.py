@@ -164,12 +164,12 @@ def test_timing_and_shuffle_fields_are_recorded():
     assert row["shuffle_val"] is False
 
 
-def test_default_row_records_the_4ms_reference():
+def test_default_row_records_the_2ms_reference():
     row = run_row_from_variant(cfg=V3Config(), n_parameters=1)
     assert row["sequence_duration_ms"] == 1000.0
-    assert row["time_bin_ms"] == 4.0
-    assert row["num_time_steps"] == 250
-    assert row["simulation_dt_ms"] == 4.0
+    assert row["time_bin_ms"] == 2.0
+    assert row["num_time_steps"] == 500
+    assert row["simulation_dt_ms"] == 2.0
 
 
 def test_header_migration_preserves_old_rows(tmp_path):
@@ -209,7 +209,7 @@ def test_register_run_is_the_shared_entry_point(tmp_path):
     runs = reg.read_runs()
     assert len(runs) == 1
     assert runs[0]["test_correct"] == "16"
-    assert runs[0]["num_time_steps"] == "250"
+    assert runs[0]["num_time_steps"] == "500"
     assert runs[0]["notes"] == "notebook"
     assert (run_dir / "config.yaml").exists()
     assert (run_dir / "metrics.json").exists()

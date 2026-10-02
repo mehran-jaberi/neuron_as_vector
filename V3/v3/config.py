@@ -124,15 +124,17 @@ class TimingConfig:
 
     ``time_bin_ms`` is simultaneously the SHD bin width **and** the model's
     integration step ``dt`` (one bin == one dynamical step), so the leak factor
-    ``alpha = dt/tau`` changes with it: 4 ms -> ``alpha = 4/tau``,
-    2 ms -> ``alpha = 2/tau``.
+    ``alpha = dt/tau`` changes with it: 2 ms -> ``alpha = 2/tau``,
+    4 ms -> ``alpha = 4/tau``.
 
-    Defaults reproduce the reference discretization
-    (1000 ms / 4 ms -> 250 steps, ``alpha = 0.2`` at ``tau = 20 ms``).
+    Defaults are the **2 ms** discretization
+    (1000 ms / 2 ms -> 500 steps, ``alpha = 0.1`` at ``tau = 20 ms``).  The
+    historical 4 ms reference (250 steps, ``alpha = 0.2``) is still available by
+    setting ``time_bin_ms: 4``.
     """
 
     sequence_duration_ms: float = 1000.0
-    time_bin_ms: float = 4.0
+    time_bin_ms: float = 2.0
 
     @property
     def num_time_steps(self) -> int:
@@ -207,7 +209,7 @@ class V3Config:
 
     # ---- training --------------------------------------------------------
     batch_size: int = 32
-    epochs: int = 5             # primary control of how much training is done
+    epochs: int = 20             # primary control of how much training is done
     max_train_batches: int | None = None  # None = all batches; int = cap per epoch
     learning_rate: float = 2.0e-3
     weight_decay: float = 0.0

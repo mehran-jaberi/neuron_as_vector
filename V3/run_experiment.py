@@ -51,7 +51,7 @@ QUICK_OVERRIDES = dict(
     n_neurons=16,
     state_dim=64,
     mix_rank=8,
-    timing=TimingConfig(sequence_duration_ms=240.0, time_bin_ms=4.0),
+    timing=TimingConfig(sequence_duration_ms=240.0, time_bin_ms=2.0),
     batch_size=16,
     epochs=2,
     max_train_samples=256,
