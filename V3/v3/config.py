@@ -209,7 +209,7 @@ class V3Config:
 
     # ---- training --------------------------------------------------------
     batch_size: int = 32
-    epochs: int = 20             # primary control of how much training is done
+    epochs: int = 5             # primary control of how much training is done
     max_train_batches: int | None = None  # None = all batches; int = cap per epoch
     learning_rate: float = 2.0e-3
     weight_decay: float = 0.0
