@@ -1,15 +1,48 @@
 # V3 TODO
 
-## Immediate next step (deferred by request)
+## Current stage: controlled state imprecision (+ persistent run registry)
 
-- [x] get a measured full-dimensional result — done at **3 epochs**: vector
-      `D=1000` = **71.78%** (1625/2264), scalar `D=1` = **26.55%** (601/2264) on the
-      official SHD test set (see `RESULTS.md`)
-- [ ] **run the full 20-epoch schedule** (the value already in
-      `configs/v3_default.yaml`):
-      `.venv\Scripts\python.exe V3\tools\run_notebook.py` — ≈ 43 min for the
-      vector model + ≈ 22 min for the scalar baseline, plus evaluation. No code
-      change is needed; the notebook picks `epochs: 20` up from the YAML.
+Implemented (see `README.md` §11 for the full description):
+
+- [x] `state_regularization` block: `mode` ∈ {none, noise, quantization,
+      noise_quantization}, `noise_std`, `quantize_bits`, `quantize_clip`, and
+      per-phase `apply_during_training/validation/test` flags. Disabled by
+      default; `mode: none` is bit-identical to the baseline.
+- [x] noise applied to the **internal state** `z(t)` where the next timestep
+      reads it (not to the classifier input / labels / input data)
+- [x] differentiable STE state quantizer (dynamic range, bounded by the `tanh`
+      invariant, fp16-safe)
+- [x] training-only by default; validation and official test stay at full
+      precision unless explicitly enabled
+- [x] persistent registry: one row per completed run in `V3/results/runs.csv`
+      plus a timestamped `V3/results/<run_id>/` with `config.yaml`,
+      `metrics.json`, `confusion_matrix.csv`, `summary.txt`
+- [x] focused tests in `V3/tests/` (noise, quantization, phase gating, registry)
+
+### Screening (5 epochs; default stays 5, not 20)
+
+- [ ] baseline regression run (`mode: none`) — verify parity with the existing
+      model (same params, same forward logic, no numerical regression)
+- [ ] noise sweep: `std` ∈ {0.001, 0.005, 0.01, 0.02, 0.05}
+- [ ] quantization sweep: `bits` ∈ {16, 12, 8, 6, 4}
+- [ ] combined `noise_quantization` for the most promising single settings
+- [ ] 20-epoch rerun of the promising regime(s), compared against the
+      reference **79.81%** ($N=64$, $D=1000$, 2,025,440 params)
+
+The reference is already measured; the default epoch count was deliberately left
+at **5** so screening is cheap:
+
+```
+VECTOR  D=1000  N=64    2,025,440 params   test  1807/2264 = 79.81%
+```
+
+### Future imprecision work (not implemented)
+
+- [ ] per-neuron / per-coordinate quantization (currently one global scale)
+- [ ] learned or scheduled `noise_std` / `bits` (annealing)
+- [ ] other quantization schemes (logarithmic, stochastic rounding, QAT fake-quant)
+- [ ] adversarial / Worst-case state perturbation as a robustness probe
+- [ ] imprecision applied to the input drive or the emitted population signal
 
 Everything below is **not implemented**. Nothing in this file is wired into the
 active interface; if a feature is implemented it works, if it is not it lives here.

@@ -111,6 +111,7 @@ def train_one_epoch(
 ) -> dict:
     """One genuine pass over the training split.  ``progress`` is a tqdm bar."""
     model.train()
+    model.set_phase("train")
     it = BatchIterator(store, split, cfg.batch_size, shuffle=True, seed=cfg.seed, epoch=epoch)
     total_loss = total_ce = 0.0
     correct = total = 0
@@ -171,9 +172,17 @@ def evaluate(
     device: torch.device,
     collect_predictions: bool = False,
     progress=None,
+    phase: str = "val",
 ) -> dict:
-    """Loss / accuracy / rate statistics over a whole split.  No gradients."""
+    """Loss / accuracy / rate statistics over a whole split.  No gradients.
+
+    ``phase`` ("val" | "test") selects whether controlled state imprecision is
+    active during evaluation.  It defaults to "val", so the official test set must
+    be evaluated with ``phase="test"`` explicitly -- and even then noise /
+    quantization are off unless the experiment turns them on for test.
+    """
     model.eval()
+    model.set_phase(phase)
     it = BatchIterator(store, split, cfg.batch_size, shuffle=False, epoch=0)
     total_loss = total = correct = 0
     spk_all = []

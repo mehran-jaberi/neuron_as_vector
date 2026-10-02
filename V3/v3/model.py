@@ -74,6 +74,7 @@ import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
 from .config import V3Config
+from .state_regularization import regularize_state
 
 
 # ---------------------------------------------------------------------- #
@@ -154,6 +155,11 @@ class VectorNeuronPopulation(nn.Module):
         # so the population signal is divided by sqrt(N) to stay O(1) and to keep the
         # drive (and hence the firing rate) from growing with the number of neurons
         self.pop_scale = 1.0 / math.sqrt(N)
+        # phase that selects whether controlled state imprecision is active.
+        # None -> infer from training/eval mode.  Callers set it explicitly:
+        #   "train" during optimisation, "val" for validation, "test" for the
+        #   official test set.  Only training is perturbed by default.
+        self.state_reg_phase: str | None = None
 
     # ------------------------------------------------------------------ #
     def param_groups(self) -> dict:
@@ -161,6 +167,17 @@ class VectorNeuronPopulation(nn.Module):
 
     def n_parameters(self) -> int:
         return int(sum(p.numel() for p in self.parameters()))
+
+    def set_phase(self, phase: str) -> None:
+        """Select the phase ("train" | "val" | "test") for state imprecision."""
+        if phase not in ("train", "val", "test"):
+            raise ValueError(f"unknown phase {phase!r}")
+        self.state_reg_phase = phase
+
+    def _reg_phase(self) -> str:
+        if self.state_reg_phase is not None:
+            return self.state_reg_phase
+        return "train" if self.training else "val"
 
     def init_state(self, batch: int, device: torch.device) -> torch.Tensor:
         return torch.zeros(
@@ -211,6 +228,11 @@ class VectorNeuronPopulation(nn.Module):
             drive = gate * a_chunk[:, k].unsqueeze(1) + c.unsqueeze(-1) * h.unsqueeze(1) + bias
             z = z + alpha * (torch.tanh(mix + drive) - z)
             z = z.to(dt)
+            # controlled imprecision is applied to the *actual* state that the
+            # next timestep's spike generation / population signal / mixing read,
+            # so its effect genuinely propagates through the dynamics.
+            if self.cfg.state_regularization.mode != "none":
+                z = regularize_state(z, self.cfg.state_regularization, self._reg_phase())
         return z, torch.stack(spikes, dim=1), torch.stack(pots, dim=1)
 
     # ------------------------------------------------------------------ #

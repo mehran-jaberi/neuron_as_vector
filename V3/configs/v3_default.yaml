@@ -58,6 +58,20 @@ amp: true
 grad_checkpoint_chunks: 10
 select_best_val: true
 
+# ---- controlled state imprecision (the imprecision-stage experiment) ----
+# Applied to the neuron's internal vector state z(t), independently of `dtype`
+# (which is the training arithmetic).  `mode: none` reproduces the baseline.
+# Screening values: noise_std 0.001 / 0.005 / 0.01 / 0.02 / 0.05;
+#                   quantize_bits 16 / 12 / 8 / 6 / 4.
+state_regularization:
+  mode: none                      # none | noise | quantization | noise_quantization
+  noise_std: 0.01                 # sigma of z <- z + N(0, sigma^2)
+  quantize_bits: 8                # symmetric straight-through quantizer
+  quantize_clip: 1.0              # |z| bound (tanh invariant; safety guard)
+  apply_during_training: true     # training-time regularization (default)
+  apply_during_validation: false  # validation stays at full precision
+  apply_during_test: false        # official test stays at full precision
+
 # ---- io ----
 out_dir: results
 ckpt_dir: checkpoints

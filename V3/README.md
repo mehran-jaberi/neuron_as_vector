@@ -6,7 +6,13 @@
 > **Answer (executed, 3 epochs, single seed).** **71.78%** — 1625 of the 2264
 official SHD test samples. The identical population with scalar neurons
 ($D=1$, same 64 neurons, same training) reaches **26.55%**. See [§8](#8-results)
-and `RESULTS.md`. The YAML's default 20-epoch schedule is the deferred next run.
+> and `RESULTS.md`.
+>
+> **Current experimental reference (20 epochs, single seed).** $N=64$, $D=1000$,
+> 2,025,440 parameters: **79.81%** — 1807/2264 official SHD test samples
+> (recorded in `V3_SHD_experiment.ipynb`, cells with the final test evaluation).
+> The current stage tests **controlled state imprecision** on top of this
+> reference; see [§11](#11-controlled-state-imprecision--the-run-registry).
 
 This folder is an independent experiment. It is **not** an extension of V2 and
 does not import, modify or reproduce any of the V2 architecture
@@ -323,11 +329,16 @@ V3/
   v3/train.py                   training / evaluation loops
   v3/experiment.py              orchestration used by BOTH the notebook and the CLI
   v3/plots.py                   training and test figures
+  v3/state_regularization.py    controlled state noise + STE quantization
+  v3/registry.py                persistent run registry (runs.csv + per-run dirs)
+  tests/conftest.py             puts V3/ on sys.path for the isolated test module
+  tests/test_state_regularization.py  focused noise/quantization/phase tests
+  tests/test_registry.py        focused registry tests
   run_experiment.py             headless CLI
   run_smoke_test.py             mechanics / precision / VRAM smoke test
   tools/build_notebook.py       assembles the .ipynb from its cell list
   tools/run_notebook.py         executes the .ipynb with a real kernel
-  results/ checkpoints/ figures/  outputs
+  results/ checkpoints/ figures/  outputs (results/runs.csv = the registry)
 ```
 
 ## 10. Known limitations
@@ -350,4 +361,128 @@ V3/
    vector-neuron population; throughput optimisation, architecture search and
    longer schedules are all in `TODO.md`.
 7. `V3/run_smoke_test.py` is a standalone script, not a `pytest` module; it lives
-   outside the repository's `tests/` suite on purpose (V3 is isolated).
+   outside the repository's `tests/` suite on purpose (V3 is isolated). The
+   focused unit/regression tests live in `V3/tests/` (also isolated).
+
+## 11. Controlled state imprecision + the run registry
+
+This stage asks one question only:
+
+> Does deliberately reducing the precision of each neuron's internal vector state
+> improve SHD generalization?
+
+It changes **nothing** about the architecture, the data, the optimizer, the
+scheduler or the readout. The only new manipulation is a perturbation applied to
+the neuron state $\mathbf z(t)$ at the point where the next timestep reads it.
+
+### Three distinct notions of "precision" (kept explicit)
+
+| # | what | where |
+|---|---|---|
+| 1 | training arithmetic dtype (`fp16` state, autocast, `GradScaler`) | `dtype` / `amp` |
+| 2 | precision of the state representation | `state_regularization.quantize_bits` |
+| 3 | stochastic perturbation of the state | `state_regularization.noise_std` |
+
+Ordinary fp16/mixed-precision training is **not** the experiment. The experiment
+is (2) and/or (3), applied deliberately and configurably.
+
+### Modes
+
+Configured in one block, disabled by default:
+
+```yaml
+state_regularization:
+  mode: none          # none | noise | quantization | noise_quantization
+  noise_std: 0.01
+  quantize_bits: 8
+  quantize_clip: 1.0
+  apply_during_training: true
+  apply_during_validation: false
+  apply_during_test: false
+```
+
+* **noise** — $\mathbf z \leftarrow \mathbf z + \epsilon$, $\epsilon\sim N(0,\sigma^2)$.
+* **quantization** — a symmetric, dynamic-range uniform quantizer with a
+  straight-through estimator: `scale = clamp(max|z|, eps, clip)`,
+  `q = round(clamp(z/scale * (2^(b-1)-1), -levels, levels))`,
+  `z_q = q/levels*scale`, and the backward pass is the identity
+  (`z + (z_q - z).detach()`). The forward pass is genuinely quantized, training
+  stays end-to-end. `scale` is detached; the range is bounded by `clip` (the
+  `tanh` invariant $|z|\le 1$) and floored at `eps` so a degenerate range cannot
+  amplify float noise.
+* **noise_quantization** — quantize, then add noise.
+
+A final `clamp(-1, 1)` preserves the $\tanh$ bound the fp16 path relies on.
+
+### Phase behaviour
+
+The perturbation is **training-only by default** (a regularizer). Validation and
+the official test evaluation run at full precision unless the experiment opts in
+via `apply_during_validation` / `apply_during_test`. This separates
+*training-time regularization* from *deliberately degraded inference*; the two are
+never conflated. Because `mode: none` short-circuits before any tensor op, the
+default configuration is the exact baseline.
+
+### Run registry
+
+Every completed run appends exactly one row to `V3/results/runs.csv` and writes a
+timestamped directory:
+
+```
+V3/results/
+  runs.csv
+  2026-10-02_00-15-30/
+    config.yaml            # the exact configuration used
+    metrics.json           # fit / val / test metrics (no big arrays)
+    confusion_matrix.csv
+    summary.txt
+```
+
+The row records timestamp, run id, `N`, `D`, parameters, epochs, seed, batch size,
+learning rate, optimizer, scheduler, training precision, noise/quantization
+settings (mode, std, bits, enabled), train/val/test accuracy, correct/total,
+English (0-9) and German (10-19) accuracy, durations, checkpoint path and notes.
+Run ids come from the **local system time** (`%Y-%m-%d_%H-%M-%S`, disambiguated
+with a `_NN` suffix on collision). The registry is append-only and never
+overwrites. Test confusion matrices are diagnostics, never a training signal.
+
+### Screening workflow
+
+Each full run is ≈1.5 h, so the default epoch count stays at **5** (the reference
+is re-run at 20 epochs only after screening). The runner accepts dotted overrides,
+so no YAML edits are needed between runs:
+
+```powershell
+# baseline (mode none) — should land near the 5-epoch reference
+.venv\Scripts\python.exe V3\run_experiment.py --variant vector
+
+# noise sweep
+.venv\Scripts\python.exe V3\run_experiment.py --variant vector `
+  --override state_regularization.mode=noise --override state_regularization.noise_std=0.01
+
+# quantization sweep
+.venv\Scripts\python.exe V3\run_experiment.py --variant vector `
+  --override state_regularization.mode=quantization --override state_regularization.quantize_bits=8
+```
+
+Suggested screening values: `noise_std` ∈ {0.001, 0.005, 0.01, 0.02, 0.05};
+`quantize_bits` ∈ {16, 12, 8, 6, 4}. Nothing launches a grid automatically — each
+command runs exactly one configuration and records exactly one row.
+
+## 12. Current experimental reference
+
+```
+N = 64    D = 1000    epochs = 20    params = 2,025,440
+```
+
+```
+VECTOR  D=1000  N=64    2,025,440 params   test  1807/2264 =  79.81%
+```
+
+Verified from the executed `V3_SHD_experiment.ipynb` (the stored test evaluation
+cells). This is the number every imprecision screening run is compared against.
+Older measured points (all single-seed): $D=1000$ at 3 epochs = 71.78%; scalar
+$D=1$ at 3 epochs = 26.55%; $N=128$, $D=1000$ = 79.24%; $N=64$, $D=2000$ = 77.96%.
+Doubling $N$ (64→128) or $D$ (1000→2000) did not improve on the 79.81%
+reference, which is why this stage tests imprecision rather than more neurons or
+more dimensions.

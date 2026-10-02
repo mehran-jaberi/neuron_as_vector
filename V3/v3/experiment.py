@@ -216,7 +216,8 @@ def test_variant(
 
     bar = tqdm(total=len(BatchIterator(store, split, cfg.batch_size, shuffle=False)),
                desc="test", unit="batch", leave=False, disable=not show_progress, mininterval=2.0)
-    metrics = evaluate(model, store, split, cfg, device, collect_predictions=True, progress=bar)
+    metrics = evaluate(model, store, split, cfg, device, collect_predictions=True,
+                       progress=bar, phase="test")
     bar.close()
 
     logits = metrics.pop("logits")

@@ -19,13 +19,98 @@ from __future__ import annotations
 import dataclasses
 import json
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import yaml
 
 V3_ROOT = Path(__file__).resolve().parent.parent
 REPO_ROOT = V3_ROOT.parent
+
+
+@dataclass
+class StateRegularizationConfig:
+    """Controlled imprecision applied to the neuron internal state ``z(t)``.
+
+    This is **not** about the numerical datatype of the model.  ``V3Config.dtype``
+    / ``amp`` decide how CUDA stores and multiplies numbers (fp16 state, fp32
+    masters, autocast/GradScaler); this object decides whether the *internal
+    vector state itself* is deliberately perturbed or quantized.
+
+    Three separate knobs, kept explicit:
+
+    1. training arithmetic dtype  -> ``V3Config.dtype`` / ``amp``
+    2. precision of the state      -> ``quantize_bits`` here
+    3. stochastic perturbation     -> ``noise_std`` here
+
+    Modes
+    -----
+    ``none``               state untouched (baseline; default).
+    ``noise``              ``z <- z + N(0, std^2)``.
+    ``quantization``       ``z <- Q(z)`` symmetric straight-through quantizer.
+    ``noise_quantization`` quantize first, then add noise.
+
+    The ``apply_during_*`` flags choose the phase.  Default is **training only**:
+    the perturbation acts as a training-time regularizer and inference (validation
+    / the official test set) stays at full precision unless explicitly requested.
+    """
+
+    mode: str = "none"
+    noise_std: float = 0.0        # 0.001 .. 0.05 for the screening sweep
+    quantize_bits: int = 8        # 16 / 12 / 8 / 6 / 4 for the screening sweep
+    quantize_clip: float = 1.0    # max magnitude of z (tanh bound; safety guard)
+    apply_during_training: bool = True
+    apply_during_validation: bool = False
+    apply_during_test: bool = False
+
+    MODES = ("none", "noise", "quantization", "noise_quantization")
+
+    @property
+    def uses_noise(self) -> bool:
+        return self.mode in ("noise", "noise_quantization")
+
+    @property
+    def uses_quantization(self) -> bool:
+        return self.mode in ("quantization", "noise_quantization")
+
+    @property
+    def noise_enabled(self) -> bool:
+        """Noise is genuinely active (mode selects it and the std is positive)."""
+        return self.uses_noise and float(self.noise_std) > 0.0
+
+    @property
+    def quantization_enabled(self) -> bool:
+        return self.uses_quantization
+
+    def phase_active(self, phase: str) -> bool:
+        """Whether the perturbation is applied in ``phase`` (train | val | test)."""
+        if self.mode == "none":
+            return False
+        if phase == "train":
+            return bool(self.apply_during_training)
+        if phase == "val":
+            return bool(self.apply_during_validation)
+        if phase == "test":
+            return bool(self.apply_during_test)
+        raise ValueError(f"unknown phase {phase!r} (expected train | val | test)")
+
+    def validate(self) -> None:
+        if self.mode not in self.MODES:
+            raise ValueError(f"state_regularization.mode must be one of {self.MODES}, got {self.mode!r}")
+        if float(self.noise_std) < 0.0:
+            raise ValueError("state_regularization.noise_std must be >= 0")
+        if not 2 <= int(self.quantize_bits) <= 16:
+            raise ValueError("state_regularization.quantize_bits must be in [2, 16]")
+        if float(self.quantize_clip) <= 0.0:
+            raise ValueError("state_regularization.quantize_clip must be > 0")
+
+    @classmethod
+    def from_dict(cls, data: dict, strict: bool = False) -> "StateRegularizationConfig":
+        known = {f.name for f in dataclasses.fields(cls)}
+        unknown = set(data) - known
+        if unknown and strict:
+            raise ValueError(f"unknown state_regularization keys: {sorted(unknown)}")
+        return cls(**{k: v for k, v in data.items() if k in known})
 
 
 @dataclass
@@ -80,6 +165,15 @@ class V3Config:
     amp: bool = True             # autocast + GradScaler for fp32 master params
     grad_checkpoint_chunks: int = 10  # split T into this many checkpointed chunks
     select_best_val: bool = True      # keep the best-validation-accuracy epoch as secondary
+
+    # ---- controlled state imprecision (disabled by default) --------------
+    # This is the *only* new scientific manipulation in the imprecision stage: it
+    # deliberately perturbs/quantizes the neuron's internal vector state z(t).
+    # It is independent of `dtype`/`amp` (the training arithmetic).  Default
+    # `mode="none"` reproduces the baseline exactly.
+    state_regularization: StateRegularizationConfig = field(
+        default_factory=StateRegularizationConfig
+    )
 
     # ---- io --------------------------------------------------------------
     out_dir: str = "results"        # resolved relative to V3/ when not absolute
@@ -138,6 +232,7 @@ class V3Config:
             raise ValueError("grad_checkpoint_chunks must be >= 1")
         if self.max_train_batches is not None and int(self.max_train_batches) < 1:
             raise ValueError("max_train_batches must be null (all batches) or >= 1")
+        self.state_regularization.validate()
 
     # ------------------------------------------------------------------ #
     def to_dict(self) -> dict:
@@ -175,7 +270,13 @@ class V3Config:
         unknown = set(data) - known - {"derived"}
         if unknown and strict:
             raise ValueError(f"unknown configuration keys: {sorted(unknown)}")
-        kwargs = {k: v for k, v in data.items() if k in known}
+        kwargs = {}
+        for k, v in data.items():
+            if k not in known:
+                continue
+            if k == "state_regularization" and isinstance(v, dict):
+                v = StateRegularizationConfig.from_dict(v, strict=strict)
+            kwargs[k] = v
         return cls(**kwargs)
 
     @classmethod
@@ -190,11 +291,12 @@ class V3Config:
 
 def describe(cfg: V3Config) -> str:
     """Short human-readable summary used in logs and notebook output."""
+    reg = cfg.state_regularization
     return (
         f"V3Config(tag={cfg.tag!r}, N={cfg.n_neurons}, D={cfg.state_dim}, "
         f"T={cfg.n_bins}x{cfg.bin_ms:g}ms={cfg.duration_s:g}s, "
         f"batch={cfg.batch_size}, epochs={cfg.epochs}, lr={cfg.learning_rate:g}, "
-        f"device={cfg.device}, dtype={cfg.dtype})"
+        f"device={cfg.device}, dtype={cfg.dtype}, state_reg={reg.mode})"
     )
 
 
@@ -217,4 +319,12 @@ def parameter_groups(cfg: V3Config) -> dict:
     return groups
 
 
-__all__ = ["V3Config", "V3_ROOT", "REPO_ROOT", "describe", "parameter_groups", "math"]
+__all__ = [
+    "V3Config",
+    "StateRegularizationConfig",
+    "V3_ROOT",
+    "REPO_ROOT",
+    "describe",
+    "parameter_groups",
+    "math",
+]
