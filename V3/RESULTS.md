@@ -1,18 +1,20 @@
 # V3 results
 
 Measured numbers only. Every value below comes from the executed
-`V3_SHD_experiment.ipynb` (19/19 code cells, zero errors, 712 s wall; executed
-top-to-bottom with a real Jupyter kernel by `V3/tools/run_notebook.py`,
-`V3_QUICK` unset, `V3_OVERRIDES='{"epochs": 3}'`) and from the artifacts that run
-wrote under `V3/results/`, `V3/checkpoints/` and `V3/figures/`.
+`V3_SHD_experiment.ipynb` (20 code cells, zero errors; executed top-to-bottom
+with a real Jupyter kernel by `V3/tools/run_notebook.py`, `V3_QUICK` unset, the
+YAML default `epochs: 20`) and from the artifacts that run wrote under
+`V3/results/`, `V3/checkpoints/` and `V3/figures/`. The same run is recorded in
+the registry as `V3/results/runs.csv` row `2026-10-02_14-31-15` and under
+`V3/results/2026-10-02_14-31-15/`.
 
 Those three directories are ignored by the repository's root `.gitignore` (the
 repository's convention), so the numbers are reproduced in full here and in the
 notebook itself.
 
-The **committed execution uses a 3-epoch schedule** so the turnaround stays short.
-The YAML default is `epochs: 20`; that full run is deferred and is one command
-away (see §8).
+The **default temporal discretization is now 2 ms** (500 steps, $\alpha = 0.1$).
+The previous 4 ms reference (250 steps, $\alpha = 0.2$) is retained for comparison
+(see the note at the end of §1).
 
 **Configuration** (`configs/v3_default.yaml`, `seed = 0`, **one seed — no error bar**):
 
@@ -21,11 +23,11 @@ away (see §8).
 | neurons `N` | 64 | 64 |
 | state dimension `D` | **1000** | **1** |
 | trainable parameters | 2,025,440 | 6,335 |
-| epochs / batch | 3 / 128 | 3 / 128 |
+| epochs / batch | 20 / 128 | 20 / 128 |
 | optimizer / schedule | Adam, lr 1e-3, cosine, 3% warmup, clip 1.0 | same |
 | loss | CE + 1e-4·(rate − 10 Hz)² | same |
 | data | SHD, FIT 7340 / VAL 816 (stratified split of the train file) | same |
-| temporal resolution | 250 × 4 ms = 1000 ms, binary input | same |
+| temporal resolution | **500 × 2 ms = 1000 ms**, binary input (dt = 2 ms, α = dt/τ = 0.1) | same |
 | surrogate | fast sigmoid γu/(1+β\|u\|), β=4, γ=1 | same |
 | device / dtype | CUDA (RTX 3060 Laptop, 6 GiB) / fp16 state, fp32 masters + loss | same |
 
@@ -34,39 +36,61 @@ away (see §8).
 ```
 PRIMARY RESULT — official SHD test set, 2264 samples, frozen parameters
 
-VECTOR  D=1000   correct:  1625
+VECTOR  D=1000   correct:  1868
 VECTOR  D=1000   total:    2264
-VECTOR  D=1000   accuracy: 71.78%
+VECTOR  D=1000   accuracy: 82.51%
 
-SCALAR  D=1      correct:   601
-SCALAR  D=1      total:    2264
-SCALAR  D=1      accuracy: 26.55%
+SCALAR  D=1     correct:  1119
+SCALAR  D=1     total:    2264
+SCALAR  D=1     accuracy: 49.43%
 
-vector − scalar = +45.23 percentage points
+vector − scalar = +33.08 percentage points
 ```
 
-Reference points (not measured in this run): a plain recurrent SHD baseline is
-usually quoted around 71%; the repository's own V2 LIF model (N=256, T=1400 ms,
-2 ms bins, 20 epochs) measured **59.98%** on the same test file
-(`checkpoints/sweep_l2_0.pt`, `results/lif_baseline_selection.json`).
+Reference points: a plain recurrent SHD baseline is usually quoted around 71%;
+the repository's own V2 LIF model (N=256, T=1400 ms, 2 ms bins, 20 epochs)
+measured **59.98%** on the same test file (`checkpoints/sweep_l2_0.pt`,
+`results/lif_baseline_selection.json`).  The previous V3 reference — the same
+$N=64$, $D=1000$ population at the **4 ms** discretization ($T=250$, α = 0.2),
+20 epochs — measured **79.81%** (1807/2264). The 2 ms run is **+2.70 percentage
+points** above that, i.e. halving the time step and the leak `alpha` improved the
+benchmark rather than merely changing its resolution.
 
 ## 2. Training
 
-Vector (`D=1000`, 2,025,440 parameters):
+Vector (`D=1000`, 2,025,440 parameters, 20 epochs, 2 ms):
 
-| epoch | train loss | train CE | train acc | val loss | val acc | firing rate | spikes/sample | epoch time |
+| epoch | train loss | train CE | train acc | val loss | val acc | rate | spikes/sample | epoch time |
 |---|---|---|---|---|---|---|---|---|
-| 1 | 1.7030 | 1.6665 | 45.33% | 0.9983 | 67.16% | 19.21 Hz | 1229 | 160.7 s |
-| 2 | 0.7629 | 0.7164 | 77.26% | 0.6061 | 83.82% | 23.65 Hz | 1514 | 136.6 s |
-| 3 | 0.4701 | 0.4268 | 88.01% | 0.4903 | 86.89% | 24.72 Hz | 1582 | 131.5 s |
+| 1 | 1.9840 | 1.9180 | 37.26% | 1.2104 | 61.89% | 24.55 Hz | 1571 | 220.9 s |
+| 2 | 0.9246 | 0.8527 | 70.53% | 0.7634 | 75.61% | 27.60 Hz | 1766 | 204.0 s |
+| 3 | 0.6011 | 0.5402 | 81.06% | 0.5042 | 84.44% | 27.34 Hz | 1750 | 204.6 s |
+| 4 | 0.4743 | 0.4249 | 85.48% | 0.4043 | 88.11% | 25.68 Hz | 1643 | 204.2 s |
+| 5 | 0.3424 | 0.2998 | 90.18% | 0.4536 | 86.52% | 25.26 Hz | 1617 | 204.3 s |
+| 6 | 0.3052 | 0.2663 | 91.13% | 0.4700 | 85.05% | 23.91 Hz | 1530 | 204.0 s |
+| 7 | 0.2308 | 0.1948 | 93.56% | 0.3842 | 87.50% | 23.54 Hz | 1507 | 204.2 s |
+| 8 | 0.1876 | 0.1538 | 94.84% | 0.2222 | 94.36% | 23.28 Hz | 1490 | 204.6 s |
+| 9 | 0.1575 | 0.1293 | 95.59% | 0.2409 | 92.40% | 22.66 Hz | 1450 | 205.8 s |
+| 10 | 0.1295 | 0.1020 | 96.54% | 0.2330 | 93.38% | 22.18 Hz | 1420 | 203.7 s |
+| 11 | 0.0972 | 0.0747 | 97.74% | 0.1522 | 95.71% | 21.56 Hz | 1380 | 204.2 s |
+| 12 | 0.0704 | 0.0516 | 98.60% | 0.1589 | 95.22% | 21.00 Hz | 1344 | 204.0 s |
+| 13 | 0.0499 | 0.0330 | 99.21% | 0.1358 | 96.20% | 20.70 Hz | 1325 | 203.7 s |
+| 14 | 0.0381 | 0.0240 | 99.51% | 0.1221 | 96.08% | 19.84 Hz | 1270 | 203.9 s |
+| 15 | 0.0282 | 0.0161 | 99.70% | 0.1136 | 96.08% | 19.17 Hz | 1227 | 203.7 s |
+| **16** | 0.0208 | 0.0106 | 99.90% | **0.1021** | **97.67%** | 18.66 Hz | 1195 | 207.0 s |
+| 17 | 0.0173 | 0.0085 | 99.93% | 0.1200 | 96.45% | 18.07 Hz | 1157 | 201.7 s |
+| 18 | 0.0152 | 0.0067 | 99.99% | 0.1162 | 96.57% | 17.98 Hz | 1151 | 203.9 s |
+| 19 | 0.0137 | 0.0057 | 100.00% | 0.1135 | 96.69% | 17.77 Hz | 1137 | 204.0 s |
+| 20 | 0.0135 | 0.0057 | 100.00% | 0.1129 | 96.32% | 17.71 Hz | 1133 | 204.4 s |
 
-total 445.5 s; FIT accuracy over the whole training split 90.35%; best-validation
-epoch = 3 (val 0.8689). The first epoch is slower because it also fills the in-RAM
-event cache.
+total 4243.5 s (≈ 204 s/epoch; the first epoch is slower because it also fills
+the in-RAM event cache); FIT accuracy over the whole training split **100.00%**
+(loss 0.0134); best-validation epoch = **16** (val 0.9767). The population closes
+the FIT/VAL gap by epoch 8 and then mildly overfits (train 100% vs val 96.3% at
+epoch 20); the final (not best-val) weights are what §3 evaluates.
 
-Scalar (`D=1`, 6,335 parameters): train acc 12.90% → 20.42% → 23.66%, val acc
-18.63% → 24.88% → 24.63%, 8.73 → 11.01 Hz, epochs 61.3 / 40.8 / 41.6 s, total
-151.0 s; FIT accuracy 24.29%.
+Scalar (`D=1`, 6,335 parameters, 20 epochs, 2 ms): FIT accuracy **58.01%**,
+VAL **53.68%**, 1380.6 s total (≈ 69 s/epoch).
 
 ## 3. Test
 
@@ -76,26 +100,30 @@ disabled, every sample evaluated, no early stopping and no selection on test.
 
 | | vector `D=1000` | scalar `D=1` |
 |---|---|---|
-| correct | **1625** | 601 |
+| correct | **1868** | **1119** |
 | total | 2264 | 2264 |
-| accuracy | **71.78%** | 26.55% |
-| errors | 639 | 1663 |
-| loss (CE + rate reg) | 0.893 | 2.303 |
-| mean / median / p90 / max rate | 24.09 / 21.55 / 38.66 / 95.45 Hz | 10.72 / 5.21 / 24.98 / 66.23 Hz |
-| silent neurons (of 64) | 0 | 10 |
-| spikes per sample | 1542 | 686 |
-| per-class accuracy min / median / max | 37.0% / 72.0% / 100.0% | 0.0% / 25.4% / 68.8% |
-| classes with recall < 10% | **0** | 5 |
-| English digits 0–9 / German 10–19 | 74.91% / 68.42% | 23.18% / 29.57% |
-| peak CUDA memory | 1283 MiB allocated / 1330 MiB reserved | 144 MiB |
-| test pass wall time | 18.8 s | 10.3 s |
+| accuracy | **82.51%** | **49.43%** |
+| errors | 396 | 1145 |
+| loss (CE + rate reg) | 0.7728 | not recorded |
+| mean / median / p90 / max rate | 18.22 / 17.71 / 25.10 / 37.02 Hz | not recorded |
+| silent neurons (of 64) | 0 | not recorded |
+| spikes per sample | 1166 | not recorded |
+| per-class accuracy min / median / max | 38.8% / 88.6% / 100.0% | not recorded |
+| classes with recall < 10% | **0** | not recorded |
+| English digits 0–9 / German 10–19 | 90.31% / 75.08% | not recorded |
+| peak CUDA memory | 2284 MiB allocated / 2328 MiB reserved | not recorded |
+| test pass wall time | 24.1 s | not recorded |
 
-Both models heal their firing rates during training (calibration starts at 10.5 Hz;
-the vector population settles at ~24 Hz, well below saturation, with no silent
-neurons and a 95 Hz maximum).
+The vector population arrives at a healthy, non-saturated regime (18.2 Hz mean,
+37.0 Hz maximum, no silent neurons) and its errors are concentrated in a few
+German-digit confusions. The largest off-diagonal confusions (true → predicted,
+count) are: `13 → 5` (49), `19 → 9` (32), `17 → 3` (26), `2 → 0` (21),
+`17 → 7` (19), `12 → 13` (17); the weakest class is 17 (recall 38.8%) and the
+strongest are 4 and 18 (100%).
 
 Predictions, logits, the confusion matrix and per-class accuracy are saved under
-`V3/results/<tag>/`; the figures are in `V3/figures/<tag>/`.
+`V3/results/<tag>/` and in the run directory `V3/results/2026-10-02_14-31-15/`;
+the figures are in `V3/figures/<tag>/`.
 
 ## 4. Activity figures
 
@@ -117,17 +145,18 @@ three test samples and one FIT sample.
 ## 6. Resource use
 
 * Peak CUDA memory over a **full training epoch** (probe at batch 128 with
-  `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`): **1108 MiB allocated,
-  1148 MiB reserved**; `nvidia-smi` reports **~1.7 GiB** in use during the
-  notebook run (the rest is the desktop's own GPU usage on this WDDM machine).
-* Throughput: **2.2 s per training batch** measured in isolation at
-  `N=64, D=1000, T=250, batch=128` (≈ 58 samples/s), i.e. ≈ 2.1 min per epoch of
-  7340 training samples. Batch size barely matters (63 → 78 samples/s from
-  batch 32 → 256), so the Python-level 250-step loop, not the FLOPs, is the
-  bottleneck — see `TODO.md`. The notebook run additionally pays host-side event
-  binning, giving ≈ 3.5 s per batch in the first epoch.
-* The D=1 scalar baseline is roughly twice as fast per batch: its per-neuron state
-  is one number, so the rank-R mixing and the `D×D` emission disappear.
+  `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`): **2284 MiB allocated,
+  2328 MiB reserved** at the 2 ms discretization (`N=64, D=1000, T=500`).
+* Throughput at 2 ms: **4243.5 s for 20 vector epochs** (≈ 204 s/epoch, ≈ 3.5 s
+  per training batch of 128, ≈ 36 samples/s) and **24.1 s for the full 2264-sample
+  test pass**. Halving the time step doubles `T` (250 → 500), which is why the
+  per-epoch time and memory are roughly double the 4 ms reference
+  (`N=64, D=1000, T=250, batch=128`: 1108 MiB allocated / 1148 MiB reserved, ≈ 2.2 s
+  per batch). The Python-level per-step loop, not the FLOPs, is the bottleneck —
+  see `TODO.md`.
+* The D=1 scalar baseline is much faster per batch (1380.6 s for 20 epochs,
+  ≈ 69 s/epoch, ≈ 3× faster per epoch): its per-neuron state is one number, so the
+  rank-R mixing and the `D×D` emission disappear.
 
 ## 7. What failed or had to be changed
 

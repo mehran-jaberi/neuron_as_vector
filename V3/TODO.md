@@ -27,23 +27,38 @@ Implemented (see `README.md` §11 for the full description):
 - [x] focused tests in `V3/tests/` (noise, quantization, phase gating, timing,
       SHD binning, shuffle/state reset, registry)
 
-### Screening (5 epochs; default stays 5, not 20)
+### Screening status
 
-- [ ] baseline regression run (`mode: none`) — verify parity with the existing
-      model (same params, same forward logic, no numerical regression)
-- [ ] noise sweep: `std` ∈ {0.001, 0.005, 0.01, 0.02, 0.05}
-- [ ] quantization sweep: `bits` ∈ {16, 12, 8, 6, 4}
+Measured runs (all single seed, `N=64`, `D=1000`, 2,025,440 params; full rows in
+`V3/results/runs.csv`):
+
+| when | discretization | epochs | state regularization | test | correct/total |
+|---|---|---|---|---|---|
+| 2026-10-02 11:24 | 4 ms (T=250) | 5 | none | 72.26% | 1636/2264 |
+| 2026-10-02 11:39 | 4 ms (T=250) | 5 | noise std 0.01 | 74.47% | 1686/2264 |
+| 2026-10-02 11:57 | 4 ms (T=250) | 5 | quantization 8-bit | 73.94% | 1674/2264 |
+| 2026-10-02 12:40 | **2 ms** (T=500) | 5 | none | 76.15% | 1724/2264 |
+| **2026-10-02 14:31** | **2 ms** (T=500) | **20** | none | **82.51%** | **1868/2264** |
+
+- [x] baseline regression run (`mode: none`) — same params/forward logic, no regression
+- [x] first 5-epoch screening: noise `std 0.01` and 8-bit quantization (both at 4 ms)
+- [x] 2 ms resolution run (`time_bin_ms=2` → 500 steps, `alpha = 0.1`) —
+      5-epoch 76.15%, 20-epoch **82.51%**
+- [ ] noise sweep at the current 2 ms default: `std` ∈ {0.001, 0.005, 0.01, 0.02, 0.05}
+- [ ] quantization sweep at 2 ms: `bits` ∈ {16, 12, 8, 6, 4}
 - [ ] combined `noise_quantization` for the most promising single settings
-- [ ] 2 ms resolution run (`timing.time_bin_ms=2` → 500 steps, `alpha = 0.1`)
-- [ ] 20-epoch rerun of the promising regime(s), compared against the
-      reference **79.81%** ($N=64$, $D=1000$, 2,025,440 params)
+- [ ] 20-epoch reruns of the promising imprecision regime(s), compared against the
+      **82.51%** reference
 
-The reference is already measured; the default epoch count was deliberately left
-at **5** so screening is cheap:
+Reference (2 ms, 20 epochs, `mode: none`):
 
 ```
-VECTOR  D=1000  N=64    2,025,440 params   test  1807/2264 = 79.81%
+VECTOR  D=1000  N=64    2,025,440 params   test  1868/2264 = 82.51%
 ```
+
+The YAML default is now `epochs: 20` at 2 ms; 5-epoch screening runs are ~17 min
+each, the full 20-epoch run took ~72 min of vector training (4243.5 s) plus
+1380.6 s for the scalar baseline.
 
 ### Future imprecision work (not implemented)
 

@@ -3,16 +3,17 @@
 > **Question.** How much of the official SHD test set can a population of
 > $D = 1000$ **vector-valued** spiking neurons classify correctly?
 
-> **Answer (executed, 3 epochs, single seed).** **71.78%** — 1625 of the 2264
-official SHD test samples. The identical population with scalar neurons
-($D=1$, same 64 neurons, same training) reaches **26.55%**. See [§8](#8-results)
+> **Answer (executed, 20 epochs, 2 ms, single seed).** **82.51%** — 1868 of the
+> 2264 official SHD test samples. The identical population with scalar neurons
+> ($D=1$, same 64 neurons, same training) reaches **49.43%**. See [§8](#8-results)
 > and `RESULTS.md`.
 >
-> **Current experimental reference (20 epochs, single seed).** $N=64$, $D=1000$,
-> 2,025,440 parameters: **79.81%** — 1807/2264 official SHD test samples
-> (recorded in `V3_SHD_experiment.ipynb`, cells with the final test evaluation).
-> The current stage tests **controlled state imprecision** on top of this
-> reference; see [§11](#11-controlled-state-imprecision--the-run-registry).
+> **Current experimental reference.** $N=64$, $D=1000$, 2,025,440 parameters,
+> **2 ms** discretization ($T=500$, $\alpha=0.1$), 20 epochs: **82.51%**
+> (1868/2264), recorded in the executed `V3_SHD_experiment.ipynb` and in the
+> registry run `2026-10-02_14-31-15`. The previous 4 ms reference ($T=250$,
+> $\alpha=0.2$) was 79.81% (1807/2264). Imprecision screening is compared against
+> this 82.51% reference; see [§11](#11-controlled-state-imprecision--the-run-registry).
 
 This folder is an independent experiment. It is **not** an extension of V2 and
 does not import, modify or reproduce any of the V2 architecture
@@ -134,8 +135,8 @@ baseline population *through the identical code path*.
 * The window covers **96.6%** of training and **99.0%** of test utterance spans;
   events after 1000 ms are dropped (measured clip fraction: 0.013% of events on
   the training file for the sampled subset used in the notebook).
-* Measured input statistics: 7846 events/sample, 4.3% of the `(T, C)` grid cells
-  active.
+* Measured input statistics: 7846 events/sample, i.e. ≈2.2% of the `(500, 700)`
+  grid cells active at the 2 ms default (≈4.3% of the `(250, 700)` cells at 4 ms).
 * `FIT` / `VAL` are a class-stratified random 90/10 split of the **training**
   file. The official test file is opened only in the test phase and never used
   for any decision.
@@ -185,14 +186,14 @@ occurs — unlike the fp16 problems seen in the Brian 2 experiment.
 
 ### GPU memory (the one thing that really bites)
 
-The 250-step (4 ms) backprop-through-time graph is the memory driver. Training
-uses chunked gradient checkpointing (`grad_checkpoint_chunks`), which stores the
-state only at chunk boundaries — measured peak over a full epoch at
-`N=64, D=1000, T=250, batch=128`: **1108 MiB allocated / 1148 MiB reserved**, with
-`nvidia-smi` reporting ~1.7 GiB in use and ~2.2 s per batch. These figures were
-measured at the historical 4 ms discretization; the current default is 2 ms
-(`T=500`), which roughly doubles the step count (and therefore the time and
-memory per epoch) — reduce `grad_checkpoint_chunks` only if VRAM requires it.
+The per-step backprop-through-time graph is the memory driver. Training uses
+chunked gradient checkpointing (`grad_checkpoint_chunks`), which stores the state
+only at chunk boundaries. Measured peak over a full epoch at the **default 2 ms**
+discretization, `N=64, D=1000, T=500, batch=128`: **2284 MiB allocated /
+2328 MiB reserved**, ≈ 3.5 s per batch (the full 20-epoch training run took
+4243.5 s). The earlier 4 ms reference (`T=250`) measured 1108 MiB allocated /
+1148 MiB reserved and ≈ 2.2 s per batch; halving the time step doubles `T` and
+roughly doubles both time and memory per epoch.
 
 Two traps, both measured on the 6 GiB RTX 3060 Laptop:
 
@@ -259,63 +260,51 @@ results/summary.json                   vector-vs-scalar summary (CLI --variant b
 
 ## 8. Results
 
-**Executed** (`V3_SHD_experiment.ipynb`, top to bottom, 19/19 code cells, no errors,
-712 s wall). The committed execution used a short **3-epoch** schedule
-(`V3_OVERRIDES='{"epochs": 3}'`); the YAML default is `epochs: 20` and that
-full run is the deferred next step (see below). Both variants use the identical
-code path, data, readout, optimizer and epoch count.
+**Executed** (`V3_SHD_experiment.ipynb`, top to bottom, 20 code cells, no errors).
+The default configuration is `epochs: 20` at the **2 ms** discretization
+(`T=500`, `alpha=0.1`). Both variants use the identical code path, data, readout,
+optimizer and epoch count. Full per-epoch numbers are in `RESULTS.md`; the run is
+also in the registry (`V3/results/runs.csv`, run `2026-10-02_14-31-15`).
 
 | | vector `D=1000` | scalar baseline `D=1` |
 |---|---|---|
 | trainable parameters | 2,025,440 | 6,335 |
-| FIT accuracy (final epoch) | 90.35% | 24.29% |
-| VAL accuracy (final epoch) | 86.89% | 24.63% |
-| **TEST correct / total** | **1625 / 2264** | **601 / 2264** |
-| **TEST accuracy** | **71.78%** | **26.55%** |
-| test errors | 639 | 1663 |
-| per-class accuracy min / median / max | 37.0% / 72.0% / 100.0% | 0.0% / 25.4% / 68.8% |
-| classes below 10% recall | **0** | 5 |
-| English (0–9) / German (10–19) | 74.91% / 68.42% | 23.18% / 29.57% |
-| mean / median / max firing rate | 24.09 / 21.55 / 95.45 Hz | 10.72 / 5.21 / 66.23 Hz |
-| silent neurons (of 64) | 0 | 10 |
-| peak CUDA memory (train) | 1283 MiB allocated / 1330 MiB reserved | 144 MiB |
-| test pass wall time | 18.8 s for all 2264 samples | 10.3 s |
-| training wall time (3 epochs) | 445.5 s (161/137/132 s per epoch) | 151.0 s |
+| FIT accuracy (final epoch) | 100.00% | 58.01% |
+| VAL accuracy (final epoch) | 96.32% | 53.68% |
+| **TEST correct / total** | **1868 / 2264** | **1119 / 2264** |
+| **TEST accuracy** | **82.51%** | **49.43%** |
+| test errors | 396 | 1145 |
+| per-class accuracy min / median / max | 38.8% / 88.6% / 100.0% | not recorded |
+| classes below 10% recall | **0** | not recorded |
+| English (0–9) / German (10–19) | 90.31% / 75.08% | not recorded |
+| mean / median / max firing rate | 18.22 / 17.71 / 37.02 Hz | not recorded |
+| silent neurons (of 64) | 0 | not recorded |
+| peak CUDA memory (train) | 2284 MiB allocated / 2328 MiB reserved | not recorded |
+| test pass wall time | 24.1 s for all 2264 samples | not recorded |
+| training wall time (20 epochs) | 4243.5 s (≈ 204 s/epoch) | 1380.6 s (≈ 69 s/epoch) |
 
-**The vector population beats the scalar population by +45.23 percentage points**
-(71.78% vs 26.55%) with the same 64 neurons, the same input, the same readout and
-the same training procedure. The scalar baseline is still at chance-plus
-(FIT 24.3%, five classes with <10% recall, 10 of its 64 neurons silent), i.e. it has
-barely started to learn after 3 epochs, whereas the vector population is already
-at 71.78% test accuracy — above the repository's own V2 LIF baseline
-(59.98%, N=256, 20 epochs) and close to the ~71% usually quoted for a plain
-recurrent SHD baseline. The full 20-epoch run is expected to go further.
+**The vector population beats the scalar population by +33.08 percentage points**
+(82.51% vs 49.43%) with the same 64 neurons, the same input, the same readout and
+the same training procedure. At 20 epochs the scalar baseline has learned much
+more than at 3 epochs (49.43% vs 26.55%), so the vector advantage is **not**
+merely "the scalar model had not trained yet"; the vector population reaches
+82.51%, above the repository's own V2 LIF baseline (59.98%, N=256, 20 epochs) and
+well above the ~71% usually quoted for a plain recurrent SHD baseline.
 
-Training progressed as (vector):
+Training progressed as (vector; the full 20-epoch table is in `RESULTS.md`):
 
 | epoch | train loss | train acc | val loss | val acc | rate | spikes/sample | epoch time |
 |---|---|---|---|---|---|---|---|
-| 1 | 1.7030 | 45.33% | 0.9983 | 67.16% | 19.21 Hz | 1229 | 160.7 s |
-| 2 | 0.7629 | 77.26% | 0.6061 | 83.82% | 23.65 Hz | 1514 | 136.6 s |
-| 3 | 0.4701 | 88.01% | 0.4903 | 86.89% | 24.72 Hz | 1582 | 131.5 s |
+| 1 | 1.9840 | 37.26% | 1.2104 | 61.89% | 24.55 Hz | 1571 | 220.9 s |
+| 2 | 0.9246 | 70.53% | 0.7634 | 75.61% | 27.60 Hz | 1766 | 204.0 s |
+| 5 | 0.3424 | 90.18% | 0.4536 | 86.52% | 25.26 Hz | 1617 | 204.3 s |
+| 10 | 0.1295 | 96.54% | 0.2330 | 93.38% | 22.18 Hz | 1420 | 203.7 s |
+| **16** | 0.0208 | 99.90% | **0.1021** | **97.67%** | 18.66 Hz | 1195 | 207.0 s |
+| 20 | 0.0135 | 100.00% | 0.1129 | 96.32% | 17.71 Hz | 1133 | 204.4 s |
 
-Figures written to `V3/figures/<tag>/`: training curves, test confusion matrix,
-per-class accuracy, and input/spike rasters for representative test and FIT samples.
-
-### Deferred: the full 20-epoch run
-
-The committed notebook execution uses 3 epochs to keep the turnaround short. To
-produce the full result, run the identical code path with the YAML's 20 epochs:
-
-```powershell
-# notebook, 20 epochs, ~65 min (43 min vector + 22 min scalar)
-.venv\Scripts\python.exe V3\tools\run_notebook.py
-# or the equivalent CLI invocation (same functions, same seeds)
-.venv\Scripts\python.exe V3\run_experiment.py --variant both
-```
-
-Expected cost: ≈ 2.2 min per vector epoch and ≈ 0.7 min per scalar epoch of GPU
-work, plus ~30% host-side event binning (`TODO.md`).
+best-validation epoch = **16** (val 0.9767). Figures written to `V3/figures/<tag>/`:
+training curves, test confusion matrix, per-class accuracy, and input/spike
+rasters for representative test and FIT samples.
 
 ## 9. Layout
 
@@ -459,49 +448,49 @@ never a training signal.
 
 ### Screening workflow
 
-Each full run is ≈1.5 h, so the default epoch count stays at **5** (the reference
-is re-run at 20 epochs only after screening). The runner accepts dotted overrides,
-so no YAML edits are needed between runs:
+The reference (2 ms, 20 epochs) took ~72 min of vector training; **screening** is
+run at 5 epochs (~17 min) and the promising settings are only then re-run at 20
+epochs. The YAML default is `epochs: 20`, so pass `--override epochs=5` to screen.
+The runner accepts dotted overrides, so no YAML edits are needed between runs:
 
 ```powershell
-# baseline (mode none) — should land near the 5-epoch reference
-.venv\Scripts\python.exe V3\run_experiment.py --variant vector
+# baseline screening (mode none, 5 epochs, 2 ms default)
+.venv\Scripts\python.exe V3\run_experiment.py --variant vector --override epochs=5
 
 # noise sweep
-.venv\Scripts\python.exe V3\run_experiment.py --variant vector `
+.venv\Scripts\python.exe V3\run_experiment.py --variant vector --override epochs=5 `
   --override state_regularization.mode=noise --override state_regularization.noise_std=0.01
 
 # quantization sweep
-.venv\Scripts\python.exe V3\run_experiment.py --variant vector `
+.venv\Scripts\python.exe V3\run_experiment.py --variant vector --override epochs=5 `
   --override state_regularization.mode=quantization --override state_regularization.quantize_bits=8
 ```
 
 Suggested screening values: `noise_std` ∈ {0.001, 0.005, 0.01, 0.02, 0.05};
 `quantize_bits` ∈ {16, 12, 8, 6, 4}. Nothing launches a grid automatically — each
-command runs exactly one configuration and records exactly one row.
+command runs exactly one configuration and records exactly one row. The measured
+5-epoch 2 ms baseline is 76.15% (1724/2264) for context.
 
 ## 12. Current experimental reference
 
 ```
 N = 64    D = 1000    epochs = 20    params = 2,025,440
+timing: 1000 ms / 2 ms  ->  T = 500, alpha = 0.1
 ```
 
 ```
-VECTOR  D=1000  N=64    2,025,440 params   test  1807/2264 =  79.81%
+VECTOR  D=1000  N=64    2,025,440 params   test  1868/2264 =  82.51%
 ```
 
 Verified from the executed `V3_SHD_experiment.ipynb` (the stored test evaluation
-cells). This is the number every imprecision screening run is compared against.
-Older measured points (all single-seed): $D=1000$ at 3 epochs = 71.78%; scalar
-$D=1$ at 3 epochs = 26.55%; $N=128$, $D=1000$ = 79.24%; $N=64$, $D=2000$ = 77.96%.
-Doubling $N$ (64→128) or $D$ (1000→2000) did not improve on the 79.81%
-reference, which is why this stage tests imprecision rather than more neurons or
-more dimensions.
-
-> **Note.** The 79.81% reference was measured at the **4 ms** discretization
-> (`T = 250`). The current default is **2 ms** (`T = 500`, `alpha = 0.1`); when
-> comparing against 79.81%, either run the 4 ms reference (`time_bin_ms: 4`) or
-> re-measure the reference at 2 ms.
+cells) and the registry run `2026-10-02_14-31-15`. This is the number every
+imprecision screening run is compared against. The previous 4 ms reference
+(250 steps, alpha 0.2, same 20 epochs) measured **79.81%** (1807/2264); older
+measured points (all single-seed): $D=1000$ at 3 epochs (4 ms) = 71.78%; scalar
+$D=1$ at 3 epochs = 26.55% and at 20 epochs (2 ms) = 49.43%; $N=128$, $D=1000$
+(4 ms) = 79.24%; $N=64$, $D=2000$ (4 ms) = 77.96%. Doubling $N$ (64→128) or $D$
+(1000→2000) did not improve on the reference, whereas halving the time step
+(4 ms → 2 ms) did (+2.70 points).
 
 ## 13. Temporal resolution and data order
 
