@@ -114,6 +114,62 @@ class StateRegularizationConfig:
 
 
 @dataclass
+class TimingConfig:
+    """Temporal discretization of the SHD experiment.
+
+    Two independent quantities define the timing; the number of dynamical steps
+    follows from them::
+
+        num_time_steps = sequence_duration_ms / time_bin_ms     (must be an integer)
+
+    ``time_bin_ms`` is simultaneously the SHD bin width **and** the model's
+    integration step ``dt`` (one bin == one dynamical step), so the leak factor
+    ``alpha = dt/tau`` changes with it: 4 ms -> ``alpha = 4/tau``,
+    2 ms -> ``alpha = 2/tau``.
+
+    Defaults reproduce the reference discretization
+    (1000 ms / 4 ms -> 250 steps, ``alpha = 0.2`` at ``tau = 20 ms``).
+    """
+
+    sequence_duration_ms: float = 1000.0
+    time_bin_ms: float = 4.0
+
+    @property
+    def num_time_steps(self) -> int:
+        return int(round(float(self.sequence_duration_ms) / float(self.time_bin_ms)))
+
+    @property
+    def simulation_dt_ms(self) -> float:
+        return float(self.time_bin_ms)
+
+    @property
+    def duration_s(self) -> float:
+        return float(self.sequence_duration_ms) / 1000.0
+
+    def validate(self) -> None:
+        if float(self.time_bin_ms) <= 0:
+            raise ValueError("timing.time_bin_ms must be > 0")
+        if float(self.sequence_duration_ms) <= 0:
+            raise ValueError("timing.sequence_duration_ms must be > 0")
+        steps = float(self.sequence_duration_ms) / float(self.time_bin_ms)
+        if abs(steps - round(steps)) > 1e-9:
+            raise ValueError(
+                "timing.sequence_duration_ms / time_bin_ms must be an integer number of "
+                f"steps, got {self.sequence_duration_ms}/{self.time_bin_ms} = {steps}"
+            )
+        if round(steps) < 1:
+            raise ValueError("timing must yield at least one time step")
+
+    @classmethod
+    def from_dict(cls, data: dict, strict: bool = False) -> "TimingConfig":
+        known = {f.name for f in dataclasses.fields(cls)}
+        unknown = set(data) - known
+        if unknown and strict:
+            raise ValueError(f"unknown timing keys: {sorted(unknown)}")
+        return cls(**{k: v for k, v in data.items() if k in known})
+
+
+@dataclass
 class V3Config:
     """All V3 experiment parameters."""
 
@@ -126,13 +182,15 @@ class V3Config:
     test_h5: str = "data/shd_test.h5"
     n_inputs: int = 700
     n_classes: int = 20
-    bin_ms: float = 4.0          # width of one temporal bin [ms]
-    n_bins: int = 250            # number of temporal steps T (250 * 4 ms = 1000 ms)
+    # temporal discretization: the step count T is *derived*, never stored
+    timing: TimingConfig = field(default_factory=TimingConfig)
     binary_input: bool = True    # >=1 event in a bin -> 1 (standard SHD encoding)
     val_fraction: float = 0.10   # stratified validation split, taken from the TRAIN file
     split_seed: int = 0
     cache_events: bool = True    # cache binned event codes in RAM (faster epochs)
     max_train_samples: int = 0   # 0 = use the whole training split (subset only for quick runs)
+    shuffle_train: bool = True   # shuffle FIT batches between epochs
+    shuffle_val: bool = False    # validation order is deterministic
 
     # ---- model -----------------------------------------------------------
     n_neurons: int = 64          # N
@@ -185,9 +243,35 @@ class V3Config:
     # derived quantities
     # ------------------------------------------------------------------ #
     @property
+    def bin_ms(self) -> float:
+        """Width of one temporal bin [ms] (== ``timing.time_bin_ms``)."""
+        return float(self.timing.time_bin_ms)
+
+    @property
+    def n_bins(self) -> int:
+        """Number of temporal steps T, derived from the timing block."""
+        return int(self.timing.num_time_steps)
+
+    @property
+    def time_bin_ms(self) -> float:
+        return self.bin_ms
+
+    @property
+    def sequence_duration_ms(self) -> float:
+        return float(self.timing.sequence_duration_ms)
+
+    @property
+    def num_time_steps(self) -> int:
+        return self.n_bins
+
+    @property
     def dt_ms(self) -> float:
         """Integration step.  One bin == one dynamical step."""
-        return float(self.bin_ms)
+        return float(self.timing.simulation_dt_ms)
+
+    @property
+    def simulation_dt_ms(self) -> float:
+        return self.dt_ms
 
     @property
     def alpha(self) -> float:
@@ -196,11 +280,11 @@ class V3Config:
 
     @property
     def duration_s(self) -> float:
-        return self.n_bins * self.bin_ms / 1000.0
+        return self.timing.duration_s
 
     @property
     def window_s(self) -> float:
-        return self.n_bins * self.bin_ms / 1000.0
+        return self.timing.duration_s
 
     @property
     def torch_dtype(self):
@@ -214,8 +298,7 @@ class V3Config:
     def validate(self) -> None:
         if self.n_neurons < 1 or self.state_dim < 1:
             raise ValueError("n_neurons and state_dim must be >= 1")
-        if self.n_bins < 1 or self.bin_ms <= 0:
-            raise ValueError("n_bins and bin_ms must be positive")
+        self.timing.validate()
         if not 0.0 <= self.val_fraction < 1.0:
             raise ValueError("val_fraction must be in [0, 1)")
         if self.readout not in ("sum", "mean"):
@@ -238,6 +321,10 @@ class V3Config:
     def to_dict(self) -> dict:
         d = asdict(self)
         d["derived"] = {
+            "sequence_duration_ms": self.sequence_duration_ms,
+            "time_bin_ms": self.time_bin_ms,
+            "num_time_steps": self.num_time_steps,
+            "simulation_dt_ms": self.simulation_dt_ms,
             "dt_ms": self.dt_ms,
             "alpha": self.alpha,
             "duration_s": self.duration_s,
@@ -266,6 +353,16 @@ class V3Config:
     # ------------------------------------------------------------------ #
     @classmethod
     def from_dict(cls, data: dict, strict: bool = False) -> "V3Config":
+        data = dict(data)
+        # backward compatibility: derive a timing block from the legacy flat
+        # `bin_ms` / `n_bins` keys if no explicit `timing` block is present
+        if "timing" not in data and ("bin_ms" in data or "n_bins" in data):
+            bin_ms = float(data.pop("bin_ms", 4.0))
+            n_bins = int(data.pop("n_bins", 250))
+            data["timing"] = {
+                "time_bin_ms": bin_ms,
+                "sequence_duration_ms": bin_ms * n_bins,
+            }
         known = {f.name for f in dataclasses.fields(cls)}
         unknown = set(data) - known - {"derived"}
         if unknown and strict:
@@ -276,6 +373,8 @@ class V3Config:
                 continue
             if k == "state_regularization" and isinstance(v, dict):
                 v = StateRegularizationConfig.from_dict(v, strict=strict)
+            elif k == "timing" and isinstance(v, dict):
+                v = TimingConfig.from_dict(v, strict=strict)
             kwargs[k] = v
         return cls(**kwargs)
 
@@ -294,7 +393,7 @@ def describe(cfg: V3Config) -> str:
     reg = cfg.state_regularization
     return (
         f"V3Config(tag={cfg.tag!r}, N={cfg.n_neurons}, D={cfg.state_dim}, "
-        f"T={cfg.n_bins}x{cfg.bin_ms:g}ms={cfg.duration_s:g}s, "
+        f"T={cfg.num_time_steps}x{cfg.time_bin_ms:g}ms={cfg.sequence_duration_ms:g}ms, "
         f"batch={cfg.batch_size}, epochs={cfg.epochs}, lr={cfg.learning_rate:g}, "
         f"device={cfg.device}, dtype={cfg.dtype}, state_reg={reg.mode})"
     )
@@ -321,6 +420,7 @@ def parameter_groups(cfg: V3Config) -> dict:
 
 __all__ = [
     "V3Config",
+    "TimingConfig",
     "StateRegularizationConfig",
     "V3_ROOT",
     "REPO_ROOT",

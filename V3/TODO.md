@@ -17,7 +17,15 @@ Implemented (see `README.md` §11 for the full description):
 - [x] persistent registry: one row per completed run in `V3/results/runs.csv`
       plus a timestamped `V3/results/<run_id>/` with `config.yaml`,
       `metrics.json`, `confusion_matrix.csv`, `summary.txt`
-- [x] focused tests in `V3/tests/` (noise, quantization, phase gating, registry)
+- [x] the notebook registers completed runs through the **same**
+      `v3.registry.register_run` entry point as the CLI (no second format)
+- [x] timing block (`sequence_duration_ms`, `time_bin_ms`) with the step count
+      **derived** and validated as an integer: 4 ms -> 250 steps (default),
+      2 ms -> 500 steps (supported); `time_bin_ms` is also the model `dt`
+- [x] verified data order: fixed stratified FIT/VAL split, FIT shuffled per epoch
+      (`shuffle_train`), deterministic VAL (`shuffle_val`), fresh state per batch
+- [x] focused tests in `V3/tests/` (noise, quantization, phase gating, timing,
+      SHD binning, shuffle/state reset, registry)
 
 ### Screening (5 epochs; default stays 5, not 20)
 
@@ -26,6 +34,7 @@ Implemented (see `README.md` §11 for the full description):
 - [ ] noise sweep: `std` ∈ {0.001, 0.005, 0.01, 0.02, 0.05}
 - [ ] quantization sweep: `bits` ∈ {16, 12, 8, 6, 4}
 - [ ] combined `noise_quantization` for the most promising single settings
+- [ ] 2 ms resolution run (`timing.time_bin_ms=2` → 500 steps, `alpha = 0.1`)
 - [ ] 20-epoch rerun of the promising regime(s), compared against the
       reference **79.81%** ($N=64$, $D=1000$, 2,025,440 params)
 

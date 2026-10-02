@@ -25,6 +25,8 @@ import json
 from datetime import datetime
 from pathlib import Path
 
+import yaml
+
 RUN_FIELDS = [
     "timestamp",
     "run_id",
@@ -40,8 +42,12 @@ RUN_FIELDS = [
     "scheduler",
     "training_precision",
     "device",
-    "n_bins",
-    "bin_ms",
+    "sequence_duration_ms",
+    "time_bin_ms",
+    "num_time_steps",
+    "simulation_dt_ms",
+    "shuffle_train",
+    "shuffle_val",
     "state_regularization_mode",
     "state_noise_enabled",
     "state_noise_std",
@@ -149,13 +155,35 @@ class RunRegistry:
 
     # ------------------------------------------------------------------ #
     def _append_csv(self, row: dict) -> None:
-        exists = self.runs_csv.exists()
+        """Append one row, migrating the header if the schema has grown.
+
+        Append-only: existing rows are never dropped.  If an older ``runs.csv``
+        has a different header (e.g. before the timing fields were added), the
+        file is rewritten with the union of the old and new columns so old rows
+        stay readable and correctly aligned.
+        """
         fieldnames = list(RUN_FIELDS) + [k for k in row if k not in RUN_FIELDS]
-        with open(self.runs_csv, "a", newline="", encoding="utf-8") as fh:
-            writer = csv.DictWriter(fh, fieldnames=fieldnames)
-            if not exists:
+        if not self.runs_csv.exists():
+            with open(self.runs_csv, "w", newline="", encoding="utf-8") as fh:
+                writer = csv.DictWriter(fh, fieldnames=fieldnames)
                 writer.writeheader()
-            writer.writerow(row)
+                writer.writerow(row)
+            return
+        with open(self.runs_csv, "r", newline="", encoding="utf-8") as fh:
+            header = next(csv.reader(fh), [])
+        if header == fieldnames:
+            with open(self.runs_csv, "a", newline="", encoding="utf-8") as fh:
+                csv.DictWriter(fh, fieldnames=fieldnames).writerow(row)
+            return
+        # schema changed: rewrite with the union header, preserving every row
+        existing = self.read_runs()
+        union = list(dict.fromkeys(header + fieldnames))
+        with open(self.runs_csv, "w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=union, restval="")
+            writer.writeheader()
+            for r in existing:
+                writer.writerow({k: r.get(k, "") for k in union})
+            writer.writerow({k: row.get(k, "") for k in union})
 
     @staticmethod
     def _write_confusion_csv(cm, path: Path) -> None:
@@ -248,8 +276,12 @@ def run_row_from_variant(
             "scheduler": cfg.lr_schedule,
             "training_precision": str(cfg.dtype),
             "device": str(cfg.device),
-            "n_bins": int(cfg.n_bins),
-            "bin_ms": float(cfg.bin_ms),
+            "sequence_duration_ms": float(cfg.sequence_duration_ms),
+            "time_bin_ms": float(cfg.time_bin_ms),
+            "num_time_steps": int(cfg.num_time_steps),
+            "simulation_dt_ms": float(cfg.simulation_dt_ms),
+            "shuffle_train": bool(cfg.shuffle_train),
+            "shuffle_val": bool(cfg.shuffle_val),
             "state_regularization_mode": reg.mode,
             "state_noise_enabled": bool(reg.noise_enabled),
             "state_noise_std": float(reg.noise_std),
@@ -279,6 +311,66 @@ def run_row_from_variant(
     return row
 
 
+def register_run(
+    registry: "RunRegistry",
+    cfg,
+    *,
+    n_parameters: int,
+    fit_metrics: dict | None = None,
+    val_metrics: dict | None = None,
+    test_metrics: dict | None = None,
+    train_seconds: float = float("nan"),
+    duration_seconds: float = float("nan"),
+    checkpoint: str = "",
+    best_val_accuracy: float | None = None,
+    best_epoch: int | None = None,
+    notes: str = "",
+    extra_metrics: dict | None = None,
+    history=None,
+) -> Path:
+    """Register one completed variant with the shared schema.
+
+    Single entry point used by **both** the CLI (``run_experiment.record_run``)
+    and the notebook, so there is no second registry format.  Writes exactly one
+    ``runs.csv`` row and one ``V3/results/<run_id>/`` artifact directory.
+    """
+    row = run_row_from_variant(
+        cfg=cfg,
+        n_parameters=n_parameters,
+        fit_metrics=fit_metrics,
+        val_metrics=val_metrics,
+        test_metrics=test_metrics,
+        train_seconds=train_seconds,
+        duration_seconds=duration_seconds,
+        checkpoint=checkpoint,
+        notes=notes,
+    )
+    if best_val_accuracy is not None:
+        row["best_val_accuracy"] = float(best_val_accuracy)
+    if best_epoch is not None:
+        row["best_epoch"] = int(best_epoch)
+
+    metrics = dict(extra_metrics or {})
+    if test_metrics:
+        metrics.setdefault(
+            "test",
+            {k: v for k, v in test_metrics.items()
+             if k not in ("confusion_matrix", "predictions", "labels", "logits")},
+        )
+        cm = test_metrics.get("confusion_matrix")
+        if cm is not None:
+            metrics.setdefault("top_confusions", top_confusion_pairs(cm, k=10))
+    if history is not None:
+        metrics.setdefault("history", history)
+
+    return registry.record(
+        row,
+        config_yaml=yaml.safe_dump(cfg.to_dict(), sort_keys=True),
+        metrics=metrics,
+        confusion_matrix=(test_metrics or {}).get("confusion_matrix"),
+    )
+
+
 __all__ = [
     "RunRegistry",
     "RUN_FIELDS",
@@ -286,4 +378,5 @@ __all__ = [
     "split_accuracy",
     "top_confusion_pairs",
     "run_row_from_variant",
+    "register_run",
 ]

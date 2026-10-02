@@ -11,7 +11,7 @@ import math
 import pytest
 import torch
 
-from v3.config import StateRegularizationConfig, V3Config
+from v3.config import StateRegularizationConfig, TimingConfig, V3Config
 from v3.model import VectorNeuronPopulation
 from v3.state_regularization import add_state_noise, quantize_state, regularize_state
 
@@ -123,7 +123,7 @@ def _tiny_cfg(**reg_kwargs) -> V3Config:
         mix_rank=4,
         n_inputs=10,
         n_classes=3,
-        n_bins=8,
+        timing=TimingConfig(sequence_duration_ms=16.0, time_bin_ms=2.0),  # T = 8
         batch_size=4,
         device="cpu",
         dtype="float32",

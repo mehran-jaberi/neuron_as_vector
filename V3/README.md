@@ -334,6 +334,8 @@ V3/
   tests/conftest.py             puts V3/ on sys.path for the isolated test module
   tests/test_state_regularization.py  focused noise/quantization/phase tests
   tests/test_registry.py        focused registry tests
+  tests/test_timing.py          timing derivation + SHD event binning tests
+  tests/test_shuffle_and_state.py  shuffle semantics + state-reset tests
   run_experiment.py             headless CLI
   run_smoke_test.py             mechanics / precision / VRAM smoke test
   tools/build_notebook.py       assembles the .ipynb from its cell list
@@ -441,10 +443,16 @@ V3/results/
 The row records timestamp, run id, `N`, `D`, parameters, epochs, seed, batch size,
 learning rate, optimizer, scheduler, training precision, noise/quantization
 settings (mode, std, bits, enabled), train/val/test accuracy, correct/total,
-English (0-9) and German (10-19) accuracy, durations, checkpoint path and notes.
+English (0-9) and German (10-19) accuracy, durations, checkpoint path and notes,
+plus the temporal settings (`sequence_duration_ms`, `time_bin_ms`,
+`num_time_steps`, `simulation_dt_ms`) and the shuffle flags.
 Run ids come from the **local system time** (`%Y-%m-%d_%H-%M-%S`, disambiguated
 with a `_NN` suffix on collision). The registry is append-only and never
-overwrites. Test confusion matrices are diagnostics, never a training signal.
+overwrites; if the column set grows, the existing file is rewritten with the
+union of the old and new columns so earlier rows survive. `V3_SHD_experiment.ipynb`
+registers its completed run through the **same** `v3.registry.register_run` entry
+point as the CLI (no second format). Test confusion matrices are diagnostics,
+never a training signal.
 
 ### Screening workflow
 
@@ -486,3 +494,47 @@ $D=1$ at 3 epochs = 26.55%; $N=128$, $D=1000$ = 79.24%; $N=64$, $D=2000$ = 77.96
 Doubling $N$ (64→128) or $D$ (1000→2000) did not improve on the 79.81%
 reference, which is why this stage tests imprecision rather than more neurons or
 more dimensions.
+
+## 13. Temporal resolution and data order
+
+### Timing
+
+The temporal discretization is one explicit block; the number of dynamical steps
+is **derived**, never stored:
+
+```yaml
+timing:
+  sequence_duration_ms: 1000
+  time_bin_ms: 4          # T = 1000 / 4 = 250
+```
+
+`time_bin_ms` is both the SHD bin width **and** the model integration step `dt`
+(one bin == one dynamical step), so the leak `alpha = dt/tau` follows:
+
+| `time_bin_ms` | steps `T` | window | `alpha` (tau=20 ms) | status |
+|---|---|---|---|---|
+| 4 ms | 250 | 1000 ms | 0.2 | **default benchmark discretization** |
+| 2 ms | 500 | 1000 ms | 0.1 | **supported experimental resolution** |
+
+Events are binned **directly from the original timestamps** at the requested
+`time_bin_ms` (never by splitting the 4 ms bins in half). The same 1000 ms window
+and the same truncation policy are used at both resolutions: events with
+`t < 1000 ms` are kept (`t = 0` goes to bin 0), the bin index is clamped to the
+last bin, and events at/after the cutoff are dropped. A non-integer
+`sequence_duration_ms / time_bin_ms` is rejected at configuration time. Switching
+to 2 ms changes `T`, `alpha` and the input tensor shape
+(`[B, 250, 700]` → `[B, 500, 700]`) with no special-casing anywhere.
+
+### Data order (verified by `V3/tests/test_shuffle_and_state.py`)
+
+* **FIT/VAL split** — one fixed stratified random 90/10 split of the *training*
+  file (`split_seed`); the same examples are in FIT/VAL for every epoch.
+* **FIT batches** — shuffled between epochs (`shuffle_train: true`), seeded by
+  `(seed, epoch)` so a given seed reproduces the order. The full FIT set is seen
+  exactly once per epoch (no `drop_last`); shuffling changes the order, not the
+  set of training examples.
+* **VAL batches** — `shuffle_val: false`, so validation order and accuracy are
+  deterministic and comparable across epochs. Validation is *not* a fresh random
+  sample each epoch.
+* **State reset** — every batch starts from a fresh zero state ($Z(0)=0$); no
+  neuron state or autograd graph carries over between batches.

@@ -16,13 +16,21 @@ train_h5: data/shd_train.h5
 test_h5: data/shd_test.h5
 n_inputs: 700
 n_classes: 20
-bin_ms: 4.0            # one dynamical step == one 4 ms bin
-n_bins: 250            # T = 250 steps -> a 1000 ms window (96.6% of train spans)
+# Temporal discretization.  num_time_steps is DERIVED: T = duration / bin.
+#   1000 ms / 4 ms -> 250 steps  (default reference; float16 state)
+#   1000 ms / 2 ms -> 500 steps  (supported 2 ms experiment)
+# time_bin_ms is BOTH the SHD bin width AND the model integration step dt,
+# so alpha = dt/tau changes with it (4/tau vs 2/tau).
+timing:
+  sequence_duration_ms: 1000
+  time_bin_ms: 4
 binary_input: true     # >=1 event in a bin -> 1 (standard SHD encoding)
 val_fraction: 0.10     # stratified split of the TRAIN file only (monitoring)
 split_seed: 0
 cache_events: true
 max_train_samples: 0   # 0 = full FIT split
+shuffle_train: true    # shuffle FIT batch order between epochs (fixed 90/10 split)
+shuffle_val: false     # deterministic validation order
 
 # ---- model ----
 n_neurons: 64          # N

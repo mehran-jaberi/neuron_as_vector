@@ -109,10 +109,16 @@ def train_one_epoch(
     epoch: int,
     progress=None,
 ) -> dict:
-    """One genuine pass over the training split.  ``progress`` is a tqdm bar."""
+    """One genuine pass over the training split.  ``progress`` is a tqdm bar.
+
+    The FIT/VAL split is fixed for the whole run; only the *order* of the FIT
+    batches changes between epochs (``cfg.shuffle_train``), seeded by
+    ``(cfg.seed, epoch)`` so a given seed reproduces the same order.
+    """
     model.train()
     model.set_phase("train")
-    it = BatchIterator(store, split, cfg.batch_size, shuffle=True, seed=cfg.seed, epoch=epoch)
+    it = BatchIterator(store, split, cfg.batch_size, shuffle=cfg.shuffle_train,
+                       seed=cfg.seed, epoch=epoch)
     total_loss = total_ce = 0.0
     correct = total = 0
     spikes_seen = 0
@@ -183,7 +189,7 @@ def evaluate(
     """
     model.eval()
     model.set_phase(phase)
-    it = BatchIterator(store, split, cfg.batch_size, shuffle=False, epoch=0)
+    it = BatchIterator(store, split, cfg.batch_size, shuffle=cfg.shuffle_val, epoch=0)
     total_loss = total = correct = 0
     spk_all = []
     logits_all, labels_all = [], []
@@ -265,7 +271,7 @@ def fit(
     set_seed(cfg.seed)
     model.to(device)
     optimizer = make_optimizer(model, cfg)
-    steps_per_epoch = len(BatchIterator(store, fit_split, cfg.batch_size, shuffle=True))
+    steps_per_epoch = len(BatchIterator(store, fit_split, cfg.batch_size, shuffle=cfg.shuffle_train))
     scheduler = make_scheduler(optimizer, cfg, steps_per_epoch)
     scaler = torch.amp.GradScaler("cuda", enabled=bool(cfg.amp) and device.type == "cuda")
 

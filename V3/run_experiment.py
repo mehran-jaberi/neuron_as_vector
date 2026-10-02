@@ -29,24 +29,29 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import yaml
 
 V3_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(V3_ROOT))
 
 from v3 import plots  # noqa: E402
-from v3.config import StateRegularizationConfig, V3Config, describe  # noqa: E402
+from v3.config import StateRegularizationConfig, TimingConfig, V3Config, describe  # noqa: E402
 from v3.experiment import resolve_device, test_variant, train_variant, variant_dirs  # noqa: E402
-from v3.registry import RunRegistry, run_row_from_variant, top_confusion_pairs  # noqa: E402
+from v3.registry import RunRegistry, register_run  # noqa: E402
 from v3.train import save_json  # noqa: E402
 
 DEFAULT_CONFIG = V3_ROOT / "configs" / "v3_default.yaml"
+
+# nested dataclass blocks addressable with dotted --override keys
+NESTED_BLOCKS = {
+    "timing": TimingConfig,
+    "state_regularization": StateRegularizationConfig,
+}
 
 QUICK_OVERRIDES = dict(
     n_neurons=16,
     state_dim=64,
     mix_rank=8,
-    n_bins=60,
+    timing=TimingConfig(sequence_duration_ms=240.0, time_bin_ms=4.0),
     batch_size=16,
     epochs=2,
     max_train_samples=256,
@@ -67,12 +72,11 @@ def _coerce(anno: str, raw: str):
 def apply_overrides(cfg: V3Config, items: list[str]) -> V3Config:
     """Apply ``key=value`` overrides, including one level of nesting.
 
-    ``state_regularization.mode=noise`` and
-    ``state_regularization.noise_std=0.01`` update the nested imprecision block
-    in place (other nested fields keep their configured values).
+    ``timing.time_bin_ms=2``, ``state_regularization.mode=noise`` and
+    ``state_regularization.noise_std=0.01`` update the nested block in place
+    (other nested fields keep their configured values).
     """
     vfields = {f.name: f for f in dataclasses.fields(V3Config)}
-    rfields = {f.name: f for f in dataclasses.fields(StateRegularizationConfig)}
     flat: dict = {}
     nested: dict[str, dict] = {}
     for item in items:
@@ -82,55 +86,45 @@ def apply_overrides(cfg: V3Config, items: list[str]) -> V3Config:
         key = key.strip()
         if "." in key:
             parent, child = key.split(".", 1)
-            if parent != "state_regularization" or child not in rfields:
+            if parent not in NESTED_BLOCKS:
                 raise SystemExit(f"unknown override key {key!r}")
-            nested.setdefault(parent, {})[child] = _coerce(str(rfields[child].type), raw)
+            nfields = {f.name: f for f in dataclasses.fields(NESTED_BLOCKS[parent])}
+            if child not in nfields:
+                raise SystemExit(f"unknown override key {key!r}")
+            nested.setdefault(parent, {})[child] = _coerce(str(nfields[child].type), raw)
             continue
         if key not in vfields:
             raise SystemExit(f"unknown configuration key {key!r}")
         flat[key] = _coerce(str(vfields[key].type), raw)
-    if "state_regularization" in nested:
-        cfg = cfg.with_overrides(
-            state_regularization=dataclasses.replace(
-                cfg.state_regularization, **nested["state_regularization"]
-            )
-        )
+    for parent, kwargs in nested.items():
+        cfg = cfg.with_overrides(**{parent: dataclasses.replace(getattr(cfg, parent), **kwargs)})
     if flat:
         cfg = cfg.with_overrides(**flat)
     return cfg
 
 
 def record_run(vcfg: V3Config, variant, info: dict, test_metrics: dict | None, registry: RunRegistry) -> Path:
-    """Append one registry row + per-run artifacts for a completed variant."""
-    metrics = {
-        k: v for k, v in info.items() if k not in ("history", "result", "parameter_groups")
-    }
-    metrics["parameter_groups"] = info.get("parameter_groups", {})
-    if test_metrics:
-        metrics["test"] = {
-            k: v for k, v in test_metrics.items()
-            if k not in ("confusion_matrix", "predictions", "labels", "logits")
-        }
-        cm = test_metrics.get("confusion_matrix")
-        metrics["top_confusions"] = top_confusion_pairs(cm, k=10) if cm is not None else []
-    row = run_row_from_variant(
-        cfg=vcfg,
+    """Append one registry row + per-run artifacts for a completed variant.
+
+    Delegates to the shared ``v3.registry.register_run`` -- the same entry point
+    the notebook uses, so CLI and notebook rows share one schema.
+    """
+    extra = {k: v for k, v in info.items() if k not in ("history", "result")}
+    return register_run(
+        registry, vcfg,
         n_parameters=info["n_parameters"],
         fit_metrics={"accuracy": info.get("fit_accuracy")},
         val_metrics={"accuracy": info.get("val_accuracy")},
         test_metrics=test_metrics,
         train_seconds=info.get("train_seconds", float("nan")),
-        duration_seconds=float(info.get("train_seconds", 0.0)) + float(info.get("init_and_data_seconds", 0.0)),
+        duration_seconds=float(info.get("train_seconds", 0.0))
+        + float(info.get("init_and_data_seconds", 0.0)),
         checkpoint=info.get("checkpoint", ""),
+        best_val_accuracy=info.get("best_val_accuracy"),
+        best_epoch=info.get("best_epoch"),
         notes=f"quick={info.get('quick', False)}",
-    )
-    row["best_val_accuracy"] = float(info.get("best_val_accuracy", float("nan")))
-    row["best_epoch"] = int(info.get("best_epoch", -1))
-    return registry.record(
-        row,
-        config_yaml=yaml.safe_dump(vcfg.to_dict(), sort_keys=True),
-        metrics=metrics,
-        confusion_matrix=(test_metrics or {}).get("confusion_matrix"),
+        extra_metrics=extra,
+        history=info.get("history"),
     )
 
 

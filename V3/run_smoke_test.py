@@ -26,7 +26,7 @@ import torch
 V3_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(V3_ROOT))
 
-from v3.config import V3Config, parameter_groups  # noqa: E402
+from v3.config import TimingConfig, V3Config, parameter_groups  # noqa: E402
 from v3.data import BatchIterator, SHDEventStore, make_split, official_test_split  # noqa: E402
 from v3.model import VectorNeuronPopulation, surrogate_spike  # noqa: E402
 from v3.train import _rate_stats, evaluate, fit, set_seed  # noqa: E402
@@ -66,7 +66,8 @@ def test_surrogate() -> None:
 # ---------------------------------------------------------------------- #
 def test_state_dims(device: torch.device, dtype: torch.dtype) -> None:
     banner("2/3. state dimensions, dtype and vector coupling")
-    cfg = V3Config(n_neurons=4, state_dim=16, n_inputs=32, n_bins=12, bin_ms=4.0, mix_rank=5,
+    cfg = V3Config(n_neurons=4, state_dim=16, n_inputs=32, mix_rank=5,
+                   timing=TimingConfig(sequence_duration_ms=48.0, time_bin_ms=4.0),
                    device=str(device), dtype=str(dtype).replace("torch.", ""))
     model = VectorNeuronPopulation(cfg).to(device)
     B, T, C = 3, 12, 32
@@ -100,7 +101,8 @@ def test_state_dims(device: torch.device, dtype: torch.dtype) -> None:
 # ---------------------------------------------------------------------- #
 def test_scalar_baseline(device: torch.device) -> None:
     banner("5. scalar baseline (D = 1) uses the same code path")
-    cfg = V3Config(n_neurons=8, state_dim=1, n_inputs=32, n_bins=10, mix_rank=4, bin_ms=4.0,
+    cfg = V3Config(n_neurons=8, state_dim=1, n_inputs=32, mix_rank=4,
+                   timing=TimingConfig(sequence_duration_ms=40.0, time_bin_ms=4.0),
                    device=str(device), dtype="float16")
     model = VectorNeuronPopulation(cfg).to(device)
     check("D=1 marked as scalar baseline", model.is_scalar_baseline)
@@ -113,7 +115,7 @@ def test_scalar_baseline(device: torch.device) -> None:
 def test_real_shd(device: torch.device) -> None:
     banner("4. real SHD, tiny end-to-end fit")
     cfg = V3Config(
-        tag="smoke", n_neurons=8, state_dim=64, mix_rank=8, n_bins=250, bin_ms=4.0,
+        tag="smoke", n_neurons=8, state_dim=64, mix_rank=8,
         batch_size=8, epochs=2, learning_rate=2e-3, val_fraction=0.25, split_seed=0,
         device=str(device), dtype="float16", cache_events=True, log_every=0,
     )
@@ -151,7 +153,8 @@ def test_real_shd(device: torch.device) -> None:
 
 def test_parameter_update(device: torch.device) -> None:
     banner("6. parameters actually move (fp16 fwd + fp32 master weights)")
-    cfg = V3Config(n_neurons=6, state_dim=32, n_inputs=64, n_bins=8, mix_rank=4, bin_ms=4.0,
+    cfg = V3Config(n_neurons=6, state_dim=32, n_inputs=64, mix_rank=4,
+                   timing=TimingConfig(sequence_duration_ms=32.0, time_bin_ms=4.0),
                    device=str(device), dtype="float16", batch_size=4, learning_rate=1e-2,
                    rate_reg=0.0, grad_checkpoint_chunks=2)
     set_seed(0)
@@ -179,9 +182,9 @@ def test_parameter_update(device: torch.device) -> None:
 # ---------------------------------------------------------------------- #
 def test_rate_stats() -> None:
     banner("8. firing-rate statistics are per-sample normalised")
-    cfg = V3Config(n_bins=250, bin_ms=4.0)
-    # 10 samples, 250 steps, 8 neurons; neuron j fires every (j+1)-th step
-    s = torch.zeros(10, 250, 8)
+    cfg = V3Config()
+    # 10 samples, T steps, 8 neurons; neuron j fires every (j+1)-th step
+    s = torch.zeros(10, cfg.n_bins, 8)
     for j in range(8):
         s[:, :: (j + 1), j] = 1.0
     st = _rate_stats(s, cfg)
@@ -212,7 +215,7 @@ def test_full_size_probe(device: torch.device) -> None:
     if device.type != "cuda":
         print("no CUDA -- skipped")
         return
-    cfg = V3Config(n_neurons=64, state_dim=1000, mix_rank=64, n_bins=250, bin_ms=4.0,
+    cfg = V3Config(n_neurons=64, state_dim=1000, mix_rank=64,
                    batch_size=32, device="cuda", dtype="float16", grad_checkpoint_chunks=10)
     model = VectorNeuronPopulation(cfg).to(device)
     groups = parameter_groups(cfg)

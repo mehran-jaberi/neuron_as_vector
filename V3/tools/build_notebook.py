@@ -81,6 +81,7 @@ same readout) is trained as the reference point.
 | 13 | Scalar baseline |
 | 14 | Final comparison |
 | 15 | Results / notes |
+| 16 | Register run (persistent registry) |
 
 Everything is imported from the small `v3` package next to this notebook; the
 notebook contains no scientific logic of its own, so the command-line runner
@@ -116,10 +117,11 @@ import numpy as np
 import torch
 from IPython.display import Image, display
 
-from v3.config import V3Config, describe, parameter_groups
+from v3.config import TimingConfig, V3Config, describe, parameter_groups
 from v3.data import SHDEventStore, make_split, official_test_split
 from v3.experiment import resolve_device, test_variant, train_variant, variant_dirs
 from v3.model import VectorNeuronPopulation, surrogate_spike
+from v3.registry import RunRegistry, register_run
 from v3.train import save_json
 
 DEVICE = resolve_device(V3Config())
@@ -149,7 +151,8 @@ CONFIG_FILE = V3_ROOT / "configs" / "v3_default.yaml"
 # JSON object of configuration overrides, e.g.
 #   V3_OVERRIDES='{"epochs": 2, "max_train_samples": 512}'
 QUICK = bool(int(os.environ.get("V3_QUICK", "0")))
-QUICK_OVERRIDES = dict(n_neurons=16, state_dim=64, mix_rank=8, n_bins=60,
+QUICK_OVERRIDES = dict(n_neurons=16, state_dim=64, mix_rank=8,
+                       timing=TimingConfig(sequence_duration_ms=240.0, time_bin_ms=4.0),
                        batch_size=16, epochs=2, max_train_samples=256,
                        val_fraction=0.15, tag="v3_quick_smoke")
 OVERRIDES: dict = _json.loads(os.environ.get("V3_OVERRIDES", "{}"))
@@ -166,10 +169,12 @@ print(f"device/dtype: {cfg.device} / {cfg.dtype}")
 print(f"tag         : {cfg.tag}")
 print(f"N (neurons) : {cfg.n_neurons}")
 print(f"D (state dim): {cfg.state_dim}")
-print(f"T x bin     : {cfg.n_bins} x {cfg.bin_ms:g} ms = {cfg.duration_s:g} s")
+print(f"T x bin     : {cfg.num_time_steps} x {cfg.time_bin_ms:g} ms = {cfg.sequence_duration_ms:g} ms "
+      f"(dt = {cfg.simulation_dt_ms:g} ms, alpha = dt/tau = {cfg.alpha:g})")
 print(f"batch/epochs: {cfg.batch_size} / {cfg.epochs}")
 print(f"lr / optim  : {cfg.learning_rate:g} / {cfg.optimizer} ({cfg.lr_schedule})")
-print(f"tau (leak)  : {cfg.tau_ms:g} ms   -> alpha = dt/tau = {cfg.alpha:g}")
+print(f"tau (leak)  : {cfg.tau_ms:g} ms")
+print(f"shuffle     : train={cfg.shuffle_train}  val={cfg.shuffle_val}  (FIT/VAL split is fixed)")
 """)
 
 py(r"""
@@ -577,6 +582,56 @@ print(f"SCALAR  D={scalar_cfg.state_dim:<5} N={scalar_cfg.n_neurons:<4} "
       f"{s['n_parameters']:>10,} params   "
       f"test {s['test_correct']:5d}/{s['test_total']} = {s['test_accuracy'] * 100:6.2f}%")
 print("=" * 62)
+""")
+
+md(r"""
+## 16. Register run
+
+Append the completed experiment to the persistent registry -- **exactly the same
+machinery as the command-line runner** (`V3/v3/registry.py`), so notebook and CLI
+runs share one schema and one file.  This cell runs only at the very end, after
+training, validation and the official test have all produced real results; if any
+earlier stage failed, no registry row is written.
+
+Output: one row in `V3/results/runs.csv` plus a timestamped directory
+`V3/results/<run_id>/` holding `config.yaml`, `metrics.json`,
+`confusion_matrix.csv` and `summary.txt`.
+""")
+
+py(r"""
+registry = RunRegistry(cfg.v3_path(cfg.out_dir))
+run_dir = register_run(
+    registry, cfg,
+    n_parameters=variant.model.n_parameters(),
+    fit_metrics=variant.fit_metrics,
+    val_metrics=variant.val_metrics,
+    test_metrics=test,
+    train_seconds=variant.result.total_seconds,
+    duration_seconds=variant.wall_seconds,
+    checkpoint=str(variant.checkpoint_path),
+    best_val_accuracy=variant.result.best_val_accuracy,
+    best_epoch=variant.result.best_epoch,
+    notes=f"notebook{' quick' if QUICK else ''}",
+    extra_metrics={
+        "vector": {
+            "fit": variant.fit_metrics,
+            "val": variant.val_metrics,
+            "dtypes": variant.result.dtypes,
+            "rate_mean_hz": variant.fit_metrics["rate_mean_hz"],
+            "rate_max_hz": variant.fit_metrics["rate_max_hz"],
+        },
+        "scalar": {
+            "fit_accuracy": scalar.fit_metrics["accuracy"],
+            "val_accuracy": scalar.val_metrics["accuracy"],
+            "test_accuracy": scalar_test["test_accuracy"],
+            "test_correct": scalar_test["test_correct"],
+            "test_total": scalar_test["test_total"],
+        },
+    },
+    history=variant.history_rows(),
+)
+print(f"registered run : {run_dir}")
+print(f"registry       : {registry.runs_csv}  ({len(registry.read_runs())} rows)")
 """)
 
 md(r"""

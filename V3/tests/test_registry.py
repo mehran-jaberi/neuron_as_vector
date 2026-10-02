@@ -7,8 +7,8 @@ from datetime import datetime
 import numpy as np
 import pytest
 
-from v3.config import StateRegularizationConfig, V3Config
-from v3.registry import RUN_FIELDS, RunRegistry, run_row_from_variant, split_accuracy
+from v3.config import StateRegularizationConfig, TimingConfig, V3Config
+from v3.registry import RUN_FIELDS, RunRegistry, register_run, run_row_from_variant, split_accuracy
 
 
 def _row(**over):
@@ -148,3 +148,70 @@ def test_row_from_variant_extracts_config_and_accuracies():
     assert row["english_accuracy"] == pytest.approx(1.0)
     assert row["german_accuracy"] == pytest.approx(1.0)
     assert set(RUN_FIELDS).issubset(set(row))
+
+
+def test_timing_and_shuffle_fields_are_recorded():
+    cfg = V3Config(
+        tag="v3_2ms", n_neurons=64, state_dim=1000,
+        timing=TimingConfig(sequence_duration_ms=1000.0, time_bin_ms=2.0),
+    )
+    row = run_row_from_variant(cfg=cfg, n_parameters=1)
+    assert row["sequence_duration_ms"] == 1000.0
+    assert row["time_bin_ms"] == 2.0
+    assert row["num_time_steps"] == 500
+    assert row["simulation_dt_ms"] == 2.0
+    assert row["shuffle_train"] is True
+    assert row["shuffle_val"] is False
+
+
+def test_default_row_records_the_4ms_reference():
+    row = run_row_from_variant(cfg=V3Config(), n_parameters=1)
+    assert row["sequence_duration_ms"] == 1000.0
+    assert row["time_bin_ms"] == 4.0
+    assert row["num_time_steps"] == 250
+    assert row["simulation_dt_ms"] == 4.0
+
+
+def test_header_migration_preserves_old_rows(tmp_path):
+    """An existing runs.csv with an older header must not be corrupted."""
+    (tmp_path / "runs.csv").write_text("run_id,notes\nold_row,legacy\n", encoding="utf-8")
+    reg = RunRegistry(tmp_path)
+    reg.record(_row(notes="new"))
+    runs = reg.read_runs()
+    assert len(runs) == 2
+    assert runs[0]["run_id"] == "old_row" and runs[0]["notes"] == "legacy"
+    assert runs[1]["notes"] == "new"
+    assert "num_time_steps" in runs[1] and "sequence_duration_ms" in runs[1]
+
+
+def test_register_run_is_the_shared_entry_point(tmp_path):
+    """The notebook and the CLI both call this; it writes one row + artifacts."""
+    cm = np.eye(20, dtype=int) * 2
+    test_metrics = {"test_accuracy": 0.8, "test_correct": 16, "test_total": 20,
+                    "confusion_matrix": cm}
+    cfg = V3Config(tag="v3_reg", epochs=5)
+    reg = RunRegistry(tmp_path)
+    run_dir = register_run(
+        reg, cfg,
+        n_parameters=2025440,
+        fit_metrics={"accuracy": 0.9},
+        val_metrics={"accuracy": 0.85},
+        test_metrics=test_metrics,
+        train_seconds=100.0,
+        duration_seconds=110.0,
+        checkpoint="x.pt",
+        best_val_accuracy=0.85,
+        best_epoch=3,
+        notes="notebook",
+        extra_metrics={"vector": {"fit": {"accuracy": 0.9}}},
+        history=[{"epoch": 1, "loss": 1.0}],
+    )
+    runs = reg.read_runs()
+    assert len(runs) == 1
+    assert runs[0]["test_correct"] == "16"
+    assert runs[0]["num_time_steps"] == "250"
+    assert runs[0]["notes"] == "notebook"
+    assert (run_dir / "config.yaml").exists()
+    assert (run_dir / "metrics.json").exists()
+    assert (run_dir / "confusion_matrix.csv").exists()
+    assert (run_dir / "summary.txt").exists()
