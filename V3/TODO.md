@@ -100,6 +100,11 @@ active interface; if a feature is implemented it works, if it is not it lives he
 
 ## Experiments
 
+- [ ] optimizer sweep:
+    - Adam (current)
+    - AdamW
+    - SGD + momentum
+    - LAMB
 - [ ] more `N` values (N=16/32/128/256) to separate "vector state" from "more units"
 - [ ] more `D` values (D=1, 4, 16, 64, 256, 1000, 4096) - the size of the effect
 - [ ] multiple seeds per configuration (the single-seed result has no error bar)
