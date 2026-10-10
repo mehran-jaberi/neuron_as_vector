@@ -1,0 +1,87 @@
+# V3 primary configuration.
+#
+# A neuron's internal state is a genuine D-dimensional vector; D dimensions
+# participate directly in the neuron's recurrent dynamics, its interaction with
+# the other neurons, and spike generation.  See ../README.md.
+#
+# Everything the experiment needs is here; N and D are never hard-coded in the
+# model, the data loader or the notebook.
+
+# ---- run identity ----
+tag: v3_vector_d1000
+seed: 0
+
+# ---- data (SHD, official event-based files) ----
+train_h5: data/shd_train.h5
+test_h5: data/shd_test.h5
+n_inputs: 700
+n_classes: 20
+# Temporal discretization.  num_time_steps is DERIVED: T = duration / bin.
+#   1000 ms / 2 ms -> 500 steps  (DEFAULT; float16 state)
+#   1000 ms / 4 ms -> 250 steps  (historical reference discretization)
+# time_bin_ms is BOTH the SHD bin width AND the model integration step dt,
+# so alpha = dt/tau changes with it (2/tau vs 4/tau).
+timing:
+  sequence_duration_ms: 1000
+  time_bin_ms: 2
+binary_input: true     # >=1 event in a bin -> 1 (standard SHD encoding)
+val_fraction: 0.10     # stratified split of the TRAIN file only (monitoring)
+split_seed: 0
+cache_events: true
+max_train_samples: 0   # 0 = full FIT split
+shuffle_train: true    # shuffle FIT batch order between epochs (fixed 90/10 split)
+shuffle_val: false     # deterministic validation order
+
+# ---- model ----
+n_neurons: 64          # N
+state_dim: 1000        # D
+mix_rank: 64           # rank of the shared intra-neuron mixing operator
+tau_ms: 20.0           # state leak time constant
+input_gain: 5.0        # scale of the shared input projection init
+surrogate_beta: 4.0
+surrogate_gamma: 1.0
+readout: sum           # spike-count readout
+rate_reg: 1.0e-4       # firing-rate regulariser weight (0 disables)
+rate_target_hz: 10.0   # target rate used for threshold init and the regulariser
+emit_identity_init: true
+
+# ---- training ----
+batch_size: 128
+epochs: 5            # primary control of how much training is performed
+max_train_batches: null  # null = use all training batches; an integer caps every
+                         # epoch at that many batches (debug / smoke runs only;
+                         # evaluation and testing always use the full splits)
+learning_rate: 1.0e-3
+weight_decay: 0.0
+grad_clip: 1.0
+optimizer: adam
+lr_schedule: cosine
+warmup_frac: 0.03
+label_smoothing: 0.0
+
+# ---- precision / device ----
+device: cuda
+dtype: float16
+amp: true
+grad_checkpoint_chunks: 10
+select_best_val: true
+
+# ---- controlled state imprecision (the imprecision-stage experiment) ----
+# Applied to the neuron's internal vector state z(t), independently of `dtype`
+# (which is the training arithmetic).  `mode: none` reproduces the baseline.
+# Screening values: noise_std 0.001 / 0.005 / 0.01 / 0.02 / 0.05;
+#                   quantize_bits 16 / 12 / 8 / 6 / 4.
+state_regularization:
+  mode: none                      # none | noise | quantization | noise_quantization
+  noise_std: 0.01                 # sigma of z <- z + N(0, sigma^2)
+  quantize_bits: 8                # symmetric straight-through quantizer
+  quantize_clip: 1.0              # |z| bound (tanh invariant; safety guard)
+  apply_during_training: true     # training-time regularization (default)
+  apply_during_validation: false  # validation stays at full precision
+  apply_during_test: false        # official test stays at full precision
+
+# ---- io ----
+out_dir: results
+ckpt_dir: checkpoints
+figure_dir: figures
+log_every: 0
