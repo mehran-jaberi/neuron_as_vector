@@ -81,10 +81,50 @@ Parameter count: vector 2,025,440 vs scalar 6,335 (**×320**).
 
 - Three 4 ms registry rows have an empty `time_bin_ms` (written before the timing columns
   existed).
-- `V3_SHD_experiment.ipynb` does not register its run through the registry (PI: known).
+- ~~`V3_SHD_experiment.ipynb` does not register its run (PI: known)~~ — **corrected
+  2026-10-25**: it did register, but only from the last cell, after every plot, reload and
+  comparison cell; the committed notebook shows the run row written and then a kernel crash.
+  The real defect was *loss on crash*. Fixed in `V3/tools/build_notebook.py` (new `8b. Register
+  run` cell immediately after training); notebook regenerated; 4 static tests added
+  (`V3/tests/test_notebook_registration.py`, 78 tests green).
 - `checkpoints/sweep_l2_0.pt` is the V2 baseline cited by `V3/RESULTS.md`; it must survive
   the archive move (path reference updated).
 
 ## Next gate
 
-PI decides the archive layout; then the first red-flag batch is briefed.
+Red-flag fixes (S1a, S3b, S4a, S6a) and the notebook-registration fix are applied and
+uncommitted. PI decides: commit (and push from VS Code) → then the next direction (abstract
+draft vs anything else). No new experiment is running.
+
+---
+
+## 2026-10-25 — red-flag decisions (PI)
+
+Post-audit red-flag round (`CLAIMS_AUDIT.md`); docs-only follow-up. No training
+run and no commit in this round.
+
+- **S1a — adopted.** The `D=1` scalar is an **untuned, size-matched control
+  (ablation)**, not a competitive baseline; the docs relabel it and state that no
+  literature-baseline improvement is claimed from 49.43 %. Support (`screening`,
+  5 epochs, seed 0, `V3/results/runs.csv`): scalar flat at 35.20 % (N=64, 6,335
+  params), 31.71 % (N=256, 72,383), 33.13 % (N=1411, 2,025,488); vector 57.20 %
+  at `D=4` (9,056 params) and 76.15 % at `D=1000` (2,025,440).
+- **S3b — adopted.** `VAL` (96.32 %) is annotated as speaker-overlapping
+  (class-stratified random 10 % split of the training file,
+  `V3/v3/data.py:169-198`), monitoring only, **not a generalisation estimate**.
+- **S4a — adopted.** Protocol disclosure added to the docs: screening and model
+  selection used official TEST accuracy at 5 epochs (n = 2264, ±0.84 pp binomial
+  SE), by PI decision, because `VAL` saturates (96–99 %); the 20-epoch headline
+  is the final-epoch model, not a test-selected checkpoint.
+- **S6a — adopted.** Headline numbers use final-epoch weights
+  (`V3/v3/experiment.py:192` default `which="final"`;
+  `V3/v3/train.py:330-334` clones the best-`VAL` state into `result.state_dict`
+  without restoring it). `checkpoints/<tag>_bestval.pt` is diagnostic only — it
+  is selected on the speaker-overlapping `VAL` and must not be used to reproduce
+  headline numbers.
+- **Multi-seed — rejected for now.** No multi-seed runs in this round; it would be
+  the last step of the project and would likely run on another machine.
+- **4 ms 79.81 % (1807/2264) `doc-claim` — left as accepted docs.** No action; the
+  number stays a `doc-claim` and was not re-verified.
+- **Claims audit (`CLAIMS_AUDIT.md`) — flagged, docs accepted as-is.** No further
+  doc changes beyond S1a/S3b/S4a/S6a in this round.

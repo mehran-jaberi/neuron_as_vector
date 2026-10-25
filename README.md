@@ -11,11 +11,20 @@ Active code: **`V3/`**. Everything earlier is archived (see [Archives](#archives
 | model | config | epochs | test (official, 2264) | tag |
 |---|---|---|---|---|
 | vector neuron | `N=64`, `D=1000`, 2 ms | 20 | **1868 = 82.51 %** | confirmed |
-| scalar neuron | `N=64`, `D=1`, same training | 20 | 1119 = 49.43 % | confirmed |
+| scalar neuron (untuned, size-matched control) | `N=64`, `D=1`, same training | 20 | 1119 = 49.43 % | confirmed |
 | V2 LIF reference | `N=256`, T=1400 ms | 20 | 59.98 % | doc-claim |
 
-Numbers are seed 0 only (no error bar yet), and the vector-vs-scalar gap is
-**confounded** — see `INVESTIGATION.md` for what is and is not established.
+Numbers are seed 0 only (no error bar yet). The scalar row is an **untuned,
+size-matched control (ablation)**, not a competitive baseline, and no
+literature-baseline improvement is claimed from it. The 5-epoch screen
+(`screening`, seed 0) shows why: the scalar family is flat across capacity —
+797/2264 = 35.20 % at 6,335 parameters, 31.71 % at 72,383, 33.13 % at
+2,025,488 — while the vector model reaches 57.20 % with 9,056 parameters (`D=4`)
+and 76.15 % at `D=1000`. The vector-vs-scalar gap is still **confounded** — see
+`INVESTIGATION.md` for what is and is not established. `VAL` (96.32 %) is a
+class-stratified random 10 % split of the training file, so it shares speakers
+with `FIT`; it is monitoring only, never a generalisation estimate
+(`V3/v3/data.py:169-198`).
 
 ## Layout
 

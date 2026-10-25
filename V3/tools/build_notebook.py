@@ -74,6 +74,7 @@ same readout) is trained as the reference point.
 | 6 | Define the population |
 | 7 | Define the classifier |
 | 8 | Training |
+| 8b | Register run (immediately after training) |
 | 9 | Training visualisations |
 | 10 | Save checkpoint |
 | 11 | Test (official SHD test set) |
@@ -81,7 +82,6 @@ same readout) is trained as the reference point.
 | 13 | Scalar baseline |
 | 14 | Final comparison |
 | 15 | Results / notes |
-| 16 | Register run (persistent registry) |
 
 Everything is imported from the small `v3` package next to this notebook; the
 notebook contains no scientific logic of its own, so the command-line runner
@@ -396,6 +396,58 @@ print(f"FIT firing rate: mean {variant.fit_metrics['rate_mean_hz']:.1f} Hz, "
 """)
 
 md(r"""
+## 8b. Register run
+
+Write the run to the persistent registry **now** -- as soon as training and the official
+test have produced real numbers, and before any plotting, checkpoint inspection, scalar
+baseline or comparison cell (sections 9-15).  One configuration -> one registry row ->
+one `V3/results/<run_id>/` directory, exactly the machinery of the command-line runner
+(`v3.registry.register_run`), so notebook and CLI runs share one schema and one file.
+
+The later cells are presentation: if one of them crashes, the registry row is already on
+disk.  The official test set is evaluated in this cell because the row must carry the
+primary number (`test_correct` / `test_total`); the scalar-baseline comparison is a
+second configuration, so it goes to the summary JSON in section 15, not to this row.
+
+Output: one row in `V3/results/runs.csv` plus a timestamped directory
+`V3/results/<run_id>/` holding `config.yaml`, `metrics.json`,
+`confusion_matrix.csv` and `summary.txt`.
+""")
+
+py(r"""
+# The official test set is evaluated here, immediately after training, so the row
+# written below carries the primary number of the run.
+test = test_variant(variant, which="final", show_progress=True)
+
+registry = RunRegistry(cfg.v3_path(cfg.out_dir))
+run_dir = register_run(
+    registry, cfg,
+    n_parameters=variant.model.n_parameters(),
+    fit_metrics=variant.fit_metrics,
+    val_metrics=variant.val_metrics,
+    test_metrics=test,
+    train_seconds=variant.result.total_seconds,
+    duration_seconds=variant.wall_seconds,
+    checkpoint=str(variant.checkpoint_path),
+    best_val_accuracy=variant.result.best_val_accuracy,
+    best_epoch=variant.result.best_epoch,
+    notes=f"notebook{' quick' if QUICK else ''}",
+    extra_metrics={
+        "vector": {
+            "fit": variant.fit_metrics,
+            "val": variant.val_metrics,
+            "dtypes": variant.result.dtypes,
+            "rate_mean_hz": variant.fit_metrics["rate_mean_hz"],
+            "rate_max_hz": variant.fit_metrics["rate_max_hz"],
+        },
+    },
+    history=variant.history_rows(),
+)
+print(f"registered run : {run_dir}")
+print(f"registry       : {registry.runs_csv}  ({len(registry.read_runs())} rows)")
+""")
+
+md(r"""
 ## 9. Training visualisations
 """)
 
@@ -437,10 +489,15 @@ md(r"""
 
 The official SHD test set.  Parameters are frozen, gradients are disabled, and
 **every** test sample is evaluated.  Nothing here is estimated.
+
+The evaluation itself runs in section 8b, immediately after training, so the
+registry row is already on disk before this section; the numbers below are the
+stored result of that pass, not a second evaluation.
 """)
 
 py(r"""
-test = test_variant(variant, which="final", show_progress=True)
+# `test` was evaluated in section 8b, immediately after training and before any
+# plotting, so the registry row already carries these numbers.  Nothing is re-run here.
 print()
 print(f"correct : {test['test_correct']}")
 print(f"total   : {test['test_total']}")
@@ -582,56 +639,6 @@ print(f"SCALAR  D={scalar_cfg.state_dim:<5} N={scalar_cfg.n_neurons:<4} "
       f"{s['n_parameters']:>10,} params   "
       f"test {s['test_correct']:5d}/{s['test_total']} = {s['test_accuracy'] * 100:6.2f}%")
 print("=" * 62)
-""")
-
-md(r"""
-## 16. Register run
-
-Append the completed experiment to the persistent registry -- **exactly the same
-machinery as the command-line runner** (`V3/v3/registry.py`), so notebook and CLI
-runs share one schema and one file.  This cell runs only at the very end, after
-training, validation and the official test have all produced real results; if any
-earlier stage failed, no registry row is written.
-
-Output: one row in `V3/results/runs.csv` plus a timestamped directory
-`V3/results/<run_id>/` holding `config.yaml`, `metrics.json`,
-`confusion_matrix.csv` and `summary.txt`.
-""")
-
-py(r"""
-registry = RunRegistry(cfg.v3_path(cfg.out_dir))
-run_dir = register_run(
-    registry, cfg,
-    n_parameters=variant.model.n_parameters(),
-    fit_metrics=variant.fit_metrics,
-    val_metrics=variant.val_metrics,
-    test_metrics=test,
-    train_seconds=variant.result.total_seconds,
-    duration_seconds=variant.wall_seconds,
-    checkpoint=str(variant.checkpoint_path),
-    best_val_accuracy=variant.result.best_val_accuracy,
-    best_epoch=variant.result.best_epoch,
-    notes=f"notebook{' quick' if QUICK else ''}",
-    extra_metrics={
-        "vector": {
-            "fit": variant.fit_metrics,
-            "val": variant.val_metrics,
-            "dtypes": variant.result.dtypes,
-            "rate_mean_hz": variant.fit_metrics["rate_mean_hz"],
-            "rate_max_hz": variant.fit_metrics["rate_max_hz"],
-        },
-        "scalar": {
-            "fit_accuracy": scalar.fit_metrics["accuracy"],
-            "val_accuracy": scalar.val_metrics["accuracy"],
-            "test_accuracy": scalar_test["test_accuracy"],
-            "test_correct": scalar_test["test_correct"],
-            "test_total": scalar_test["test_total"],
-        },
-    },
-    history=variant.history_rows(),
-)
-print(f"registered run : {run_dir}")
-print(f"registry       : {registry.runs_csv}  ({len(registry.read_runs())} rows)")
 """)
 
 md(r"""

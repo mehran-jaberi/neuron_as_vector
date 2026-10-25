@@ -18,7 +18,7 @@ The previous 4 ms reference (250 steps, $\alpha = 0.2$) is retained for comparis
 
 **Configuration** (`configs/v3_default.yaml`, `seed = 0`, **one seed — no error bar**):
 
-| | vector | scalar baseline |
+| | vector | scalar control (untuned) |
 |---|---|---|
 | neurons `N` | 64 | 64 |
 | state dimension `D` | **1000** | **1** |
@@ -26,7 +26,7 @@ The previous 4 ms reference (250 steps, $\alpha = 0.2$) is retained for comparis
 | epochs / batch | 20 / 128 | 20 / 128 |
 | optimizer / schedule | Adam, lr 1e-3, cosine, 3% warmup, clip 1.0 | same |
 | loss | CE + 1e-4·(rate − 10 Hz)² | same |
-| data | SHD, FIT 7340 / VAL 816 (stratified split of the train file) | same |
+| data | SHD, FIT 7340 / VAL 816 (class-stratified split of the train file; shares speakers with FIT — monitoring only) | same |
 | temporal resolution | **500 × 2 ms = 1000 ms**, binary input (dt = 2 ms, α = dt/τ = 0.1) | same |
 | surrogate | fast sigmoid γu/(1+β\|u\|), β=4, γ=1 | same |
 | device / dtype | CUDA (RTX 3060 Laptop, 6 GiB) / fp16 state, fp32 masters + loss | same |
@@ -47,7 +47,15 @@ SCALAR  D=1     accuracy: 49.43%
 vector − scalar = +33.08 percentage points
 ```
 
-Reference points: a plain recurrent SHD baseline is usually quoted around 71%;
+The `SCALAR` row is an **untuned, size-matched control (ablation)**, not a
+competitive baseline; the repository does **not** claim a literature-baseline
+improvement from the +33.08 pp gap. The honest capacity comparison is the
+5-epoch screen in §3 (`screening`): the scalar family is flat from 6,335 to
+2,025,488 parameters (35.20 %, 31.71 %, 33.13 %) while the vector family reaches
+57.20 % with 9,056 parameters (`D=4`) and 76.15 % at `D=1000`.
+
+Reference points: a plain recurrent SHD baseline is usually quoted around 71%
+(context only — not reproduced here, and no claim rests on it);
 the repository's own V2 LIF model (N=256, T=1400 ms, 2 ms bins, 20 epochs)
 measured **59.98%** on the same test file
 (`archive/v2/artifacts/checkpoints/sweep_l2_0.pt`,
@@ -88,10 +96,20 @@ total 4243.5 s (≈ 204 s/epoch; the first epoch is slower because it also fills
 the in-RAM event cache); FIT accuracy over the whole training split **100.00%**
 (loss 0.0134); best-validation epoch = **16** (val 0.9767). The population closes
 the FIT/VAL gap by epoch 8 and then mildly overfits (train 100% vs val 96.3% at
-epoch 20); the final (not best-val) weights are what §3 evaluates.
+epoch 20). `VAL` is a class-stratified random 10 % split of the training file and
+shares speakers with `FIT` (`V3/v3/data.py:169-198`): speaker-overlapping,
+monitoring only, **not a generalisation estimate**.
 
-Scalar (`D=1`, 6,335 parameters, 20 epochs, 2 ms): FIT accuracy **58.01%**,
-VAL **53.68%**, 1380.6 s total (≈ 69 s/epoch).
+**Which weights the headline uses.** The headline numbers in §1 and §3 come from
+the **final-epoch** weights (`v3/experiment.py:192` defaults to `which="final"`;
+`v3/train.py:330-334` only clones the best-`VAL` state into `result.state_dict`,
+it never restores it). `checkpoints/<tag>_bestval.pt` is selected on the
+speaker-overlapping `VAL` and is **diagnostic only** — it must not be used to
+reproduce the headline numbers.
+
+Scalar control (`D=1`, 6,335 parameters, 20 epochs, 2 ms): FIT accuracy
+**58.01%**, VAL **53.68%** (same speaker-overlapping caveat), 1380.6 s total
+(≈ 69 s/epoch).
 
 ## 3. Test
 
@@ -99,7 +117,7 @@ The official SHD test set (2264 samples, speakers `{0..11}` — including speake
 and 5, which never occur in the training file). Parameters frozen, gradients
 disabled, every sample evaluated, no early stopping and no selection on test.
 
-| | vector `D=1000` | scalar `D=1` |
+| | vector `D=1000` | scalar control `D=1` (untuned) |
 |---|---|---|
 | correct | **1868** | **1119** |
 | total | 2264 | 2264 |
@@ -125,6 +143,30 @@ strongest are 4 and 18 (100%).
 Predictions, logits, the confusion matrix and per-class accuracy are saved under
 `V3/results/<tag>/` and in the run directory `V3/results/2026-10-02_14-31-15/`;
 the figures are in `V3/figures/<tag>/`.
+
+### Capacity check (screening, 5 epochs — not a headline)
+
+Identical training for every row (seed 0, 2 ms, 5 epochs), all registered in
+`V3/results/runs.csv`:
+
+| family | `N` | `D` | parameters | TEST (5 epochs) | tag |
+|---|---|---|---|---|---|
+| scalar | 64 | 1 | 6,335 | 797/2264 = 35.20 % | screening |
+| scalar | 256 | 1 | 72,383 | 718/2264 = 31.71 % | screening |
+| scalar | 1411 | 1 | 2,025,488 | 750/2264 = 33.13 % | screening |
+| vector | 64 | 4 | 9,056 | 1295/2264 = 57.20 % | screening |
+| vector | 64 | 16 | 20,480 | 1443/2264 = 63.74 % | screening |
+| vector | 64 | 64 | 74,816 | 1553/2264 = 68.60 % | screening |
+| vector | 64 | 256 | 332,096 | 1757/2264 = 77.61 % | screening |
+| vector | 64 | 1000 | 2,025,440 | 1724/2264 = 76.15 % | screening |
+
+The scalar family is flat from 6,335 to 2,025,488 parameters, so the 20-epoch
+49.43 % measures an untuned control, not scalar capacity. The vector family rises
+steeply with `D` at matching parameter counts (`D=4`, 9,056 parameters → 57.20 %).
+These 5-epoch rows were compared/selected using official TEST accuracy (n = 2264,
+binomial SE ±0.84 pp, by PI decision because speaker-overlapping `VAL` saturated
+at 96–99 %), so the screen carries a disclosed test-set selection effect; the
+20-epoch headline is the final-epoch model, not a test-selected checkpoint.
 
 ## 4. Activity figures
 
@@ -155,7 +197,7 @@ three test samples and one FIT sample.
   (`N=64, D=1000, T=250, batch=128`: 1108 MiB allocated / 1148 MiB reserved, ≈ 2.2 s
   per batch). The Python-level per-step loop, not the FLOPs, is the bottleneck —
   see `TODO.md`.
-* The D=1 scalar baseline is much faster per batch (1380.6 s for 20 epochs,
+* The D=1 scalar control is much faster per batch (1380.6 s for 20 epochs,
   ≈ 69 s/epoch, ≈ 3× faster per epoch): its per-neuron state is one number, so the
   rank-R mixing and the `D×D` emission disappear.
 

@@ -5,8 +5,9 @@
 
 > **Answer (executed, 20 epochs, 2 ms, single seed).** **82.51%** — 1868 of the
 > 2264 official SHD test samples. The identical population with scalar neurons
-> ($D=1$, same 64 neurons, same training) reaches **49.43%**. See [§8](#8-results)
-> and `RESULTS.md`.
+> ($D=1$, same 64 neurons, same training) reaches **49.43%**, but that is an
+> **untuned, size-matched control (ablation)**, not a competitive baseline. See
+> [§8](#8-results) and `RESULTS.md`.
 >
 > **Current experimental reference.** $N=64$, $D=1000$, 2,025,440 parameters,
 > **2 ms** discretization ($T=500$, $\alpha=0.1$), 20 epochs: **82.51%**
@@ -119,7 +120,7 @@ $$
 
 Both are ordinary keys in `configs/v3_default.yaml`; nothing in the model, data
 loader or notebook hard-codes them. Setting `state_dim: 1` gives the scalar
-baseline population *through the identical code path*.
+control population *through the identical code path*.
 
 ---
 
@@ -266,11 +267,11 @@ The default configuration is `epochs: 20` at the **2 ms** discretization
 optimizer and epoch count. Full per-epoch numbers are in `RESULTS.md`; the run is
 also in the registry (`V3/results/runs.csv`, run `2026-10-02_14-31-15`).
 
-| | vector `D=1000` | scalar baseline `D=1` |
+| | vector `D=1000` | scalar control `D=1` (untuned) |
 |---|---|---|
 | trainable parameters | 2,025,440 | 6,335 |
 | FIT accuracy (final epoch) | 100.00% | 58.01% |
-| VAL accuracy (final epoch) | 96.32% | 53.68% |
+| VAL accuracy (final epoch)¹ | 96.32% | 53.68% |
 | **TEST correct / total** | **1868 / 2264** | **1119 / 2264** |
 | **TEST accuracy** | **82.51%** | **49.43%** |
 | test errors | 396 | 1145 |
@@ -283,13 +284,55 @@ also in the registry (`V3/results/runs.csv`, run `2026-10-02_14-31-15`).
 | test pass wall time | 24.1 s for all 2264 samples | not recorded |
 | training wall time (20 epochs) | 4243.5 s (≈ 204 s/epoch) | 1380.6 s (≈ 69 s/epoch) |
 
-**The vector population beats the scalar population by +33.08 percentage points**
+¹ `VAL` is a class-stratified **random** 10 % split of the training file
+(`V3/v3/data.py:169-198`), so it shares speakers with `FIT`: it is
+speaker-overlapping, used for monitoring only, and is **not a generalisation
+estimate**. The `TEST` row is the comparable number.
+
+**The vector population beats this control by +33.08 percentage points**
 (82.51% vs 49.43%) with the same 64 neurons, the same input, the same readout and
-the same training procedure. At 20 epochs the scalar baseline has learned much
-more than at 3 epochs (49.43% vs 26.55%), so the vector advantage is **not**
-merely "the scalar model had not trained yet"; the vector population reaches
-82.51%, above the repository's own V2 LIF baseline (59.98%, N=256, 20 epochs) and
-well above the ~71% usually quoted for a plain recurrent SHD baseline.
+the same training procedure. The scalar row is an **untuned, size-matched
+control (ablation)**, not a competitive baseline: no improvement over a
+literature baseline is claimed from this gap, and 49.43% says nothing about what
+a tuned scalar model could reach. At 20 epochs the control has learned much more
+than at 3 epochs (49.43% vs 26.55%), so the gap is **not** merely "the scalar
+model had not trained yet" — but it is one seed, one schedule, and three
+simultaneous changes (`D`, the population broadcast, the parameter count; see
+`INVESTIGATION.md`). The repository's own V2 LIF model (N=256, T=1400 ms,
+20 epochs) measures 59.98% (`doc-claim`). A plain recurrent SHD baseline is
+usually quoted around 71%; this repository has not reproduced one, so that figure
+is context only and no claim rests on it.
+
+The honest capacity comparison is the 5-epoch screen below (`screening`, seed 0,
+2 ms, identical training for every row, never a headline). The scalar family is
+flat from 6,335 to 2,025,488 parameters while the vector family rises steeply
+with `D`:
+
+| family | `N` | `D` | parameters | 5-epoch TEST | tag |
+|---|---|---|---|---|---|
+| scalar | 64 | 1 | 6,335 | 797/2264 = 35.20% | screening |
+| scalar | 256 | 1 | 72,383 | 718/2264 = 31.71% | screening |
+| scalar | 1411 | 1 | 2,025,488 | 750/2264 = 33.13% | screening |
+| vector | 64 | 4 | 9,056 | 1295/2264 = 57.20% | screening |
+| vector | 64 | 16 | 20,480 | 1443/2264 = 63.74% | screening |
+| vector | 64 | 64 | 74,816 | 1553/2264 = 68.60% | screening |
+| vector | 64 | 256 | 332,096 | 1757/2264 = 77.61% | screening |
+| vector | 64 | 1000 | 2,025,440 | 1724/2264 = 76.15% | screening |
+
+**Protocol disclosure.** Screening and model selection used the official
+**TEST accuracy at 5 epochs** (n = 2264, binomial SE ±0.84 pp), by PI decision:
+`VAL` is speaker-overlapping and saturated near the end of training (96–99 %), so
+it could not discriminate between variants. No test sample was trained on and no
+test data builds features; the disclosure is that the 5-epoch selector saw test
+accuracy, so 5-epoch test numbers carry a selection effect and are tagged
+`screening`, never headline.
+
+**Which weights the headline uses.** The 82.51% comes from the **final-epoch**
+weights (`v3/experiment.py:192` defaults to `which="final"`;
+`v3/train.py:330-334` only clones the best-`VAL` state into `result.state_dict`,
+it never restores it). `checkpoints/<tag>_bestval.pt` is selected on the
+speaker-overlapping `VAL` and is **diagnostic only** — it must not be used to
+reproduce the headline numbers.
 
 Training progressed as (vector; the full 20-epoch table is in `RESULTS.md`):
 
@@ -338,12 +381,12 @@ V3/
 ## 10. Known limitations
 
 1. **Single seed.** No error bar on any number. See `TODO.md`.
-2. **`VAL` is not speaker-independent** (it is a stratified split of the
-   training file, so it shares speakers with `FIT`). The published SHD
-   train/test gap is dominated by speaker shift — the official test set contains
-   speakers 4 and 5, which are absent from the training file — so `VAL` is
-   optimistic and is used only for monitoring and best-checkpoint selection. The
-   **test** number is the comparable one.
+2. **`VAL` is not speaker-independent** (it is a stratified random split of the
+   training file, `V3/v3/data.py:169-198`, so it shares speakers with `FIT`). The
+   published SHD train/test gap is dominated by speaker shift — the official test
+   set contains speakers 4 and 5, which are absent from the training file — so
+   `VAL` is optimistic and is used only for monitoring and best-checkpoint
+   selection. The **test** number is the comparable one.
 3. **Truncated tail.** A 1000 ms window drops events beyond 1000 ms for ~3.4% of
    training and ~1.0% of test utterances.
 4. **No data augmentation.** Published competitive SHD numbers typically use
@@ -487,7 +530,7 @@ cells) and the registry run `2026-10-02_14-31-15`. This is the number every
 imprecision screening run is compared against. The previous 4 ms reference
 (250 steps, alpha 0.2, same 20 epochs) measured **79.81%** (1807/2264); older
 measured points (all single-seed): $D=1000$ at 3 epochs (4 ms) = 71.78%; scalar
-$D=1$ at 3 epochs = 26.55% and at 20 epochs (2 ms) = 49.43%; $N=128$, $D=1000$
+control $D=1$ at 3 epochs = 26.55% and at 20 epochs (2 ms) = 49.43%; $N=128$, $D=1000$
 (4 ms) = 79.24%; $N=64$, $D=2000$ (4 ms) = 77.96%. Doubling $N$ (64→128) or $D$
 (1000→2000) did not improve on the reference, whereas halving the time step
 (4 ms → 2 ms) did (+2.70 points).
