@@ -16,11 +16,11 @@
 > this 82.51% reference; see [§11](#11-controlled-state-imprecision--the-run-registry).
 
 This folder is an independent experiment. It is **not** an extension of V2 and
-does not import, modify or reproduce any of the V2 architecture
-(`src/`, `scripts/`, `configs/` of the repository root are untouched). It is also
-not a rerun of `brian implementation/`, which was a *fixed* high-dimensional
-dynamical system with a trained readout. Here the vector dynamics themselves are
-trained end-to-end.
+does not import, modify or reproduce any of the V2 architecture (the old root
+`src/`, `scripts/`, `configs/` now live under `archive/v2/` and are untouched). It
+is also not a rerun of the early Brian prototype (`brian implementation/`, removed
+from the tree in 2026-10 — a *fixed* high-dimensional dynamical system with a
+trained readout). Here the vector dynamics themselves are trained end-to-end.
 
 ---
 

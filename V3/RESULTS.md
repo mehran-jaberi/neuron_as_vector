@@ -49,8 +49,9 @@ vector − scalar = +33.08 percentage points
 
 Reference points: a plain recurrent SHD baseline is usually quoted around 71%;
 the repository's own V2 LIF model (N=256, T=1400 ms, 2 ms bins, 20 epochs)
-measured **59.98%** on the same test file (`checkpoints/sweep_l2_0.pt`,
-`results/lif_baseline_selection.json`).  The previous V3 reference — the same
+measured **59.98%** on the same test file
+(`archive/v2/artifacts/checkpoints/sweep_l2_0.pt`,
+`archive/v2/artifacts/results/lif_baseline_selection.json`).  The previous V3 reference — the same
 $N=64$, $D=1000$ population at the **4 ms** discretization ($T=250$, α = 0.2),
 20 epochs — measured **79.81%** (1807/2264). The 2 ms run is **+2.70 percentage
 points** above that, i.e. halving the time step and the leak `alpha` improved the

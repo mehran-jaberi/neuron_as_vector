@@ -55,7 +55,7 @@ torch = { index = "pytorch-cu126" }
 [tool.pytest.ini_options]
 minversion = "8.0"
 addopts = "-q"
-testpaths = ["tests"]
+testpaths = ["V3/tests"]
 pythonpath = ["."]
 filterwarnings = ["ignore::DeprecationWarning"]
 
