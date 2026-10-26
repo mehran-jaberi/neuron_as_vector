@@ -190,6 +190,9 @@ class V3Config:
     val_fraction: float = 0.10   # stratified validation split, taken from the TRAIN file
     split_seed: int = 0
     cache_events: bool = True    # cache binned event codes in RAM (faster epochs)
+    binned_cache: bool = False   # read the dense (n,T,C) input from the pre-binned
+    #                              disk cache (V3/v3/binned_cache.py) instead of
+    #                              rebuilding it per batch; opt-in, built once
     max_train_samples: int = 0   # 0 = use the whole training split (subset only for quick runs)
     shuffle_train: bool = True   # shuffle FIT batches between epochs
     shuffle_val: bool = False    # validation order is deterministic

@@ -206,10 +206,20 @@ class VectorNeuronPopulation(nn.Module):
         )
 
     # ------------------------------------------------------------------ #
-    def _segment(self, z: torch.Tensor, a_chunk: torch.Tensor):
+    def _segment(
+        self,
+        z: torch.Tensor,
+        a_chunk: torch.Tensor,
+        state_sum: torch.Tensor | None = None,
+    ):
         """Run one chunk of timesteps.  Returns ``(z_next, spikes, potentials)``.
 
         Kept as a bound method so ``torch.utils.checkpoint`` can recompute it.
+
+        ``state_sum`` is an optional ``(B, N, D)`` fp32 accumulator; when given,
+        the state that is *read* at every timestep is added to it in place.  It is
+        used by :meth:`forward` (``return_states=True``) to obtain the time-mean
+        state without storing per-timestep states, and must not require grad.
         """
         w_in, w_down, w_up, w_emit, w_rec, gate, bias, w_out, theta, _ = self._weights()
         dt = self.state_dtype
@@ -218,6 +228,8 @@ class VectorNeuronPopulation(nn.Module):
 
         spikes, pots = [], []
         for k in range(a_chunk.shape[1]):
+            if state_sum is not None:
+                state_sum += z                                        # fp32 running sum
             pot = (z * w_out).sum(-1) + theta                          # (B, N) fp16
             pots.append(pot)
             s = surrogate_spike(pot, beta, gamma)                      # (B, N) fp16
@@ -236,8 +248,21 @@ class VectorNeuronPopulation(nn.Module):
         return z, torch.stack(spikes, dim=1), torch.stack(pots, dim=1)
 
     # ------------------------------------------------------------------ #
-    def forward(self, x: torch.Tensor, return_potentials: bool = False):
-        """``x``: ``(B, T, C)`` float tensor.  Returns ``(logits, spikes[, pots])``."""
+    def forward(
+        self,
+        x: torch.Tensor,
+        return_potentials: bool = False,
+        return_states: bool = False,
+    ):
+        """``x``: ``(B, T, C)`` float tensor.
+
+        Returns ``(logits, spikes[, pots][, z_final, z_mean])``; the optional
+        state summary is appended after the optional potentials.  ``z_final`` is
+        the ``(B, N, D)`` state after the last update, ``z_mean`` the ``(B, N, D)``
+        time-mean of the state read at each timestep (accumulated in fp32,
+        returned in the state dtype).  ``return_states=True`` is an analysis
+        path: it is not supported together with gradient checkpointing.
+        """
         B, T, C = x.shape
         if C != self.n_inputs:
             raise ValueError(f"expected {self.n_inputs} input channels, got {C}")
@@ -253,13 +278,25 @@ class VectorNeuronPopulation(nn.Module):
         chunks = int(self.cfg.grad_checkpoint_chunks)
         step = max(1, math.ceil(T / chunks))
         use_ckpt = self.training and checkpoint_supported(z)
+        if return_states and use_ckpt:
+            raise ValueError(
+                "return_states=True is not supported together with gradient "
+                "checkpointing; call forward under torch.no_grad()/eval()"
+            )
+        # fp32 accumulator: a fp16 running sum would lose ~1e-1 relative accuracy
+        # after T=500 additions.  Never stores per-timestep states.
+        state_sum = (
+            torch.zeros(B, self.n_neurons, self.state_dim, device=x.device, dtype=torch.float32)
+            if return_states
+            else None
+        )
         spikes, pots = [], []
         for t0 in range(0, T, step):
             a_chunk = a[:, t0 : t0 + step]
             if use_ckpt:
                 z, s, p = checkpoint(self._segment, z, a_chunk, use_reentrant=False)
             else:
-                z, s, p = self._segment(z, a_chunk)
+                z, s, p = self._segment(z, a_chunk, state_sum)
             spikes.append(s)
             if return_potentials:
                 pots.append(p)
@@ -269,9 +306,13 @@ class VectorNeuronPopulation(nn.Module):
         if self.cfg.readout == "mean":
             counts = counts / spikes.shape[1]
         logits = counts @ self.w_cls.float()                           # (B, K) fp32
+        out = [logits, spikes]
         if return_potentials:
-            return logits, spikes, torch.cat(pots, dim=1)
-        return logits, spikes
+            out.append(torch.cat(pots, dim=1))
+        if return_states:
+            out.append(z)                                              # final state (B,N,D)
+            out.append((state_sum / T).to(dt))                         # time-mean state (B,N,D)
+        return tuple(out)
 
     # ------------------------------------------------------------------ #
     def rate_hz(self, spikes: torch.Tensor) -> torch.Tensor:

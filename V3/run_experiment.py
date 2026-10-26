@@ -35,7 +35,13 @@ sys.path.insert(0, str(V3_ROOT))
 
 from v3 import plots  # noqa: E402
 from v3.config import StateRegularizationConfig, TimingConfig, V3Config, describe  # noqa: E402
-from v3.experiment import resolve_device, test_variant, train_variant, variant_dirs  # noqa: E402
+from v3.experiment import (  # noqa: E402
+    load_checkpoint_payload,
+    resolve_device,
+    test_variant,
+    train_variant,
+    variant_dirs,
+)
 from v3.registry import RunRegistry, register_run  # noqa: E402
 from v3.train import save_json  # noqa: E402
 
@@ -122,7 +128,8 @@ def record_run(vcfg: V3Config, variant, info: dict, test_metrics: dict | None, r
         checkpoint=info.get("checkpoint", ""),
         best_val_accuracy=info.get("best_val_accuracy"),
         best_epoch=info.get("best_epoch"),
-        notes=f"quick={info.get('quick', False)}",
+        notes=f"quick={info.get('quick', False)}"
+        + (f"; resumed_from={info['resumed_from']}" if info.get("resumed_from") else ""),
         extra_metrics=extra,
         history=info.get("history"),
     )
@@ -136,12 +143,13 @@ def apply_variant(cfg: V3Config, variant: str) -> V3Config:
     return cfg
 
 
-def run_variant(cfg: V3Config, device, show_progress=True) -> dict:
+def run_variant(cfg: V3Config, device, show_progress=True, resume_from=None) -> dict:
     t0 = time.perf_counter()
-    v = train_variant(cfg, device=device, show_progress=show_progress)
+    v = train_variant(cfg, device=device, show_progress=show_progress, resume_from=resume_from)
     out = {
         "tag": cfg.tag,
         "label": v.label,
+        "resumed_from": str(resume_from) if resume_from is not None else "",
         "n_neurons": cfg.n_neurons,
         "state_dim": cfg.state_dim,
         "n_parameters": v.model.n_parameters(),
@@ -169,6 +177,22 @@ def run_variant(cfg: V3Config, device, show_progress=True) -> dict:
     return out
 
 
+def resume_config(payload: dict, overrides: list[str], quick: bool) -> V3Config:
+    """Config for a ``--resume`` run: checkpoint config + CLI overrides, tag ``*_resumed``."""
+    if quick:
+        raise SystemExit("--resume cannot be combined with --quick (quick changes the model shape)")
+    cfg = V3Config.from_dict(payload["config"])
+    cfg = apply_overrides(cfg, overrides)
+    saved_epoch = int(payload.get("epoch") or len(payload.get("history") or []) or 0)
+    if int(cfg.epochs) <= saved_epoch:
+        raise SystemExit(
+            f"--resume: checkpoint is already at epoch {saved_epoch}; "
+            f"pass --override epochs=N with N > {saved_epoch}"
+        )
+    base_tag = cfg.tag[: -len("_resumed")] if cfg.tag.endswith("_resumed") else cfg.tag
+    return cfg.with_overrides(tag=f"{base_tag}_resumed")
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="V3 vector-neuron SHD experiment")
     ap.add_argument("--config", default=str(DEFAULT_CONFIG))
@@ -176,16 +200,27 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--variant", choices=["vector", "scalar", "both"], default="vector")
     ap.add_argument("--quick", action="store_true", help="tiny end-to-end smoke of the same code path")
     ap.add_argument("--device", default=None)
+    ap.add_argument("--resume", default=None,
+                    help="path to a v3 checkpoint; continue it to --override epochs=N, tag +_resumed")
     ap.add_argument("--no-test", action="store_true", help="train only; do not open the official test set")
     ap.add_argument("--test-best-val", action="store_true",
                     help="also evaluate the best-validation checkpoint on the test set")
     ap.add_argument("--no-progress", action="store_true")
     args = ap.parse_args(argv)
 
-    cfg = V3Config.from_yaml(args.config)
-    cfg = apply_overrides(cfg, args.override)
-    if args.quick:
-        cfg = cfg.with_overrides(**QUICK_OVERRIDES)
+    resume_payload = None
+    if args.resume:
+        if args.variant != "vector":
+            raise SystemExit("--resume restores one checkpoint; use --variant vector (omit --variant)")
+        resume_payload = load_checkpoint_payload(args.resume)
+        cfg = resume_config(resume_payload, args.override, args.quick)
+        print(f"[V3] resume: using the checkpoint config from {args.resume} "
+              f"(epoch {resume_payload.get('epoch')}, --config ignored)")
+    else:
+        cfg = V3Config.from_yaml(args.config)
+        cfg = apply_overrides(cfg, args.override)
+        if args.quick:
+            cfg = cfg.with_overrides(**QUICK_OVERRIDES)
     if args.device:
         cfg = cfg.with_overrides(device=args.device)
     device = resolve_device(cfg)
@@ -194,7 +229,7 @@ def main(argv: list[str] | None = None) -> int:
           + (f" ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else ""))
     show = not args.no_progress
 
-    variants = ["vector", "scalar"] if args.variant == "both" else [args.variant]
+    variants = ["vector", "scalar"] if args.variant == "both" else ["vector"] if args.resume else [args.variant]
     summary: dict = {"variants": {}, "quick": bool(args.quick), "config_file": args.config}
     rows: list[dict] = []
     histories: dict[str, list[dict]] = {}
@@ -204,7 +239,7 @@ def main(argv: list[str] | None = None) -> int:
     for name in variants:
         vcfg = apply_variant(cfg, name)
         print("\n" + "=" * 78 + f"\n[V3] variant: {name}  ->  {describe(vcfg)}\n" + "=" * 78)
-        info = run_variant(vcfg, device, show_progress=show)
+        info = run_variant(vcfg, device, show_progress=show, resume_from=args.resume)
         info["quick"] = bool(args.quick)
         variant_obj = info.pop("result")
         tm = None

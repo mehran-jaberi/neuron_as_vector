@@ -44,10 +44,14 @@ Measured runs (all single seed, `N=64`, `D=1000`, 2,025,440 params; full rows in
 - [x] first 5-epoch screening: noise `std 0.01` and 8-bit quantization (both at 4 ms)
 - [x] 2 ms resolution run (`time_bin_ms=2` → 500 steps, `alpha = 0.1`) —
       5-epoch 76.15%, 20-epoch **82.51%**
-- [ ] noise sweep at the current 2 ms default: `std` ∈ {0.001, 0.005, 0.01, 0.02, 0.05}
-- [ ] quantization sweep at 2 ms: `bits` ∈ {16, 12, 8, 6, 4}
-- [ ] combined `noise_quantization` for the most promising single settings
-- [ ] 20-epoch reruns of the promising imprecision regime(s), compared against the
+- [x] noise sweep at the current 2 ms default: `std` ∈ {0.001, 0.005, 0.01, 0.02, 0.05}
+      0.02 worked best in 5 epoch runs. Did not translate to any improvements in 20 epochs.
+- [x] quantization sweep at 2 ms: `bits` ∈ {16, 12, 8, 6, 4}
+      loss of accuracy when lowering Q
+- [x] combined `noise_quantization` for the most promising single settings
+      redundent after the last experiment
+- [ ] Higher percision/alternate data format runs: bf16, fp32
+- [x] 20-epoch reruns of the promising imprecision regime(s), compared against the
       **82.51%** reference
 
 Reference (2 ms, 20 epochs, `mode: none`):
@@ -62,9 +66,11 @@ each, the full 20-epoch run took ~72 min of vector training (4243.5 s) plus
 
 ### Future imprecision work (not implemented)
 
-- [ ] per-neuron / per-coordinate quantization (currently one global scale)
+- [x] per-neuron / per-coordinate quantization (currently one global scale)
+      redundant after the last experiments
 - [ ] learned or scheduled `noise_std` / `bits` (annealing)
-- [ ] other quantization schemes (logarithmic, stochastic rounding, QAT fake-quant)
+- [x] other quantization schemes (logarithmic, stochastic rounding, QAT fake-quant)
+      redundant after the last experiments
 - [ ] adversarial / Worst-case state perturbation as a robustness probe
 - [ ] imprecision applied to the input drive or the emitted population signal
 
@@ -98,6 +104,42 @@ active interface; if a feature is implemented it works, if it is not it lives he
 - [ ] `torch.compile` / fused per-step kernel (the Python timestep loop is the
       current throughput bottleneck: ~75 samples/s at N=64, D=1000, T=250)
 
+## Robustness (input augmentation — the next workstream)
+
+Specified by the PI (2026-10-26) from an external design note. The hard rule:
+augmentation acts on **raw events before binning**, never on the already-binned
+binary tensor, and never on VAL or official TEST.
+
+```text
+raw SHD event stream → augmentation → 2-ms binning → 500 × 700 → V3
+```
+
+- [ ] event-augmentation module (one reusable `augment(events, config, rng)` API,
+      e.g. `V3/v3/event_augmentation.py`) — no per-augmentation loaders, no
+      duplicated binning, existing binning consumes the augmented events
+- [ ] **A. timestamp jitter**: `t_i' = t_i + ε_i`, `ε_i ~ N(0, σ_t²)`,
+      `time_jitter_std_ms` configurable (start at 0.5), events leaving the
+      1000 ms window follow the existing windowing policy, fresh realisation per
+      training sample
+- [ ] **B. event dropout**: drop each raw event with
+      `event_dropout_probability`, labels preserved, source data never mutated
+- [ ] **C. event insertion**: add artificial events with valid SHD channels
+      inside the 1000 ms window, parameterised by an unambiguous insertion
+      amount/probability
+- [ ] **D. global time shift**: `t_i' = t_i + Δ`, symmetric `Δ` bounded by
+      `global_time_shift_max_ms`, sequence duration unchanged
+- [ ] **E. channel dropout**: choose channels, remove all their events for that
+      sample, then bin (channel identities, not the post-binning tensor)
+- [ ] training-only phase gating: FIT on, VAL off, TEST off — must not leak when
+      the same dataset objects are reused for evaluation
+- [ ] config block + CLI/notebook wiring, disabled by default (`mode: none`
+      equivalent must stay bit-identical to the unaugmented baseline)
+- [ ] tests: synthetic-event unit tests per augmenter, off-by-default
+      bit-identical test, phase-gating test
+- [ ] control panel: temporary overrides equivalent to `--override` (epochs,
+      timing, `N`, `D`, state regularization, augmentation, seed), constructing a
+      transient config layer on top of the YAML default — not a second config system
+
 ## Experiments
 
 - [ ] optimizer sweep:
@@ -108,9 +150,7 @@ active interface; if a feature is implemented it works, if it is not it lives he
 - [ ] more `N` values (N=16/32/128/256) to separate "vector state" from "more units"
 - [ ] more `D` values (D=1, 4, 16, 64, 256, 1000, 4096) - the size of the effect
 - [ ] multiple seeds per configuration (the single-seed result has no error bar)
-- [ ] stronger baselines: tuned LIF/ALIF SHD baselines, and the V2 LIF model
-      (`sweep_l2_0`, test 0.5998) as an external reference point
-- [ ] `tau_ms` / `dt_ms` / `bin_ms` sweep (currently T=500 x 2 ms fixed)
+- [x] `tau_ms` / `dt_ms` / `bin_ms` sweep (currently T=500 x 2 ms fixed)
 - [ ] speaker-held-out validation (the current VAL split is stratified, not
       speaker-independent - it cannot measure speaker generalisation)
 - [ ] learning-curve / dataset-size scaling
@@ -119,35 +159,48 @@ active interface; if a feature is implemented it works, if it is not it lives he
 
 ## Performance
 
-- [ ] overlap host-side event binning with GPU compute (a `DataLoader` with
-      worker processes, or a one-off pre-binned cache). Measured: the GPU drops
-      to ~20% utilisation once every few batches while the host rebuilds the
-      dense `(B, T, C)` tensor with `np.bincount`, which costs ~30% of the epoch
-      (3.1 min/epoch observed end-to-end vs 2.1 min/epoch of pure GPU work)
+Measured 2026-10-26 (see `PERF.md`): one FIT epoch (N=64, D=1000, T=500, 2 ms,
+batch 128) is **196.72 s** warm, GPU utilisation **94.6 %**, host binning
+**8.44 s = 4 %** — the "~30 % of the epoch" premise below was false.
+
+- [x] host-side binning overlap / pre-binned cache — landed opt-in
+      (`--override binned_cache=true`, default off): 190.52 s (−3.2 %), tensors
+      bit-identical, 2.66 GiB under `V3/cache/` (git-ignored). `DataLoader`
+      workers measured unnecessary at 96.5 % GPU util.
 - [ ] CUDA kernel optimisation / custom fused step (biggest lever: the Python
-      250-step loop, not the FLOPs, is the bottleneck — ~2.2 s/batch and
-      58 samples/s at N=64, D=1000, T=250, batch 128)
+      500-step loop, not the FLOPs, is the bottleneck). `torch.compile` is not
+      usable on this Windows build (`TritonMissing`); a hand-written fused step
+      is the remaining option.
 - [ ] memory optimisation (gradient checkpointing is already used; chunks=10)
       and memory instrumentation: log `max_memory_reserved` per epoch, and guard
-      against ever building an un-checkpointed 250-step graph (~8.4 GiB at D=1000)
+      against ever building an un-checkpointed 500-step graph (~8.4 GiB at D=1000)
 - [ ] larger `N`, larger `D`, longer `T`
 - [ ] `bf16` comparison against `fp16`
 - [ ] multi-GPU / gradient accumulation to raise the effective batch size
 
 ## Analysis (deliberately out of scope for V3's primary question)
 
-- [ ] per-neuron functional fingerprints from the vector state
-- [ ] decoder probe on the raw `(N, D)` state (linear probe per class)
-- [ ] state-geometry / PCA / manifold diagnostics
+Done 2026-10-26 on the frozen 20-epoch checkpoint — see `ANALYSIS.md`.
+
+- [x] per-neuron functional fingerprints from the vector state (knockout, 64
+      TEST passes: mean 1.02 ± 1.07 pp, no critical unit, MI does not predict
+      causal necessity)
+- [x] decoder probe on the raw `(N, D)` state (logistic, fit on FIT, TEST n=2264:
+      counts 82.51 %, mean state 80.83 %, Δ = −1.68 pp, 95 % CI [−3.00, −0.31])
+- [x] state-geometry / PCA / manifold diagnostics (population PR 6.64 of 64,000;
+      per-neuron median 4.21 of 1,000; scalar control 1.71)
 - [ ] spike-train statistics beyond mean/median/max rate
-- [ ] ablation: freeze the state dynamics and train only the readout (this is
-      the Brian-experiment limitation V3 exists to avoid, so it is worth
-      measuring as a contrast, not as the headline)
+- [x] ablation: freeze the state dynamics and train only the readout
+      (82.02 % vs 82.51 %; untrained dynamics 36.66 %; recurrence zeroed 59.23 %)
 
 ## Reproducibility / infrastructure
 
-- [ ] resume training from a checkpoint
+- [x] resume training from a checkpoint (`--resume <ckpt>`; model, optimizer,
+      scheduler, scaler, epoch, RNG restored; new `<tag>_resumed` registry row;
+      bit-identical continuation proven for `lr_schedule=none`)
 - [ ] deterministic GPU kernels (`torch.use_deterministic_algorithms`)
 - [ ] automated regression test for the SHD loader inside `tests/`
       (`V3/run_smoke_test.py` is a standalone script, not a pytest module)
-- [ ] CI entry point that runs the quick configuration end-to-end
+- [x] CI entry point that runs the quick configuration end-to-end
+      (`.github/workflows/tests.yml`: `uv sync --locked --group dev` + pytest on
+      CPU; not yet executed on GitHub — the repo has not been pushed)

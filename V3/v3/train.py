@@ -256,6 +256,38 @@ def count_parameters(model) -> dict:
     return {name: int(p.numel()) for name, p in model.named_parameters()}
 
 
+def rng_state() -> dict:
+    """Snapshot every RNG the training loop touches (for checkpoints)."""
+    import random
+
+    state = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def restore_rng(state: dict | None) -> bool:
+    """Restore a snapshot from :func:`rng_state`.  Returns True if anything was read."""
+    import random
+
+    if not state:
+        return False
+    if state.get("python") is not None:
+        random.setstate(state["python"])
+    if state.get("numpy") is not None:
+        np.random.set_state(state["numpy"])
+    if state.get("torch") is not None:
+        t = torch.as_tensor(state["torch"], dtype=torch.uint8).cpu()
+        torch.set_rng_state(t)
+    if state.get("cuda") and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all([torch.as_tensor(s, dtype=torch.uint8).cpu() for s in state["cuda"]])
+    return True
+
+
 def fit(
     model: VectorNeuronPopulation,
     store: SHDEventStore,
@@ -264,8 +296,17 @@ def fit(
     cfg: V3Config,
     device: torch.device,
     show_progress: bool = True,
+    resume_state: dict | None = None,
+    state_sink: dict | None = None,
 ) -> FitResult:
-    """Train the population.  The official test split is never passed in here."""
+    """Train the population.  The official test split is never passed in here.
+
+    ``resume_state`` (optional) restores model/optimizer/scheduler/scaler weights,
+    the epoch counter and the RNG snapshot written by an earlier run, then trains
+    ``cfg.epochs - saved_epoch`` more epochs.  History rows of the earlier epochs
+    are carried over.  ``state_sink`` (optional) receives the resumable state
+    (optimizer/scheduler/scaler/epoch/rng) after the last epoch.
+    """
     from tqdm.auto import tqdm
 
     set_seed(cfg.seed)
@@ -281,11 +322,33 @@ def fit(
         parameter_groups=model.param_groups(),
         device=str(device),
     )
+    start_epoch = 1
+    if resume_state is not None:
+        model.load_state_dict(resume_state["state_dict"])
+        if resume_state.get("optimizer"):
+            optimizer.load_state_dict(resume_state["optimizer"])
+        else:
+            print("[V3] warning: checkpoint has no optimizer state; optimizer starts fresh", flush=True)
+        if resume_state.get("scheduler") and scheduler is not None:
+            scheduler.load_state_dict(resume_state["scheduler"])
+        if resume_state.get("scaler"):
+            scaler.load_state_dict(resume_state["scaler"])
+        restore_rng(resume_state.get("rng"))
+        start_epoch = int(resume_state.get("epoch", 0)) + 1
+        res.history = list(resume_state.get("history") or [])
+        res.best_val_accuracy = float(resume_state.get("best_val_accuracy") or 0.0)
+        res.best_epoch = int(resume_state.get("best_epoch") or -1)
+        res.state_dict = resume_state.get("best_val_state_dict")
+        print(
+            f"[V3] resumed at epoch {start_epoch - 1}/{cfg.epochs}; "
+            f"training epochs {start_epoch}..{int(cfg.epochs)}",
+            flush=True,
+        )
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats()
 
     total_t0 = time.perf_counter()
-    for epoch in range(1, int(cfg.epochs) + 1):
+    for epoch in range(start_epoch, int(cfg.epochs) + 1):
         bar = tqdm(
             total=steps_per_epoch,
             desc=f"epoch {epoch:3d}/{cfg.epochs}",
@@ -333,6 +396,16 @@ def fit(
                 res.best_epoch = int(epoch)
                 res.state_dict = {k: v.detach().clone() for k, v in model.state_dict().items()}
     res.total_seconds = time.perf_counter() - total_t0
+    if state_sink is not None:
+        state_sink.update(
+            {
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict() if scheduler is not None else None,
+                "scaler": scaler.state_dict(),
+                "epoch": int(res.history[-1]["epoch"]) if res.history else start_epoch - 1,
+                "rng": rng_state(),
+            }
+        )
     if device.type == "cuda":
         res.dtypes = {
             "state_dtype": str(cfg.torch_dtype).replace("torch.", ""),
@@ -370,6 +443,8 @@ __all__ = [
     "make_optimizer",
     "make_scheduler",
     "set_seed",
+    "rng_state",
+    "restore_rng",
     "save_json",
     "FitResult",
     "count_parameters",

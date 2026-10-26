@@ -128,3 +128,63 @@ run and no commit in this round.
   number stays a `doc-claim` and was not re-verified.
 - **Claims audit (`CLAIMS_AUDIT.md`) — flagged, docs accepted as-is.** No further
   doc changes beyond S1a/S3b/S4a/S6a in this round.
+
+## 2026-10-26 — mechanism bucket and throughput bucket (measured)
+
+Everything below is measured on the frozen 20-epoch checkpoint
+`V3/checkpoints/v3_vector_d1000.pt` (official TEST n=2264, model readout
+1868 = 82.51 %) or benchmarked against the current training loop. Details and
+caveats live in `V3/ANALYSIS.md` and `V3/PERF.md`.
+
+### What the vector state is for
+
+| measurement | result |
+|---|---|
+| linear probe on 64 spike counts (fit FIT, TEST) | 1868 = 82.51 % (equals the readout) |
+| linear probe on the time-mean state (64,000 dims) | 1830 = 80.83 %, Δ = −1.68 pp, 95 % CI [−3.00, −0.31] |
+| linear probe on the final-timestep state | 674 = 29.77 % |
+| population participation ratio (mean state) | 6.64 of 64,000 dims (23/70/460 comps at 90/95/99 %) |
+| per-neuron participation ratio | median 4.21 of 1,000 (P10–P90 3.05–6.20) |
+| scalar control (D=1) participation ratio | 1.71 of 64 |
+
+No evidence the raw state decodes better than the spike counts: the width is
+not extra readout bandwidth. All decodable signal sits in the temporal mean,
+not the final state — consistent with a count readout.
+
+### Is it the dynamics or the readout? (only `w_cls` fit, dynamics frozen)
+
+| arm | dynamics | TEST |
+|---|---|---|
+| A1 | trained checkpoint | 1857 = 82.02 % (−0.49 pp) |
+| A2 | untrained net, recalibrated threshold | 830 = 36.66 % (−45.85 pp) |
+| A3 | trained weights, recurrence zeroed (leaky integrator only) | 1341 = 59.23 % (−23.28 pp) |
+
+The learned vector dynamics are worth **+45.9 pp** over a random reservoir with
+the same readout capacity; the recurrence is worth +23.3 pp; the readout adds
+almost nothing irreducible. The vector width is load-bearing through the
+dynamics, not at the classifier.
+
+### Are individual neurons necessary? (knockout by silencing, θ − 1e9)
+
+Mean TEST drop 1.02 ± 1.07 pp, worst neuron 4.46 pp, one neuron (14) *improves*
+accuracy by 1.24 pp when silenced; 28/64 neurons cost > 1 pp individually;
+cumulative k=1/2/4/8/16/32/64 → 4.46/7.38/13.07/22.22/34.63/43.99/77.96 pp.
+Per-neuron class mutual information is flat (0.084–0.742 bits, 57/64 effective)
+and does not predict causal necessity (Spearman +0.20). Distributed and
+redundant; no critical unit.
+
+### Throughput (1 epoch, FIT 7340, N=64 D=1000 T=500 @ 2 ms, batch 128)
+
+- TODO premise **measured false**: host `np.bincount` is 8.44 s = 4 % of a warm
+  epoch (GPU util 94.6 %), not ~30 %.
+- Opt-in pre-binned cache (`--override binned_cache=true`, default off):
+  196.72 → 190.52 s (−3.2 %), bit-identical tensors. 2.66 GiB under
+  `V3/cache/` (git-ignored).
+- `--resume` restores model/optimizer/scheduler/epoch/RNG and writes a new
+  `<tag>_resumed` row; continuation is bit-identical on `lr_schedule=none`.
+- CI entry point added (`.github/workflows/tests.yml`), not yet executed on
+  GitHub.
+- `torch.compile` not usable on this Windows build (`TritonMissing`); kernel
+  untouched.
+
+Tests 135 green (was 124). No commit yet in this round.

@@ -87,14 +87,57 @@ def variant_dirs(cfg: V3Config) -> dict:
 
 
 # ---------------------------------------------------------------------- #
-def train_variant(cfg: V3Config, device: torch.device | None = None, show_progress: bool = True) -> Variant:
-    """Load SHD, build the population, train it, save checkpoint + history + curves."""
+def load_checkpoint_payload(path: str | Path) -> dict:
+    """Load a training checkpoint written by :func:`train_variant` (v1 or v2)."""
+    payload = torch.load(Path(path), map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict) or "state_dict" not in payload or "config" not in payload:
+        raise ValueError(f"{path} is not a V3 training checkpoint (no state_dict/config)")
+    return payload
+
+
+def resume_state_from_payload(payload: dict) -> dict:
+    """Turn a checkpoint payload into the ``resume_state`` dict :func:`fit` expects."""
+    return {
+        "state_dict": payload["state_dict"],
+        "optimizer": payload.get("optimizer"),
+        "scheduler": payload.get("scheduler"),
+        "scaler": payload.get("scaler"),
+        "epoch": payload.get("epoch", len(payload.get("history") or [])),
+        "rng": payload.get("rng"),
+        "history": payload.get("history"),
+        "best_val_accuracy": payload.get("best_val_accuracy"),
+        "best_epoch": payload.get("best_epoch"),
+        "best_val_state_dict": payload.get("best_val_state_dict"),
+    }
+
+
+def train_variant(
+    cfg: V3Config,
+    device: torch.device | None = None,
+    show_progress: bool = True,
+    resume_from: str | Path | None = None,
+) -> Variant:
+    """Load SHD, build the population, train it, save checkpoint + history + curves.
+
+    ``resume_from`` restores the model, optimizer, scheduler, scaler, RNG and epoch
+    counter of that checkpoint and trains up to ``cfg.epochs`` total.
+    """
     t_start = time.perf_counter()
     device = device or resolve_device(cfg)
     cfg = effective_config(cfg, device)
     dirs = variant_dirs(cfg)
     for p in (dirs["results"], dirs["checkpoints"], dirs["run_figures"]):
         p.mkdir(parents=True, exist_ok=True)
+
+    resume_state = None
+    if resume_from is not None:
+        payload = load_checkpoint_payload(resume_from)
+        resume_state = resume_state_from_payload(payload)
+        print(
+            f"[V3] resuming from {resume_from} (epoch {resume_state['epoch']}, "
+            f"has_optimizer={bool(resume_state['optimizer'])})",
+            flush=True,
+        )
 
     set_seed(cfg.seed)
     store = SHDEventStore(cfg.path(cfg.train_h5), cfg)
@@ -114,7 +157,18 @@ def train_variant(cfg: V3Config, device: torch.device | None = None, show_progre
     )
     print(f"[V3] threshold calibrated; parameters = {model.n_parameters():,}")
 
-    result = fit(model, store, fit_split, val_split, cfg, device, show_progress=show_progress)
+    train_state: dict = {}
+    result = fit(
+        model,
+        store,
+        fit_split,
+        val_split,
+        cfg,
+        device,
+        show_progress=show_progress,
+        resume_state=resume_state,
+        state_sink=train_state,
+    )
 
     fit_metrics = evaluate(model, store, fit_split, cfg, device)
     val_metrics = evaluate(model, store, val_split, cfg, device) if len(val_split) else {}
@@ -124,7 +178,7 @@ def train_variant(cfg: V3Config, device: torch.device | None = None, show_progre
     ckpt_path = dirs["checkpoints"] / f"{cfg.tag}.pt"
     torch.save(
         {
-            "schema": "v3_checkpoint/v1",
+            "schema": "v3_checkpoint/v2",
             "config": cfg.to_dict(),
             "state_dict": model.state_dict(),
             "best_val_state_dict": result.state_dict,
@@ -132,6 +186,13 @@ def train_variant(cfg: V3Config, device: torch.device | None = None, show_progre
             "best_val_accuracy": result.best_val_accuracy,
             "fit_metrics": fit_metrics,
             "val_metrics": val_metrics,
+            "epoch": int(train_state.get("epoch") or len(result.history) or 0),
+            "optimizer": train_state.get("optimizer"),
+            "scheduler": train_state.get("scheduler"),
+            "scaler": train_state.get("scaler"),
+            "rng": train_state.get("rng"),
+            "history": result.history,
+            "resumed_from": str(resume_from) if resume_from is not None else "",
         },
         ckpt_path,
     )

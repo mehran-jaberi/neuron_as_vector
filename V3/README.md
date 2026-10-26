@@ -23,6 +23,22 @@ is also not a rerun of the early Brian prototype (`brian implementation/`, remov
 from the tree in 2026-10 — a *fixed* high-dimensional dynamical system with a
 trained readout). Here the vector dynamics themselves are trained end-to-end.
 
+> **Mechanism, measured on the frozen 20-epoch checkpoint** (`ANALYSIS.md`): a
+> linear probe on the raw state does not beat the spike counts (80.83% vs
+> 82.51%, Δ = −1.68 pp, 95% CI [−3.00, −0.31]), so the width is not extra readout
+> bandwidth. It is a learned, low-dimensional dynamical substrate: participation
+> ratio 6.64 of 64,000 dimensions population-wide and 4.21 per neuron of 1,000
+> (scalar control 1.71), refitting only the readout on the trained dynamics still
+> gives 82.02%, random dynamics 36.66%, recurrence removed 59.23%. Neurons are
+> distributed and redundant: silencing any single neuron costs 1.02 ± 1.07 pp on
+> average, worst 4.46 pp.
+>
+> **Throughput** (`PERF.md`, 1 epoch, N=64, D=1000, T=500, 2 ms): 196.72 s warm at
+> 94.6% GPU utilisation. `--override binned_cache=true` gives −3.2% with
+> bit-identical tensors; `--resume <ckpt>` continues a run and writes a
+> `<tag>_resumed` row; `torch.compile` is unavailable on this Windows build
+> (`TritonMissing`).
+
 ---
 
 ## 1. The hypothesis (the "C" version of neuron-as-vector)

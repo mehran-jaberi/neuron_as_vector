@@ -78,6 +78,13 @@ class SHDEventStore:
         # bookkeeping filled in by stats()
         self.n_events_raw = 0
         self.n_events_kept = 0
+        # optional pre-binned dense cache (performance only; values identical).
+        # Off by default: the on-the-fly path below stays the reference.
+        self.binned: object | None = None
+        if bool(getattr(cfg, "binned_cache", False)):
+            from .binned_cache import BinnedCache
+
+            self.binned = BinnedCache.open_or_build(self)
 
     # ------------------------------------------------------------------ #
     def _file(self) -> h5py.File:
@@ -89,6 +96,9 @@ class SHDEventStore:
         if self._fh is not None:
             self._fh.close()
             self._fh = None
+        if self.binned is not None:
+            self.binned.close()
+            self.binned = None
 
     # ------------------------------------------------------------------ #
     def sample_codes(self, i: int) -> np.ndarray:
@@ -115,6 +125,9 @@ class SHDEventStore:
     # ------------------------------------------------------------------ #
     def batch(self, indices: np.ndarray) -> np.ndarray:
         """Dense float32 input batch ``(B, T, C)`` (counts, or 0/1 when binary)."""
+        if self.binned is not None:
+            # pre-binned cache: bit-identical values, built from this same path
+            return self.binned.batch(indices)
         B = len(indices)
         parts = []
         for b, i in enumerate(indices):

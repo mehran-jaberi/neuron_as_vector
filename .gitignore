@@ -27,3 +27,6 @@ figures/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Binned input cache (V3/v3/binned_cache.py; derived data, rebuild with V3/tools/build_binned_cache.py)
+V3/cache/
