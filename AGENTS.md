@@ -47,6 +47,10 @@ Append findings; do not rewrite history.
     another agent.
 12. **No silent scope creep.** If the brief is ambiguous, or a measurement contradicts the
     brief, stop and report. Do not "helpfully" fix something else.
+13. **Long runs go to a side command line.** Training and other multi-minute jobs are
+    launched as a separate command-line process with its own log and its built-in `tqdm`
+    progress bar kept on (do not pass `--no-progress`); they never block the conversation
+    turn. Monitor from that side shell, not by re-running the work inline.
 
 ## Repo conventions
 

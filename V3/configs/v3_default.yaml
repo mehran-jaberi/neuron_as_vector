@@ -80,6 +80,32 @@ state_regularization:
   apply_during_validation: false  # validation stays at full precision
   apply_during_test: false        # official test stays at full precision
 
+# ---- raw-event augmentation (disabled by default) ----
+# Applied to the raw (time, channel) events BEFORE the 2-ms binning, never to the
+# binned tensor.  Defaults are all off: the unaugmented path is bit-identical.
+# Fixed order: channel dropout -> event dropout -> insertion -> global shift ->
+# timestamp jitter -> window filter (0 <= t < 1000 ms).
+augmentation:
+  enabled: false                  # master switch
+  time_jitter:
+    enabled: false
+    std_ms: 0.5                   # sigma of the per-event timestamp jitter
+  event_dropout:
+    enabled: false
+    probability: 0.1              # per-event drop probability
+  event_insertion:
+    enabled: false
+    rate_hz: 50.0                 # inserted events per second of the window
+  global_time_shift:
+    enabled: false
+    max_ms: 100.0                 # symmetric shift U(-max_ms, +max_ms)
+  channel_dropout:
+    enabled: false
+    probability: 0.1              # per-channel drop probability
+  apply_during_training: true
+  apply_during_validation: false
+  apply_during_test: false
+
 # ---- io ----
 out_dir: results
 ckpt_dir: checkpoints

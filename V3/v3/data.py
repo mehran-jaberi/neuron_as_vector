@@ -24,6 +24,7 @@ import h5py
 import numpy as np
 
 from .config import V3Config
+from .event_augmentation import augment
 
 
 @dataclass
@@ -74,17 +75,40 @@ class SHDEventStore:
         self.n_samples = int(self.labels.size)
 
         self._fh: h5py.File | None = None
-        self._cache: dict[int, np.ndarray] | None = {} if cfg.cache_events else None
+        # Raw-event augmentation produces a fresh realisation per epoch, so any
+        # binned cache (RAM or dense) would freeze one realisation forever.
+        # Bypass both caches when augmentation can be active; stats() reports it.
+        self.augmentation = cfg.augmentation
+        self._aug_requested_cache = bool(
+            bool(getattr(cfg, "cache_events", True))
+            or bool(getattr(cfg, "binned_cache", False))
+        )
+        self.cache_warning: str | None = None
+        if self.augmentation.active() and self._aug_requested_cache:
+            self.cache_warning = (
+                "augmentation is enabled: cache_events/binned_cache are bypassed "
+                "so every epoch gets a fresh realization"
+            )
+        self._cache: dict[int, np.ndarray] | None = (
+            {} if (cfg.cache_events and not self.augmentation.active()) else None
+        )
         # bookkeeping filled in by stats()
         self.n_events_raw = 0
         self.n_events_kept = 0
         # optional pre-binned dense cache (performance only; values identical).
         # Off by default: the on-the-fly path below stays the reference.
         self.binned: object | None = None
-        if bool(getattr(cfg, "binned_cache", False)):
+        if bool(getattr(cfg, "binned_cache", False)) and not self.augmentation.active():
             from .binned_cache import BinnedCache
 
             self.binned = BinnedCache.open_or_build(self)
+        # augmentation gating: phase is the store-wide switch, the optional index
+        # mask keeps a FIT store from augmenting the VAL samples it also serves.
+        self.phase = "val"  # safe default: no augmentation outside training
+        self.epoch = 0
+        self._aug_rng: np.random.Generator | None = None
+        self._aug_mask: np.ndarray | None = None
+        self._aug_forced_off = False
 
     # ------------------------------------------------------------------ #
     def _file(self) -> h5py.File:
@@ -101,37 +125,133 @@ class SHDEventStore:
             self.binned = None
 
     # ------------------------------------------------------------------ #
+    # raw events (the only place where augmentation may be applied)
+    # ------------------------------------------------------------------ #
+    def sample_events(self, i: int) -> tuple[np.ndarray, np.ndarray]:
+        """Raw events of one sample: ``(times [s], channel ids)``.
+
+        Times are float64 seconds and channel ids int64 in ``[0, n_inputs)``;
+        the arrays are returned as read, without window filtering or binning.
+        """
+        fh = self._file()
+        ts = np.asarray(fh["spikes/times"][int(i)], dtype=np.float64)
+        us = np.asarray(fh["spikes/units"][int(i)], dtype=np.int64)
+        return ts, us
+
+    def _bin_events(self, ts: np.ndarray, us: np.ndarray) -> np.ndarray:
+        """Bin raw events to flat int32 codes; strictly ``0 <= t < window_s``.
+
+        The lower bound is a guard: raw events pushed negative by a time shift or
+        jitter must be dropped here, because a negative time would give a negative
+        bin index and corrupt neighbouring channels in the bincount.
+        """
+        keep = (ts >= 0.0) & (ts < self.window_s)
+        ts = ts[keep]
+        us = us[keep]
+        if ts.size == 0:
+            return np.zeros(0, dtype=np.int32)
+        bins = np.minimum((ts / self.bin_s).astype(np.int64), self.n_bins - 1)
+        codes = (bins * self.n_inputs + us).astype(np.int32)
+        if self.binary:
+            codes = np.unique(codes)
+        return codes
+
     def sample_codes(self, i: int) -> np.ndarray:
-        """Flat int32 codes ``bin * C + channel`` for one sample (deduplicated)."""
+        """Flat int32 codes ``bin * C + channel`` for one sample (deduplicated).
+
+        This is the *unaugmented* path; it is what the caches store.  During a
+        training epoch with augmentation active, :meth:`batch` uses
+        :meth:`_augmented_codes` instead.
+        """
         if self._cache is not None and i in self._cache:
             return self._cache[i]
-        fh = self._file()
-        ts = np.asarray(fh["spikes/times"][i], dtype=np.float64)
-        us = np.asarray(fh["spikes/units"][i], dtype=np.int64)
-        if ts.size == 0:
-            codes = np.zeros(0, dtype=np.int32)
-        else:
-            keep = ts < self.window_s
-            ts = ts[keep]
-            us = us[keep]
-            bins = np.minimum((ts / self.bin_s).astype(np.int64), self.n_bins - 1)
-            codes = (bins * self.n_inputs + us).astype(np.int32)
-            if self.binary:
-                codes = np.unique(codes)
+        ts, us = self.sample_events(i)
+        codes = self._bin_events(ts, us)
         if self._cache is not None:
             self._cache[i] = codes
         return codes
 
     # ------------------------------------------------------------------ #
+    # augmentation state
+    # ------------------------------------------------------------------ #
+    def set_phase(self, phase: str) -> None:
+        """Store-wide phase for augmentation gating: ``train`` | ``val`` | ``test``.
+
+        Only ``train`` can ever augment; the default is ``val`` so constructing a
+        store and probing it cannot perturb data by accident.  The experiment
+        additionally forces the TEST store off and masks FIT/VAL sample indices.
+        """
+        if phase not in ("train", "val", "test"):
+            raise ValueError(f"unknown phase {phase!r} (expected train | val | test)")
+        self.phase = phase
+
+    def set_epoch(self, epoch: int) -> None:
+        """Reseed the augmentation RNG deterministically for one epoch.
+
+        ``default_rng(seed * 1000 + epoch)``: the same seed and epoch always give
+        the same realisations; consecutive epochs give fresh ones.  Training and
+        evaluation iterators both call this at the start of every pass.
+        """
+        self.epoch = int(epoch)
+        self._aug_rng = np.random.default_rng(int(self.cfg.seed) * 1000 + self.epoch)
+
+    def set_augmentation_indices(self, indices) -> None:
+        """Restrict augmentation to these sample indices (use the FIT split)."""
+        mask = np.zeros(self.n_samples, dtype=bool)
+        idx = np.asarray(indices, dtype=np.int64)
+        if idx.size:
+            mask[idx] = True
+        self._aug_mask = mask
+
+    def force_augmentation_off(self, off: bool = True) -> None:
+        """Hard off-switch (VAL/TEST stores); overrides every config flag."""
+        self._aug_forced_off = bool(off)
+
+    @property
+    def augmentation_forced_off(self) -> bool:
+        return self._aug_forced_off
+
+    def augmentation_applies(self, index: int | None = None) -> bool:
+        """Whether an augmented realisation is due for ``index`` right now."""
+        if self._aug_forced_off or not self.augmentation.active():
+            return False
+        if self.phase != "train" or not self.augmentation.phase_active("train"):
+            return False
+        if index is not None and self._aug_mask is not None:
+            return bool(self._aug_mask[int(index)])
+        return True
+
+    def _augmented_codes(self, i: int) -> np.ndarray:
+        """Raw events -> augment -> bin, never cached."""
+        if self._aug_rng is None:
+            self.set_epoch(self.epoch)
+        ts, us = self.sample_events(i)
+        ts, us = augment(
+            ts,
+            us,
+            self.augmentation,
+            self._aug_rng,
+            window_s=self.window_s,
+            n_inputs=self.n_inputs,
+        )
+        return self._bin_events(ts, us)
+
+    # ------------------------------------------------------------------ #
     def batch(self, indices: np.ndarray) -> np.ndarray:
         """Dense float32 input batch ``(B, T, C)`` (counts, or 0/1 when binary)."""
         if self.binned is not None:
-            # pre-binned cache: bit-identical values, built from this same path
-            return self.binned.batch(indices)
+            if not any(self.augmentation_applies(int(i)) for i in indices):
+                # pre-binned cache: bit-identical values, built from this same path
+                return self.binned.batch(indices)
+            # augmentation became active after the dense cache was built: fall
+            # through to the on-the-fly path rather than reuse frozen data.
         B = len(indices)
         parts = []
         for b, i in enumerate(indices):
-            c = self.sample_codes(int(i))
+            if self.augmentation_applies(int(i)):
+                c = self._augmented_codes(int(i))
+            else:
+                c = self.sample_codes(int(i))
             if c.size:
                 parts.append(c.astype(np.int64) + b * self.cells)
         if parts:
@@ -159,7 +279,7 @@ class SHDEventStore:
         for i in idx:
             ts = np.asarray(fh["spikes/times"][int(i)], dtype=np.float64)
             raw += ts.size
-            kept += int((ts < self.window_s).sum())
+            kept += int(((ts >= 0.0) & (ts < self.window_s)).sum())
             occ += self.sample_codes(int(i)).size
         return {
             "file": str(self.path),
@@ -175,6 +295,12 @@ class SHDEventStore:
             "input_density": float(occ / max(len(idx), 1) / self.cells),
             "labels": [int(x) for x in np.bincount(self.labels, minlength=20)],
             "speakers": sorted(int(s) for s in np.unique(self.speakers)),
+            "cache_events_requested": bool(getattr(self.cfg, "cache_events", False)),
+            "cache_events_active": self._cache is not None,
+            "binned_cache_requested": bool(getattr(self.cfg, "binned_cache", False)),
+            "binned_cache_active": self.binned is not None,
+            "augmentation": self.augmentation.summary(),
+            "warnings": [self.cache_warning] if self.cache_warning else [],
         }
 
 
@@ -245,6 +371,11 @@ class BatchIterator:
         return n // self.batch_size if self.drop_last else int(np.ceil(n / self.batch_size))
 
     def __iter__(self):
+        # A fresh augmentation RNG per pass: same epoch -> identical realisations,
+        # next epoch -> fresh ones.  Guarded because tests use lightweight stores.
+        setter = getattr(self.store, "set_epoch", None)
+        if callable(setter):
+            setter(self.epoch)
         idx = self.split.indices
         if self.shuffle:
             rng = np.random.default_rng([self.seed, self.epoch])

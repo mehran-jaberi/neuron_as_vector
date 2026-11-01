@@ -113,6 +113,202 @@ class StateRegularizationConfig:
         return cls(**{k: v for k, v in data.items() if k in known})
 
 
+def _block_from_dict(cls, data: dict, strict: bool, label: str):
+    """Build a nested config block from a mapping (ignores unknown keys unless strict)."""
+    known = {f.name for f in dataclasses.fields(cls)}
+    unknown = set(data) - known
+    if unknown and strict:
+        raise ValueError(f"unknown {label} keys: {sorted(unknown)}")
+    return cls(**{k: v for k, v in data.items() if k in known})
+
+
+@dataclass
+class TimeJitterConfig:
+    """Per-event timestamp jitter: ``t_i' = t_i + eps_i``, ``eps_i ~ N(0, std_ms^2)``."""
+
+    enabled: bool = False
+    std_ms: float = 0.5
+
+    def validate(self) -> None:
+        if float(self.std_ms) < 0.0:
+            raise ValueError("augmentation.time_jitter.std_ms must be >= 0")
+
+    @classmethod
+    def from_dict(cls, data: dict, strict: bool = False) -> "TimeJitterConfig":
+        return _block_from_dict(cls, data, strict, "augmentation.time_jitter")
+
+
+@dataclass
+class EventDropoutConfig:
+    """Drop each raw event independently with ``probability`` (labels are preserved)."""
+
+    enabled: bool = False
+    probability: float = 0.1
+
+    def validate(self) -> None:
+        if not 0.0 <= float(self.probability) <= 1.0:
+            raise ValueError("augmentation.event_dropout.probability must be in [0, 1]")
+
+    @classmethod
+    def from_dict(cls, data: dict, strict: bool = False) -> "EventDropoutConfig":
+        return _block_from_dict(cls, data, strict, "augmentation.event_dropout")
+
+
+@dataclass
+class EventInsertionConfig:
+    """Insert Poisson(``rate_hz * window_s``) artificial events on valid SHD channels.
+
+    ``rate_hz`` is the **inserted events per second of the window** (not a
+    probability and not a count): a 1000 ms window with ``rate_hz: 50`` inserts
+    50 events per sample on average.
+    """
+
+    enabled: bool = False
+    rate_hz: float = 50.0
+
+    def validate(self) -> None:
+        if float(self.rate_hz) < 0.0:
+            raise ValueError("augmentation.event_insertion.rate_hz must be >= 0")
+
+    @classmethod
+    def from_dict(cls, data: dict, strict: bool = False) -> "EventInsertionConfig":
+        return _block_from_dict(cls, data, strict, "augmentation.event_insertion")
+
+
+@dataclass
+class GlobalTimeShiftConfig:
+    """Shift every timestamp by ``U(-max_ms, +max_ms)`` (sequence duration unchanged)."""
+
+    enabled: bool = False
+    max_ms: float = 100.0
+
+    def validate(self) -> None:
+        if float(self.max_ms) < 0.0:
+            raise ValueError("augmentation.global_time_shift.max_ms must be >= 0")
+
+    @classmethod
+    def from_dict(cls, data: dict, strict: bool = False) -> "GlobalTimeShiftConfig":
+        return _block_from_dict(cls, data, strict, "augmentation.global_time_shift")
+
+
+@dataclass
+class ChannelDropoutConfig:
+    """Drop whole input channels for one sample (one Bernoulli per channel).
+
+    The all-channels-dropped outcome is impossible by construction: if every
+    channel were drawn as dropped, one channel is kept at random.
+    """
+
+    enabled: bool = False
+    probability: float = 0.1
+
+    def validate(self) -> None:
+        if not 0.0 <= float(self.probability) <= 1.0:
+            raise ValueError("augmentation.channel_dropout.probability must be in [0, 1]")
+
+    @classmethod
+    def from_dict(cls, data: dict, strict: bool = False) -> "ChannelDropoutConfig":
+        return _block_from_dict(cls, data, strict, "augmentation.channel_dropout")
+
+
+@dataclass
+class EventAugmentationConfig:
+    """Raw-event augmentation, applied **before** the 2-ms binning.
+
+    The transform operates on the raw ``(time, channel)`` event stream, never on
+    the binned ``(T, C)`` tensor.  Fixed operation order (see
+    :func:`v3.event_augmentation.augment`)::
+
+        channel dropout -> event dropout -> insertion
+        -> global time shift -> timestamp jitter -> window filter
+
+    ``enabled`` is the master switch and every sub-block has its own ``enabled``
+    flag; **all defaults are off**, so the unaugmented path is bit-identical to
+    the baseline.  The ``apply_during_*`` flags choose the phase exactly like
+    :class:`StateRegularizationConfig`; default is training only, and the
+    experiment additionally forces VAL/TEST stores off.
+    """
+
+    enabled: bool = False
+    time_jitter: TimeJitterConfig = field(default_factory=TimeJitterConfig)
+    event_dropout: EventDropoutConfig = field(default_factory=EventDropoutConfig)
+    event_insertion: EventInsertionConfig = field(default_factory=EventInsertionConfig)
+    global_time_shift: GlobalTimeShiftConfig = field(default_factory=GlobalTimeShiftConfig)
+    channel_dropout: ChannelDropoutConfig = field(default_factory=ChannelDropoutConfig)
+    apply_during_training: bool = True
+    apply_during_validation: bool = False
+    apply_during_test: bool = False
+
+    AUGMENTERS = (
+        "time_jitter",
+        "event_dropout",
+        "event_insertion",
+        "global_time_shift",
+        "channel_dropout",
+    )
+
+    @property
+    def any_augmenter_enabled(self) -> bool:
+        """At least one sub-augmenter is switched on (the master switch aside)."""
+        return any(getattr(self, name).enabled for name in self.AUGMENTERS)
+
+    def active(self) -> bool:
+        """The master switch is on and at least one sub-augmenter is enabled."""
+        return bool(self.enabled) and self.any_augmenter_enabled
+
+    def phase_active(self, phase: str) -> bool:
+        """Whether the augmentation is applied in ``phase`` (train | val | test)."""
+        if not self.active():
+            return False
+        if phase == "train":
+            return bool(self.apply_during_training)
+        if phase == "val":
+            return bool(self.apply_during_validation)
+        if phase == "test":
+            return bool(self.apply_during_test)
+        raise ValueError(f"unknown phase {phase!r} (expected train | val | test)")
+
+    def validate(self) -> None:
+        for name in self.AUGMENTERS:
+            getattr(self, name).validate()
+
+    def summary(self) -> dict:
+        """Plain-dict snapshot used by ``SHDEventStore.stats`` / logs."""
+        return {
+            "enabled": bool(self.enabled),
+            "active": self.active(),
+            "apply_during_training": bool(self.apply_during_training),
+            "apply_during_validation": bool(self.apply_during_validation),
+            "apply_during_test": bool(self.apply_during_test),
+            **{
+                name: asdict(getattr(self, name))
+                for name in self.AUGMENTERS
+            },
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict, strict: bool = False) -> "EventAugmentationConfig":
+        block_classes = {
+            "time_jitter": TimeJitterConfig,
+            "event_dropout": EventDropoutConfig,
+            "event_insertion": EventInsertionConfig,
+            "global_time_shift": GlobalTimeShiftConfig,
+            "channel_dropout": ChannelDropoutConfig,
+        }
+        known = {f.name for f in dataclasses.fields(cls)}
+        unknown = set(data) - known
+        if unknown and strict:
+            raise ValueError(f"unknown augmentation keys: {sorted(unknown)}")
+        kwargs = {}
+        for k, v in data.items():
+            if k not in known:
+                continue
+            if k in block_classes and isinstance(v, dict):
+                v = block_classes[k].from_dict(v, strict=strict)
+            kwargs[k] = v
+        return cls(**kwargs)
+
+
 @dataclass
 class TimingConfig:
     """Temporal discretization of the SHD experiment.
@@ -238,6 +434,14 @@ class V3Config:
         default_factory=StateRegularizationConfig
     )
 
+    # ---- raw-event augmentation (disabled by default) ---------------------
+    # Applied to the raw (time, channel) events *before* the 2-ms binning; the
+    # binned tensor is never perturbed.  All defaults are off, so the default
+    # path stays bit-identical.  Training only unless a phase flag is flipped.
+    augmentation: EventAugmentationConfig = field(
+        default_factory=EventAugmentationConfig
+    )
+
     # ---- io --------------------------------------------------------------
     out_dir: str = "results"        # resolved relative to V3/ when not absolute
     ckpt_dir: str = "checkpoints"
@@ -321,6 +525,7 @@ class V3Config:
         if self.max_train_batches is not None and int(self.max_train_batches) < 1:
             raise ValueError("max_train_batches must be null (all batches) or >= 1")
         self.state_regularization.validate()
+        self.augmentation.validate()
 
     # ------------------------------------------------------------------ #
     def to_dict(self) -> dict:
@@ -378,6 +583,8 @@ class V3Config:
                 continue
             if k == "state_regularization" and isinstance(v, dict):
                 v = StateRegularizationConfig.from_dict(v, strict=strict)
+            elif k == "augmentation" and isinstance(v, dict):
+                v = EventAugmentationConfig.from_dict(v, strict=strict)
             elif k == "timing" and isinstance(v, dict):
                 v = TimingConfig.from_dict(v, strict=strict)
             kwargs[k] = v
@@ -391,6 +598,134 @@ class V3Config:
 
     def with_overrides(self, **overrides) -> "V3Config":
         return dataclasses.replace(self, **overrides)
+
+
+# ---------------------------------------------------------------------- #
+# override grammar (CLI ``--override key=value`` and programmatic mappings)
+# ---------------------------------------------------------------------- #
+NESTED_BLOCKS: dict[str, type] = {
+    "timing": TimingConfig,
+    "state_regularization": StateRegularizationConfig,
+    "augmentation": EventAugmentationConfig,
+}
+
+
+def _coerce_override(annotation: object, raw: str):
+    """Coerce a CLI string to the field's annotated scalar type."""
+    anno = str(annotation)
+    if "bool" in anno:
+        text = raw.strip().lower()
+        if text in ("1", "true", "yes", "on"):
+            return True
+        if text in ("0", "false", "no", "off"):
+            return False
+        raise ValueError(f"cannot parse {raw!r} as bool")
+    if "int" in anno and "float" not in anno:
+        return int(raw)
+    if "float" in anno:
+        return float(raw)
+    return raw
+
+
+def _resolve_override(cfg: V3Config, key: str):
+    """Walk ``a.b.c`` against the dataclass schema; return (leaf field, value)."""
+    parts = key.split(".")
+    if not key or any(not part for part in parts):
+        raise ValueError(f"invalid override key {key!r}")
+    obj: object = cfg
+    for index, part in enumerate(parts):
+        if not dataclasses.is_dataclass(obj):
+            raise ValueError(f"unknown configuration key {key!r}")
+        fields = {f.name: f for f in dataclasses.fields(obj)}
+        if part not in fields:
+            raise ValueError(f"unknown configuration key {key!r}")
+        value = getattr(obj, part)
+        if index == len(parts) - 1:
+            return fields[part], value
+        if not dataclasses.is_dataclass(value):
+            raise ValueError(
+                f"unknown configuration key {key!r}: {part!r} is not a nested block"
+            )
+        obj = value
+    raise ValueError(f"unknown configuration key {key!r}")  # pragma: no cover
+
+
+def _merge_override_dict(base: dict, updates: dict, prefix: str) -> dict:
+    """Recursively merge a nested mapping into a config block, rejecting unknown keys."""
+    for key, value in updates.items():
+        if key not in base:
+            raise ValueError(f"unknown configuration key {f'{prefix}.{key}'}")
+        if isinstance(value, dict) and isinstance(base[key], dict):
+            base[key] = _merge_override_dict(base[key], value, f"{prefix}.{key}")
+        else:
+            base[key] = value
+    return base
+
+
+def _set_override_path(cfg: V3Config, parts: list[str], value) -> V3Config:
+    if len(parts) == 1:
+        return dataclasses.replace(cfg, **{parts[0]: value})
+    child = getattr(cfg, parts[0])
+    return dataclasses.replace(
+        cfg, **{parts[0]: _set_override_path(child, parts[1:], value)}
+    )
+
+
+def _apply_override(cfg: V3Config, key: str, value) -> V3Config:
+    field_def, current = _resolve_override(cfg, key)
+    parts = key.split(".")
+    if dataclasses.is_dataclass(current):
+        if isinstance(value, dict):
+            merged = _merge_override_dict(asdict(current), value, key)
+            value = type(current).from_dict(merged, strict=True)
+        elif isinstance(value, type(current)):
+            value = value
+        else:
+            raise ValueError(
+                f"override {key!r} expects a mapping (or {type(current).__name__}), "
+                f"got {type(value).__name__}"
+            )
+    elif isinstance(value, str):
+        value = _coerce_override(field_def.type, value)
+    return _set_override_path(cfg, parts, value)
+
+
+def apply_override_mapping(cfg: V3Config, mapping: dict[str, object]) -> "V3Config":
+    """Apply programmatic overrides, including two levels of dotted nesting.
+
+    ``{"augmentation.time_jitter.std_ms": 0.5, "epochs": 7}`` updates the leaf
+    field; a nested mapping (``{"augmentation": {"time_jitter": {"std_ms": 0.5}}}``)
+    is merged into the existing block, so unspecified fields keep their values.
+    Unknown keys raise :class:`ValueError`; the returned object is a new config
+    (the input is never mutated).
+    """
+    if not isinstance(mapping, dict):
+        raise TypeError(f"overrides must be a dict, got {type(mapping).__name__}")
+    out = cfg
+    for key, value in mapping.items():
+        if not isinstance(key, str):
+            raise ValueError(f"override keys must be strings, got {type(key).__name__}")
+        out = _apply_override(out, key, value)
+    return out
+
+
+def apply_override_items(cfg: V3Config, items: list[str]) -> "V3Config":
+    """Apply CLI-style ``key=value`` overrides (two levels of dotted nesting).
+
+    ``timing.time_bin_ms=4``, ``state_regularization.mode=noise`` and
+    ``augmentation.time_jitter.std_ms=0.5`` are all valid.  Raises
+    :class:`ValueError` for malformed items and unknown keys.
+    """
+    parsed: dict[str, str] = {}
+    for item in items:
+        if "=" not in item:
+            raise ValueError(f"override must be key=value, got {item!r}")
+        key, raw = item.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise ValueError(f"override must be key=value, got {item!r}")
+        parsed[key] = raw
+    return apply_override_mapping(cfg, parsed)
 
 
 def describe(cfg: V3Config) -> str:
@@ -427,6 +762,15 @@ __all__ = [
     "V3Config",
     "TimingConfig",
     "StateRegularizationConfig",
+    "TimeJitterConfig",
+    "EventDropoutConfig",
+    "EventInsertionConfig",
+    "GlobalTimeShiftConfig",
+    "ChannelDropoutConfig",
+    "EventAugmentationConfig",
+    "NESTED_BLOCKS",
+    "apply_override_items",
+    "apply_override_mapping",
     "V3_ROOT",
     "REPO_ROOT",
     "describe",

@@ -111,6 +111,44 @@ def resume_state_from_payload(payload: dict) -> dict:
     }
 
 
+def assert_eval_batches_unchanged(
+    store: SHDEventStore,
+    split: Split,
+    cfg: V3Config,
+    phase: str = "train",
+    n_samples: int = 256,
+) -> None:
+    """Fail hard if evaluation samples bin differently with augmentation on/off.
+
+    For VAL this is called with ``phase="train"``: that is the dangerous case,
+    because ``fit`` evaluates VAL with the FIT store while it is in its training
+    phase.  For TEST it is called after the store's hard off-switch and with an
+    empty index mask; re-enabling the switch inside only proves the bytes stay
+    identical.  The store's phase and off-switch are restored before returning.
+    """
+    if not cfg.augmentation.active():
+        return
+    idx = np.asarray(split.indices[:n_samples], dtype=np.int64)
+    if idx.size == 0:
+        return
+    previous_phase = store.phase
+    previous_forced = store.augmentation_forced_off
+    try:
+        store.set_phase(phase)
+        store.force_augmentation_off(False)
+        augmented = store.batch(idx)
+        store.force_augmentation_off(True)
+        plain = store.batch(idx)
+    finally:
+        store.force_augmentation_off(previous_forced)
+        store.set_phase(previous_phase)
+    if not np.array_equal(augmented, plain):
+        raise AssertionError(
+            f"{split.name} batches differ with raw-event augmentation on/off "
+            f"(phase={phase!r}): VAL/TEST must never be augmented"
+        )
+
+
 def train_variant(
     cfg: V3Config,
     device: torch.device | None = None,
@@ -146,6 +184,11 @@ def train_variant(
         sub = fit_split.indices[: cfg.max_train_samples]
         fit_split = Split("fit_subset", sub, store.labels[sub], store.speakers[sub])
         print(f"[V3] QUICK MODE: training on the first {len(fit_split)} FIT samples only")
+    store.set_augmentation_indices(fit_split.indices)
+    # ``fit`` evaluates VAL with this same store while it is in the training
+    # phase, so verify on the real data that VAL bins identically with raw-event
+    # augmentation on and off.  The phase/mask make this a hard invariant.
+    assert_eval_batches_unchanged(store, val_split, cfg, phase="train")
     print(f"[V3] {cfg.tag}: FIT {len(fit_split)} / VAL {len(val_split)} samples "
           f"(official test set not touched)")
 
@@ -158,17 +201,23 @@ def train_variant(
     print(f"[V3] threshold calibrated; parameters = {model.n_parameters():,}")
 
     train_state: dict = {}
-    result = fit(
-        model,
-        store,
-        fit_split,
-        val_split,
-        cfg,
-        device,
-        show_progress=show_progress,
-        resume_state=resume_state,
-        state_sink=train_state,
-    )
+    store.set_phase("train")
+    try:
+        result = fit(
+            model,
+            store,
+            fit_split,
+            val_split,
+            cfg,
+            device,
+            show_progress=show_progress,
+            resume_state=resume_state,
+            state_sink=train_state,
+        )
+    finally:
+        # post-training FIT/VAL metrics, figures and test_variant must all be
+        # deterministic and unaugmented
+        store.set_phase("val")
 
     fit_metrics = evaluate(model, store, fit_split, cfg, device)
     val_metrics = evaluate(model, store, val_split, cfg, device) if len(val_split) else {}
@@ -272,6 +321,12 @@ def test_variant(
 
     store = SHDEventStore(cfg.path(cfg.test_h5), cfg)
     split = official_test_split(store)
+    # TEST is never augmented: hard off-switch plus an empty index mask, then
+    # verify the binned batches are byte-identical with augmentation on/off.
+    store.set_phase("test")
+    store.force_augmentation_off(True)
+    store.set_augmentation_indices(np.zeros(0, dtype=np.int64))
+    assert_eval_batches_unchanged(store, split, cfg, phase="test")
     print(f"[V3] {cfg.tag}: official TEST {len(split)} samples (speakers "
           f"{split.summary()['speakers']})")
 
@@ -370,6 +425,7 @@ def save_activity_figures(store, split, model, device, out_dir: Path, cfg,
 
 __all__ = [
     "Variant",
+    "assert_eval_batches_unchanged",
     "train_variant",
     "test_variant",
     "save_activity_figures",

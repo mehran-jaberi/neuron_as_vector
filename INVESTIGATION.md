@@ -37,6 +37,11 @@ Parameter count: vector 2,025,440 vs scalar 6,335 (**×320**).
 | noise 0.05 | 87.87 % | 1546/2264 = 68.29 % | −7.86 |
 | quantization 8-bit | 90.69 % | 1694/2264 = 74.82 % | −1.33 |
 | quantization 4-bit | 16.67 % | 368/2264 = 16.25 % | −59.9 |
+| aug: jitter 0.5 ms | 92.52 % | 1749/2264 = 77.25 % | +1.10 |
+| aug: event dropout 0.1 | 92.65 % | 1781/2264 = 78.66 % | **+2.51** |
+| aug: insertion 50 Hz | 92.52 % | 1726/2264 = 76.24 % | +0.09 |
+| aug: global shift 100 ms | 92.89 % | 1751/2264 = 77.34 % | +1.19 |
+| aug: channel dropout 0.1 | 92.40 % | 1768/2264 = 78.09 % | +1.94 |
 
 ## Verdicts
 
@@ -188,3 +193,94 @@ redundant; no critical unit.
   untouched.
 
 Tests 135 green (was 124). No commit yet in this round.
+
+## 2026-10-26 — raw-event augmentation (input-noise workstream)
+
+Landed (uncommitted, PI decides the commit): `V3/v3/event_augmentation.py`
+(`augment(times, units, cfg, rng)`, raw events, **before** the 2-ms binning; fixed
+order channel dropout → event dropout → insertion → global shift → jitter →
+`0 <= t < window_s` guard), an `augmentation` config block (all ops off by default,
+phase flags `train/val/test = True/False/False`), `SHDEventStore.sample_events`
+with cache bypass and per-epoch RNG, FIT-store wiring plus a hard assertion that
+VAL/TEST batches are byte-identical with augmentation on/off, and a notebook
+control panel (`V3/v3/control.py`, cell 0b) that applies the same
+`--override` grammar temporarily. 185 tests green; `run_smoke_test.py` passes.
+
+Screening at N=64 (table above): **event dropout and channel dropout move the
+5-epoch number (+2.51 and +1.94 pp), jitter/shift marginally (+1.10/+1.19),
+insertion not at all (+0.09).** Two caveats recorded now:
+
+- These are **unpaired** against the 5-epoch baseline: the baseline run predates
+  `test_predictions.npz`, so only the augmentation arms have per-sample
+  predictions. Binomial SE is ±0.87 pp, so only B is near 2σ.
+- **VAL is flat (92.4–92.9 % vs 93.0 % baseline) while TEST moves.** Consistent
+  with augmentation attacking speaker-specific overfitting rather than generic
+  fit (81 % of TEST is the two unseen speakers), not with a better fit.
+- Cost: ~216 s/epoch vs 196.7 s unaugmented (+10 %), and the event cache is
+  bypassed by design so every epoch is a fresh realization.
+
+N=100 batch (baseline + the same five arms, 5 epochs, seed 0) finished — all six
+rows are in the registry, and the paired picture (per-sample predictions, 10 000
+resamples) is:
+
+| arm (N=100) | correct/2264 | % | Δ vs N=100 baseline | 95 % CI | VERDICT |
+|---|---|---|---|---|---|
+| baseline | 1803 | 79.64 | — | — | — |
+| event dropout 0.1 | 1841 | 81.32 | **+1.68** | [ +0.18, +3.14] | only arm whose CI excludes 0 |
+| jitter 0.5 ms | 1814 | 80.12 | +0.49 | [ −0.88, +1.90] | noise |
+| insertion 50 Hz | 1811 | 79.99 | +0.35 | [ −1.02, +1.68] | noise |
+| channel dropout 0.1 | 1782 | 78.71 | −0.93 | [ −2.52, +0.71] | sign flip vs N=64 (+1.94) |
+| global shift 100 ms | 1736 | 76.68 | −2.96 | [ −4.51, −1.41] | hurts |
+
+Reading: at N=64 five arms looked better than baseline; at N=100 the baseline
+itself is +3.49 pp stronger (79.64 vs 76.15), and only **event dropout** survives
+both screens. Channel dropout and global shift flip sign, jitter/insertion stay
+inside noise — the same failure mode as state noise 0.02 (5-epoch gain, 20-epoch
+loss). This is not yet evidence: both surviving numbers are 5-epoch `screening`
+and dropout's 20-epoch outcome is unmeasured. No commit yet in this round.
+
+### Dropout probability sweep, N=64, 5 epochs (PI-directed)
+
+| p | correct/2264 | % | train acc | val acc |
+|---|---|---|---|---|
+| 0.05 | 1763 | 77.87 | 95.57 | 93.63 |
+| 0.10 | 1781 | 78.67 | 95.41 | 92.65 |
+| 0.15 | 1749 | 77.25 | 93.65 | 90.93 |
+
+Paired (same test samples, 10 000 resamples): 0.10−0.05 = +0.80 pp CI
+[−0.75, +2.34]; 0.10−0.15 = +1.41 pp CI [−0.09, +2.92]; 0.05−0.15 = +0.62 pp
+CI [−0.93, +2.16]. **The three points are statistically indistinguishable** —
+a plateau 0.05–0.15 rather than a resolved optimum; 0.15 visibly underfits at
+5 epochs (train 93.65). No commit yet in this round.
+
+### 20-epoch confirmation, p=0.10, N=64 (PI-directed)
+
+| run | test | Δ vs reference | train acc | val acc |
+|---|---|---|---|---|
+| reference `v3_vector_d1000` (20 ep, no aug) | 1868/2264 = 82.51 % | — | — | 96.32 % |
+| `v3_aug_dropout_ep20` (20 ep, p=0.10) | **1885/2264 = 83.26 %** | **+0.75 pp** | 99.88 % | 96.69 % |
+| same run, best-VAL checkpoint | 1863/2264 = 82.29 % | −0.22 pp | — | — |
+
+Paired bootstrap (10 000 resamples, per-sample predictions of both runs):
+**+0.75 pp, 95 % CI [−0.75, +2.25], one-sided p ≈ 17 %.** Speaker split (1840
+unseen / 424 seen): unseen 80.38 % vs 79.29 % reference (+1.09 pp), seen 95.75 %
+vs 96.46 % (−0.71 pp).
+
+Verdict: **the 5-epoch +2.51 pp shrank to +0.75 pp at 20 epochs and is not
+distinguishable from the reference.** Same failure mode as state noise 0.02, but
+milder — dropout does not *hurt*, it just does not demonstrably help. Note the
+model still memorises FIT (99.88 % train accuracy at epoch 20), so 10 % event
+dropout does not act as a meaningful capacity constraint at this budget.
+Best-VAL checkpoint is worse than final (82.29 vs 83.26), consistent with VAL
+being optimistic for these weights. No commit yet in this round.
+
+### Stacking test: jitter 0.5 ms + event dropout 0.10, N=64, 5 epochs (PI-directed)
+
+Measured `v3_aug_jitter_dropout_ep5`: **1731/2264 = 76.46 %** (train 94.78,
+val 93.14) — i.e. essentially the 5-epoch baseline (1724) and **below both
+single ops**. Paired bootstrap: combo − dropout(0.10) = **−2.21 pp, 95 % CI
+[−3.80, −0.66]**; combo − jitter(0.5) = −0.80 pp CI [−2.34, +0.80].
+
+Verdict: **the two weak ops do not stack.** Two individually positive 5-epoch
+deltas combine to zero; stronger evidence that the 5-epoch deltas were
+run-to-run fit noise rather than a mechanism. No commit yet in this round.

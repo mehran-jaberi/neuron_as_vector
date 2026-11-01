@@ -30,3 +30,6 @@ Thumbs.db
 
 # Binned input cache (V3/v3/binned_cache.py; derived data, rebuild with V3/tools/build_binned_cache.py)
 V3/cache/
+
+# Application materials (personal, generated locally — not part of the science repo)
+Jaberinezhad_*.docx

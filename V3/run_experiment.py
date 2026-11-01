@@ -34,7 +34,7 @@ V3_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(V3_ROOT))
 
 from v3 import plots  # noqa: E402
-from v3.config import StateRegularizationConfig, TimingConfig, V3Config, describe  # noqa: E402
+from v3.config import TimingConfig, V3Config, apply_override_items, describe  # noqa: E402
 from v3.experiment import (  # noqa: E402
     load_checkpoint_payload,
     resolve_device,
@@ -46,12 +46,6 @@ from v3.registry import RunRegistry, register_run  # noqa: E402
 from v3.train import save_json  # noqa: E402
 
 DEFAULT_CONFIG = V3_ROOT / "configs" / "v3_default.yaml"
-
-# nested dataclass blocks addressable with dotted --override keys
-NESTED_BLOCKS = {
-    "timing": TimingConfig,
-    "state_regularization": StateRegularizationConfig,
-}
 
 QUICK_OVERRIDES = dict(
     n_neurons=16,
@@ -65,48 +59,17 @@ QUICK_OVERRIDES = dict(
 )
 
 
-def _coerce(anno: str, raw: str):
-    if "bool" in anno:
-        return raw.strip().lower() in ("1", "true", "yes", "on")
-    if "int" in anno and "float" not in anno:
-        return int(raw)
-    if "float" in anno:
-        return float(raw)
-    return raw
-
-
 def apply_overrides(cfg: V3Config, items: list[str]) -> V3Config:
-    """Apply ``key=value`` overrides, including one level of nesting.
+    """Apply ``key=value`` overrides (thin CLI wrapper around ``v3.config``).
 
-    ``timing.time_bin_ms=2``, ``state_regularization.mode=noise`` and
-    ``state_regularization.noise_std=0.01`` update the nested block in place
-    (other nested fields keep their configured values).
+    The grammar lives in :func:`v3.config.apply_override_items` so the notebook
+    and the control panel share it; malformed or unknown keys keep the CLI's
+    clean ``SystemExit`` instead of a traceback.
     """
-    vfields = {f.name: f for f in dataclasses.fields(V3Config)}
-    flat: dict = {}
-    nested: dict[str, dict] = {}
-    for item in items:
-        if "=" not in item:
-            raise SystemExit(f"--override must be key=value, got {item!r}")
-        key, raw = item.split("=", 1)
-        key = key.strip()
-        if "." in key:
-            parent, child = key.split(".", 1)
-            if parent not in NESTED_BLOCKS:
-                raise SystemExit(f"unknown override key {key!r}")
-            nfields = {f.name: f for f in dataclasses.fields(NESTED_BLOCKS[parent])}
-            if child not in nfields:
-                raise SystemExit(f"unknown override key {key!r}")
-            nested.setdefault(parent, {})[child] = _coerce(str(nfields[child].type), raw)
-            continue
-        if key not in vfields:
-            raise SystemExit(f"unknown configuration key {key!r}")
-        flat[key] = _coerce(str(vfields[key].type), raw)
-    for parent, kwargs in nested.items():
-        cfg = cfg.with_overrides(**{parent: dataclasses.replace(getattr(cfg, parent), **kwargs)})
-    if flat:
-        cfg = cfg.with_overrides(**flat)
-    return cfg
+    try:
+        return apply_override_items(cfg, items)
+    except (ValueError, TypeError) as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def record_run(vcfg: V3Config, variant, info: dict, test_metrics: dict | None, registry: RunRegistry) -> Path:

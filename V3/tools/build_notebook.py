@@ -67,6 +67,7 @@ same readout) is trained as the reference point.
 | § | Section |
 |---|---------|
 | 1 | Environment |
+| 0b | Temporary configuration (control panel) |
 | 2 | Configuration |
 | 3 | Load SHD |
 | 4 | Data inspection / sanity check |
@@ -88,7 +89,10 @@ notebook contains no scientific logic of its own, so the command-line runner
 `V3/run_experiment.py` produces byte-identical results for the same configuration.
 
 Set the environment variable `V3_QUICK=1` before launching the kernel to run a
-minutes-long smoke of the *identical* code path.
+minutes-long smoke of the *identical* code path.  Temporary per-session changes
+go in the `OVERRIDES` dict of §0b: same keys, same grammar and same type coercion
+as `V3/run_experiment.py --override`, and `configs/v3_default.yaml` is never
+edited.
 """)
 
 md(r"""
@@ -135,37 +139,84 @@ if DEVICE.type == "cuda":
 """)
 
 md(r"""
-## 2. Configuration
+## 0b. Temporary configuration (control panel)
 
-One YAML file holds every experimental parameter; nothing is hard-coded in the
-model, the data loader or this notebook.  `D` and `N` are ordinary keys.
+Every knob for the *next run* lives in the `OVERRIDES` dict below.  It is a
+temporary layer on top of `configs/v3_default.yaml`: the YAML file is only read,
+the merged configuration is what the rest of the notebook trains with, and it is
+what the run's `config.yaml` records.
+
+The keys, `key=value` grammar and the type coercion are the **same** as the
+command-line runner's `--override` (both call `v3.control.build_config`), so
+
+```text
+python V3/run_experiment.py --override epochs=20 --override timing.time_bin_ms=4
+```
+
+and
+
+```python
+OVERRIDES = {"epochs": 20, "timing.time_bin_ms": 4.0}
+```
+
+produce the same configuration.  There is no second configuration system.
 """)
 
 py(r"""
+# --- 0b. control panel: temporary overrides for this session --------------
 import json as _json
 
 CONFIG_FILE = V3_ROOT / "configs" / "v3_default.yaml"
-
-# Set V3_QUICK=1 in the environment to run a minutes-long smoke of the same
-# code path (small N, small D, few samples, few epochs).  V3_OVERRIDES accepts a
-# JSON object of configuration overrides, e.g.
-#   V3_OVERRIDES='{"epochs": 2, "max_train_samples": 512}'
+# V3_QUICK=1 in the environment -> the CLI's quick smoke profile (same code path).
 QUICK = bool(int(os.environ.get("V3_QUICK", "0")))
-QUICK_OVERRIDES = dict(n_neurons=16, state_dim=64, mix_rank=8,
-                       timing=TimingConfig(sequence_duration_ms=240.0, time_bin_ms=2.0),
-                       batch_size=16, epochs=2, max_train_samples=256,
-                       val_fraction=0.15, tag="v3_quick_smoke")
-OVERRIDES: dict = _json.loads(os.environ.get("V3_OVERRIDES", "{}"))
 
-cfg = V3Config.from_yaml(CONFIG_FILE).with_overrides(**OVERRIDES)
-if QUICK:
-    cfg = cfg.with_overrides(**QUICK_OVERRIDES)
-cfg = cfg.resolved()
+# Edit this dict to change THIS run without touching configs/v3_default.yaml.
+# Keys are the fields of v3.config.V3Config (dotted for nested blocks); values are
+# coerced to the field's type, exactly like the CLI's --override.  Leave empty for
+# the YAML defaults.  Any accepted key is listed by valid_override_paths() below.
+OVERRIDES = {
+    # "epochs": 20,                              # training epochs
+    # "seed": 0,                                 # reproducibility
+    # "timing.time_bin_ms": 2.0,                 # 1000 ms / 2 ms -> 500 steps
+    # "n_neurons": 64,                           # N vector neurons
+    # "state_dim": 1000,                         # D state dimensions
+    # "state_regularization.mode": "noise",      # none | noise | quantization | noise_quantization
+    # "state_regularization.noise_std": 0.01,
+    # "augmentation.enabled": True,              # raw-event augmentation (off by default)
+    # "augmentation.time_jitter.enabled": True,
+    # "augmentation.time_jitter.std_ms": 2.0,
+}
+# Optional overrides from the environment (JSON), e.g.
+#   $env:V3_OVERRIDES='{"epochs": 2, "max_train_samples": 512}'
+OVERRIDES.update(_json.loads(os.environ.get("V3_OVERRIDES", "{}")))
 
-print(f"config file : {CONFIG_FILE}")
+from v3.control import build_config, valid_override_paths
+
+# Same YAML loader + same override grammar + same quick profile as the CLI.  The
+# YAML file is only read; this merged config is what every later cell uses.
+cfg = build_config(OVERRIDES, quick=QUICK, config_file=CONFIG_FILE)
+if QUICK:  # keep notebook smoke rows distinguishable from CLI quick runs
+    cfg = cfg.with_overrides(tag="v3_quick_smoke")
+
+print(f"config file : {CONFIG_FILE}  (read-only)")
 print(f"mode        : {'QUICK SMOKE' if QUICK else 'PRIMARY'}")
-print(f"overrides   : {OVERRIDES if OVERRIDES else '{}  (none)'}")
-print(f"device/dtype: {cfg.device} / {cfg.dtype}")
+print(f"overrides   : {OVERRIDES if OVERRIDES else '{}  (none: YAML defaults)'}")
+print(f"tag         : {cfg.tag}   device/dtype: {cfg.device} / {cfg.dtype}")
+print(f"override keys accepted: {len(valid_override_paths(cfg))}  (any leaf field of v3.config.V3Config)")
+""")
+
+md(r"""
+## 2. Configuration
+
+§0b built `cfg` from `configs/v3_default.yaml` + the temporary `OVERRIDES` through
+the same `v3.control.build_config` the command-line runner uses, so the notebook
+and `V3/run_experiment.py` see **one** configuration (one YAML file, one override
+grammar).  The prints below are the resolved configuration used by every later
+cell; nothing is re-loaded here.
+""")
+
+py(r"""
+# `cfg` was built in section 0b (YAML defaults + OVERRIDES + optional quick profile).
 print(f"tag         : {cfg.tag}")
 print(f"N (neurons) : {cfg.n_neurons}")
 print(f"D (state dim): {cfg.state_dim}")
@@ -174,6 +225,7 @@ print(f"T x bin     : {cfg.num_time_steps} x {cfg.time_bin_ms:g} ms = {cfg.seque
 print(f"batch/epochs: {cfg.batch_size} / {cfg.epochs}")
 print(f"lr / optim  : {cfg.learning_rate:g} / {cfg.optimizer} ({cfg.lr_schedule})")
 print(f"tau (leak)  : {cfg.tau_ms:g} ms")
+print(f"state reg   : {cfg.state_regularization.mode}   augmentation: {cfg.augmentation.summary()['active']}")
 print(f"shuffle     : train={cfg.shuffle_train}  val={cfg.shuffle_val}  (FIT/VAL split is fixed)")
 """)
 
