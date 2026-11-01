@@ -123,6 +123,37 @@ def _block_from_dict(cls, data: dict, strict: bool, label: str):
 
 
 @dataclass
+class InputDelayConfig:
+    """Learnable per-input-channel conduction delays.
+
+    One delay per input channel (``n_inputs`` channels; 700 for SHD) in
+    milliseconds, applied to the binned input sequence *before* the shared input
+    projection.  Channel ``c``'s sequence is shifted forward in time by
+    ``round(delay_c / dt)`` bins with zero fill at the start of the window.
+
+    Defaults are off, so the input path is untouched and the baseline stays
+    bit-identical.  When enabled, every delay is initialised to 0 ms, which is
+    exactly the baseline as well; training then moves the delays.  The effective
+    delay used by the model is clamped to ``[0, max_ms]``.
+
+    ``learnable=False`` keeps the delays in the model (so a fixed delay map can
+    be supplied) but freezes them.
+    """
+
+    enabled: bool = False
+    max_ms: float = 20.0
+    learnable: bool = True
+
+    def validate(self) -> None:
+        if float(self.max_ms) < 0.0:
+            raise ValueError("input_delays.max_ms must be >= 0")
+
+    @classmethod
+    def from_dict(cls, data: dict, strict: bool = False) -> "InputDelayConfig":
+        return _block_from_dict(cls, data, strict, "input_delays")
+
+
+@dataclass
 class TimeJitterConfig:
     """Per-event timestamp jitter: ``t_i' = t_i + eps_i``, ``eps_i ~ N(0, std_ms^2)``."""
 
@@ -406,6 +437,13 @@ class V3Config:
     rate_target_hz: float = 10.0
     emit_identity_init: bool = True  # init W_emit ~ I (+ small noise)
 
+    # ---- learnable per-input-channel conduction delays (off by default) --
+    # One delay per input channel [ms], applied to the binned input sequence
+    # *before* the shared input projection (see V3/v3/model.py).  Disabled ->
+    # the input path is untouched; enabled with the initial zero delays ->
+    # exactly the baseline as well.
+    input_delays: InputDelayConfig = field(default_factory=InputDelayConfig)
+
     # ---- training --------------------------------------------------------
     batch_size: int = 32
     epochs: int = 5             # primary control of how much training is done
@@ -526,6 +564,7 @@ class V3Config:
             raise ValueError("max_train_batches must be null (all batches) or >= 1")
         self.state_regularization.validate()
         self.augmentation.validate()
+        self.input_delays.validate()
 
     # ------------------------------------------------------------------ #
     def to_dict(self) -> dict:
@@ -585,6 +624,8 @@ class V3Config:
                 v = StateRegularizationConfig.from_dict(v, strict=strict)
             elif k == "augmentation" and isinstance(v, dict):
                 v = EventAugmentationConfig.from_dict(v, strict=strict)
+            elif k == "input_delays" and isinstance(v, dict):
+                v = InputDelayConfig.from_dict(v, strict=strict)
             elif k == "timing" and isinstance(v, dict):
                 v = TimingConfig.from_dict(v, strict=strict)
             kwargs[k] = v
@@ -597,7 +638,17 @@ class V3Config:
         return cls.from_dict(data, strict=strict)
 
     def with_overrides(self, **overrides) -> "V3Config":
-        return dataclasses.replace(self, **overrides)
+        """Copy the configuration with ``overrides`` applied.
+
+        Plain field names (``epochs=3``, ``input_delays=InputDelayConfig(...)``)
+        replace the field directly.  Dotted keys (``input_delays.enabled``) go
+        through the same grammar as the CLI overrides, so a single leaf can be
+        changed without rebuilding its block.
+        """
+        plain = {k: v for k, v in overrides.items() if "." not in k}
+        nested = {k: v for k, v in overrides.items() if "." in k}
+        out = dataclasses.replace(self, **plain)
+        return apply_override_mapping(out, nested) if nested else out
 
 
 # ---------------------------------------------------------------------- #
@@ -607,6 +658,7 @@ NESTED_BLOCKS: dict[str, type] = {
     "timing": TimingConfig,
     "state_regularization": StateRegularizationConfig,
     "augmentation": EventAugmentationConfig,
+    "input_delays": InputDelayConfig,
 }
 
 
@@ -754,6 +806,8 @@ def parameter_groups(cfg: V3Config) -> dict:
         "theta": N,
         "w_cls": N * cfg.n_classes,
     }
+    if cfg.input_delays.enabled:
+        groups["input_delays"] = C
     groups["total"] = sum(groups.values())
     return groups
 
@@ -762,6 +816,7 @@ __all__ = [
     "V3Config",
     "TimingConfig",
     "StateRegularizationConfig",
+    "InputDelayConfig",
     "TimeJitterConfig",
     "EventDropoutConfig",
     "EventInsertionConfig",

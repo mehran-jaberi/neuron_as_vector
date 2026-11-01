@@ -42,6 +42,17 @@ Readout (spike counts, 20 SHD classes)::
 
        logits = ( sum_t s(t) ) W_cls                  in R^20
 
+Learnable input delays
+----------------------
+With ``cfg.input_delays.enabled`` every input channel ``c`` owns one delay
+``d_c`` [ms].  The binned input sequence is shifted forward in time by
+``round(d_c / dt)`` bins (straight-through rounded, so ``d_c`` is trainable)
+with zero fill at the start of the window, and only then projected to ``a(t)``.
+The shift is applied to the whole sequence before it is split into the
+checkpointed segments, so a delayed sample never goes missing at a segment
+boundary.  Initial delays are 0 ms, so enabling the feature at initialisation
+reproduces the baseline exactly.
+
 Why ``tanh``
 ------------
 The state must stay bounded for fp16 to be numerically safe, and ``tanh`` gives a
@@ -110,6 +121,25 @@ def surrogate_spike(u: torch.Tensor, beta: float = 4.0, gamma: float = 1.0) -> t
     return SurrogateSpike.apply(u, beta, gamma)
 
 
+class StraightThroughRound(torch.autograd.Function):
+    """``round`` in the forward pass, the identity in the backward pass.
+
+    Converts a continuous delay in bins into the integer bin count that actually
+    shifts the input sequence.  The forward value is exactly ``round(x)`` -- so a
+    zero delay is a no-op and a delay of ``k`` bins shifts by exactly ``k``
+    timesteps -- while the backward pass pretends no rounding happened, so the
+    delay parameter receives a gradient.
+    """
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor) -> torch.Tensor:
+        return torch.round(x)
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        return grad_out
+
+
 # ---------------------------------------------------------------------- #
 class VectorNeuronPopulation(nn.Module):
     """``N`` neurons, each with a trainable ``D``-dimensional dynamical state."""
@@ -149,6 +179,16 @@ class VectorNeuronPopulation(nn.Module):
         # far from the loss basin.
         self.w_cls = nn.Parameter(torch.zeros(N, K, dtype=torch.float32))
 
+        # learnable per-input-channel conduction delays [ms].  ``None`` when the
+        # feature is disabled: the disabled model then has exactly the baseline
+        # parameters and the input path is untouched (bit-identical).
+        self.input_delay_ms: nn.Parameter | None = None
+        if cfg.input_delays.enabled:
+            self.input_delay_ms = nn.Parameter(
+                torch.zeros(C, dtype=torch.float32),
+                requires_grad=bool(cfg.input_delays.learnable),
+            )
+
         # expose the analytic flag so the class itself never hard-codes D > 1
         self.is_scalar_baseline = D == 1
         # mean-field scaling: a sum of N unit contributions has magnitude ~sqrt(N),
@@ -183,6 +223,73 @@ class VectorNeuronPopulation(nn.Module):
         return torch.zeros(
             batch, self.n_neurons, self.state_dim, device=device, dtype=self.state_dtype
         )
+
+    # ------------------------------------------------------------------ #
+    # learnable per-input-channel conduction delays
+    # ------------------------------------------------------------------ #
+    def effective_input_delays_ms(self) -> torch.Tensor:
+        """Per-channel delays in ms, clamped to ``[0, max_ms]`` (differentiable)."""
+        if self.input_delay_ms is None:
+            raise RuntimeError("input_delays.enabled is False for this model")
+        return torch.clamp(self.input_delay_ms, 0.0, float(self.cfg.input_delays.max_ms))
+
+    def input_delay_bins(self) -> torch.Tensor:
+        """Per-channel delays in bins: ``round(delay_ms / dt)``, STE-differentiable."""
+        return StraightThroughRound.apply(
+            self.effective_input_delays_ms() / float(self.cfg.bin_ms)
+        )
+
+    @torch.no_grad()
+    def clamp_input_delays_(self) -> int:
+        """Clamp the stored parameters into ``[0, max_ms]`` in place; return #changed.
+
+        :meth:`forward` already clamps the *effective* delay, so this only keeps
+        the optimised parameter itself inside the range (e.g. for checkpointing
+        or reporting).  A training loop can call it after each optimiser step.
+        """
+        if self.input_delay_ms is None:
+            return 0
+        max_ms = float(self.cfg.input_delays.max_ms)
+        before = self.input_delay_ms.detach().clone()
+        self.input_delay_ms.clamp_(0.0, max_ms)
+        return int((self.input_delay_ms.detach() != before).sum())
+
+    def _shift_input(self, x: torch.Tensor, bins: torch.Tensor) -> torch.Tensor:
+        """Integer per-channel shift with zero fill: ``out[t] = x[t - k_c]``."""
+        B, T, C = x.shape
+        out = torch.zeros_like(x)
+        if T == 0:
+            return out
+        k = bins.detach().to(torch.long).clamp(0, T)   # k bins == the channel is silent
+        for kk in torch.unique(k).tolist():
+            mask = k == kk
+            if kk == 0:
+                out[:, :, mask] = x[:, :, mask]
+            elif kk < T:
+                out[:, kk:, mask] = x[:, :-kk, mask]
+        return out
+
+    def delayed_input(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the per-channel delays to ``x: (B, T, C)``.
+
+        The *whole* sequence is shifted before it is split into the model's time
+        segments, so the history a delayed channel needs is never lost at a
+        segment boundary: a sample pulled from an earlier segment was already
+        written into the shifted tensor.
+
+        Disabled -> ``x`` is returned unchanged.  With the initial zero delays
+        the result equals ``x`` exactly (a shift by 0 bins), so enabling the
+        feature at initialisation is a no-op.
+        """
+        if self.input_delay_ms is None:
+            return x
+        bins = self.input_delay_bins()
+        shifted = self._shift_input(x, bins)
+        # Straight-through term: exactly zero in the forward pass, but it carries
+        # d(bins)/d(delay) = 1/dt back to the delay parameter -- the integer shift
+        # itself has no gradient.
+        ste = (bins - bins.detach()).to(x.dtype).reshape(1, 1, -1)
+        return shifted + ste
 
     # ------------------------------------------------------------------ #
     def _weights(self):
@@ -256,6 +363,10 @@ class VectorNeuronPopulation(nn.Module):
     ):
         """``x``: ``(B, T, C)`` float tensor.
 
+        With ``cfg.input_delays.enabled`` the input is first shifted per channel
+        by its learned delay (``delayed_input``) with zero fill at the start, so
+        the per-step gate ``a(t)`` is computed from the delayed sequence.
+
         Returns ``(logits, spikes[, pots][, z_final, z_mean])``; the optional
         state summary is appended after the optional potentials.  ``z_final`` is
         the ``(B, N, D)`` state after the last update, ``z_mean`` the ``(B, N, D)``
@@ -268,6 +379,9 @@ class VectorNeuronPopulation(nn.Module):
             raise ValueError(f"expected {self.n_inputs} input channels, got {C}")
         if T > self.cfg.n_bins:
             raise ValueError(f"expected at most {self.cfg.n_bins} timesteps, got {T}")
+        # learnable per-input-channel conduction delays, applied to the whole
+        # sequence *before* it is split into segments (see ``delayed_input``)
+        x = self.delayed_input(x)
         dt = self.state_dtype
         w_in = self.w_in.to(dt)
 
@@ -363,4 +477,9 @@ def checkpoint_supported(z: torch.Tensor) -> bool:
     return bool(z.is_cuda or z.requires_grad)
 
 
-__all__ = ["VectorNeuronPopulation", "SurrogateSpike", "surrogate_spike"]
+__all__ = [
+    "VectorNeuronPopulation",
+    "SurrogateSpike",
+    "StraightThroughRound",
+    "surrogate_spike",
+]
