@@ -38,6 +38,12 @@ input projection and ``s(t) in {0,1}^N`` the population spike vector:
        m_i(t) = ( z_i(t) W_down ) W_up^T              in R^D    (shared rank-R mixing)
        z_i(t+1) = (1 - alpha) z_i(t) + alpha * tanh( m_i(t) + d_i(t) )
 
+Optional trainable state dynamics (``V3Config.state_dynamics``, off by default)
+replace the scalar ``alpha`` with a per-neuron ``alpha_i = sigmoid(raw_i)``
+(``trainable_alpha``) and/or replace ``z(0) = 0`` with a learned ``(N, D)``
+initial state (``learnable_z0``).  With both flags off, the update above is
+executed unchanged, so the baseline stays bit-identical.
+
 Readout (spike counts, 20 SHD classes)::
 
        logits = ( sum_t s(t) ) W_cls                  in R^20
@@ -149,6 +155,21 @@ class VectorNeuronPopulation(nn.Module):
         # far from the loss basin.
         self.w_cls = nn.Parameter(torch.zeros(N, K, dtype=torch.float32))
 
+        # ---- optional trainable state dynamics (default: fixed alpha, z(0)=0)
+        # The parameters exist only when the feature is in force, so the disabled
+        # model keeps exactly the baseline parameter set (same optimiser state,
+        # state_dict and registry parameter budget).
+        sd = cfg.state_dynamics
+        self.raw_alpha: nn.Parameter | None = None   # (N,) leak logits
+        self.z0: nn.Parameter | None = None          # (N, D) initial state
+        if sd.alpha_trainable:
+            # sigmoid(raw) == alpha_init at initialisation
+            self.raw_alpha = nn.Parameter(
+                torch.full((N,), float(sd.alpha_init_logit()), dtype=torch.float32)
+            )
+        if sd.z0_learnable:
+            self.z0 = nn.Parameter(torch.zeros(N, D, dtype=torch.float32))
+
         # expose the analytic flag so the class itself never hard-codes D > 1
         self.is_scalar_baseline = D == 1
         # mean-field scaling: a sum of N unit contributions has magnitude ~sqrt(N),
@@ -179,9 +200,32 @@ class VectorNeuronPopulation(nn.Module):
             return self.state_reg_phase
         return "train" if self.training else "val"
 
+    def alpha_per_neuron(self) -> torch.Tensor | None:
+        """Per-neuron leak ``alpha_i = sigmoid(raw_i)`` in fp32, or ``None``.
+
+        ``None`` whenever ``state_dynamics.trainable_alpha`` is not in force, so
+        the state update falls back to the scalar ``dt/tau`` leak of the
+        baseline.
+        """
+        if self.raw_alpha is None:
+            return None
+        return torch.sigmoid(self.raw_alpha.float())
+
     def init_state(self, batch: int, device: torch.device) -> torch.Tensor:
-        return torch.zeros(
-            batch, self.n_neurons, self.state_dim, device=device, dtype=self.state_dtype
+        """Initial state ``z(0)``: zeros, or the learned ``(N, D)`` state repeated.
+
+        With ``learnable_z0`` the returned ``(B, N, D)`` tensor is a read-only
+        view of the ``z0`` parameter broadcast over the batch, so the gradient of
+        every sample flows back into ``z0``.
+        """
+        if self.z0 is None:
+            return torch.zeros(
+                batch, self.n_neurons, self.state_dim, device=device, dtype=self.state_dtype
+            )
+        return (
+            self.z0.to(device=device, dtype=self.state_dtype)
+            .unsqueeze(0)
+            .expand(batch, self.n_neurons, self.state_dim)
         )
 
     # ------------------------------------------------------------------ #
@@ -224,6 +268,11 @@ class VectorNeuronPopulation(nn.Module):
         w_in, w_down, w_up, w_emit, w_rec, gate, bias, w_out, theta, _ = self._weights()
         dt = self.state_dtype
         alpha = float(self.cfg.alpha)
+        # per-neuron leak when trainable; computed once per chunk and broadcast
+        # over D.  None (default) keeps the scalar baseline update untouched.
+        alpha_i = self.alpha_per_neuron()
+        if alpha_i is not None:
+            alpha_i = alpha_i.to(dt).view(1, self.n_neurons, 1)
         beta, gamma = float(self.cfg.surrogate_beta), float(self.cfg.surrogate_gamma)
 
         spikes, pots = [], []
@@ -238,7 +287,10 @@ class VectorNeuronPopulation(nn.Module):
             c = s @ w_rec                                              # (B, N)
             mix = (z @ w_down) @ w_up                                   # (B, N, D)
             drive = gate * a_chunk[:, k].unsqueeze(1) + c.unsqueeze(-1) * h.unsqueeze(1) + bias
-            z = z + alpha * (torch.tanh(mix + drive) - z)
+            if alpha_i is None:
+                z = z + alpha * (torch.tanh(mix + drive) - z)
+            else:
+                z = z + alpha_i * (torch.tanh(mix + drive) - z)
             z = z.to(dt)
             # controlled imprecision is applied to the *actual* state that the
             # next timestep's spike generation / population signal / mixing read,
