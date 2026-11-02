@@ -74,6 +74,7 @@ import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
 from .config import V3Config
+from .input_delay_line import apply_input_delay_line
 from .state_regularization import regularize_state
 
 
@@ -131,7 +132,15 @@ class VectorNeuronPopulation(nn.Module):
         def rnd(*shape, scale=1.0):
             return (torch.randn(*shape, generator=g) * scale).to(torch.float32)
 
-        self.w_in = nn.Parameter(rnd(C, D, scale=float(cfg.input_gain) / math.sqrt(C)))  # shared input basis
+        # width of the tensor the shared input projection actually sees: K*C
+        # when the delay line stacks shifted copies (concat), C otherwise.  The
+        # /sqrt(C_in) init rule keeps the *total* input drive at initialisation
+        # on today's scale instead of growing by sqrt(K) when K copies are
+        # stacked; with the delay line disabled C_in == C, so both the shape and
+        # the RNG draw are unchanged (bit-identical init).
+        C_in = int(cfg.input_delay_line.input_channels(C))
+        self.input_channels = C_in
+        self.w_in = nn.Parameter(rnd(C_in, D, scale=float(cfg.input_gain) / math.sqrt(C_in)))  # shared input basis
         self.w_down = nn.Parameter(rnd(D, R, scale=1.0 / math.sqrt(D)))    # shared rank-R mixing
         self.w_up = nn.Parameter(rnd(R, D, scale=0.5 / math.sqrt(R)))      # (init mixing gain ~0.5)
         if cfg.emit_identity_init:
@@ -271,8 +280,16 @@ class VectorNeuronPopulation(nn.Module):
         dt = self.state_dtype
         w_in = self.w_in.to(dt)
 
+        # Input delay line (M10): K shifted copies of the already-binned input,
+        # applied once per batch *before* the checkpointed temporal loop.  The
+        # helper returns `x` itself when the block is disabled or copies == 1,
+        # so the baseline path below is unchanged and bit-identical.
+        x = apply_input_delay_line(
+            x, self.cfg.input_delay_line, bin_ms=self.cfg.bin_ms, dtype=dt
+        )
+
         # shared input projection: one big matmul over the whole sequence
-        a = (x.reshape(B * T, C).to(dt) @ w_in).reshape(B, T, self.state_dim)
+        a = (x.reshape(B * T, -1).to(dt) @ w_in).reshape(B, T, self.state_dim)
 
         z = self.init_state(B, x.device)
         chunks = int(self.cfg.grad_checkpoint_chunks)
