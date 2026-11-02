@@ -281,6 +281,57 @@ class InputDelayConfig:
 
 
 @dataclass
+class AdlifConfig:
+    """Two-timescale spike-triggered adaptation currents (adLIF-style).
+
+    With ``enabled = True`` every neuron carries two scalar currents that are
+    driven by its own spike train and subtracted from the pre-activation of the
+    vector state update (inside the ``tanh``, i.e. as part of ``mix + drive``)::
+
+        u_fast(t) = rho_fast * u_fast(t-1) + s(t-1)
+        u_slow(t) = rho_slow * u_slow(t-1) + s(t-1)
+        pre(t)    = mix(t) + drive(t) - gain_fast * u_fast(t) - gain_slow * u_slow(t)
+        z(t+1)    = z(t) + alpha * (tanh(pre(t)) - z(t))
+
+    ``s(t)`` is the spike vector generated from the pre-update state, so the
+    current entering step ``t`` is driven by the *previous* step's spike and the
+    first step has ``u = 0``.  ``rho_fast = 0.9`` / ``rho_slow = 0.99`` are the
+    per-step leaks (one bin == one dynamical step); the gains are one learnable
+    scalar per neuron each and start at ``gain_init = 0``, so the mechanism is
+    exactly inert at initialisation while the currents still accumulate from
+    spikes -- from the second step on the currents are non-zero, which is what
+    gives the gains a non-zero gradient (a gain that only multiplied a zero
+    current would be frozen; see the M1 history).
+
+    ``use_fast`` / ``use_slow`` enable the two timescales separately (at least
+    one must be on when ``enabled = True``).  The default is **off**: with
+    ``enabled = False`` no current and no parameter exists and the baseline
+    update rule / ``state_dict`` are untouched.
+    """
+
+    enabled: bool = False
+    use_fast: bool = True
+    use_slow: bool = True
+    rho_fast: float = 0.9
+    rho_slow: float = 0.99
+    gain_init: float = 0.0
+
+    def validate(self) -> None:
+        if self.enabled and not (bool(self.use_fast) or bool(self.use_slow)):
+            raise ValueError("adlif.enabled requires adlif.use_fast and/or adlif.use_slow")
+        if not 0.0 <= float(self.rho_fast) < 1.0:
+            raise ValueError("adlif.rho_fast must be in [0, 1)")
+        if not 0.0 <= float(self.rho_slow) < 1.0:
+            raise ValueError("adlif.rho_slow must be in [0, 1)")
+        if not math.isfinite(float(self.gain_init)):
+            raise ValueError("adlif.gain_init must be finite")
+
+    @classmethod
+    def from_dict(cls, data: dict, strict: bool = False) -> "AdlifConfig":
+        return _block_from_dict(cls, data, strict, "adlif")
+
+
+@dataclass
 class TimeJitterConfig:
     """Per-event timestamp jitter: ``t_i' = t_i + eps_i``, ``eps_i ~ N(0, std_ms^2)``."""
 
@@ -645,6 +696,11 @@ class V3Config:
     state_dynamics: StateDynamicsConfig = field(
         default_factory=StateDynamicsConfig
     )
+    # ---- two-timescale adaptation currents (disabled by default) ---------
+    # adLIF-style spike-triggered currents that subtract from the pre-activation
+    # of the state update (inside the tanh).  Off by default: no parameter is
+    # created and the baseline update rule stays bit-identical.
+    adlif: AdlifConfig = field(default_factory=AdlifConfig)
 
     # ---- raw-event augmentation (disabled by default) ---------------------
     # Applied to the raw (time, channel) events *before* the 2-ms binning; the
@@ -749,6 +805,7 @@ class V3Config:
             raise ValueError("max_train_batches must be null (all batches) or >= 1")
         self.state_regularization.validate()
         self.state_dynamics.validate()
+        self.adlif.validate()
         self.augmentation.validate()
         self.adaptation.validate()
         self.input_delays.validate()
@@ -811,6 +868,8 @@ class V3Config:
                 v = StateRegularizationConfig.from_dict(v, strict=strict)
             elif k == "state_dynamics" and isinstance(v, dict):
                 v = StateDynamicsConfig.from_dict(v, strict=strict)
+            elif k == "adlif" and isinstance(v, dict):
+                v = AdlifConfig.from_dict(v, strict=strict)
             elif k == "augmentation" and isinstance(v, dict):
                 v = EventAugmentationConfig.from_dict(v, strict=strict)
             elif k == "adaptation" and isinstance(v, dict):
@@ -849,6 +908,7 @@ NESTED_BLOCKS: dict[str, type] = {
     "timing": TimingConfig,
     "state_regularization": StateRegularizationConfig,
     "state_dynamics": StateDynamicsConfig,
+    "adlif": AdlifConfig,
     "augmentation": EventAugmentationConfig,
     "adaptation": AdaptationConfig,
     "input_delays": InputDelayConfig,
@@ -1003,6 +1063,12 @@ def parameter_groups(cfg: V3Config) -> dict:
         groups["w_ad"] = N
     if cfg.input_delays.enabled:
         groups["input_delays"] = C
+    if cfg.adlif.enabled:
+        # one learnable scalar gain per neuron per enabled timescale
+        if cfg.adlif.use_fast:
+            groups["adlif_gain_fast"] = N
+        if cfg.adlif.use_slow:
+            groups["adlif_gain_slow"] = N
     groups["total"] = sum(groups.values())
     return groups
 
@@ -1014,6 +1080,7 @@ __all__ = [
     "AdaptationConfig",
     "StateDynamicsConfig",
     "InputDelayConfig",
+    "AdlifConfig",
     "TimeJitterConfig",
     "EventBlendConfig",
     "EventDropoutConfig",
