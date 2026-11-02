@@ -167,6 +167,69 @@ class AdaptationConfig:
 
 
 @dataclass
+class StateDynamicsConfig:
+    """Optional trainable state dynamics: per-neuron leak and initial state.
+
+    Both features are **off by default**, so the baseline -- a fixed scalar leak
+    ``alpha = dt/tau`` and ``z(0) = 0`` -- stays bit-identical unless requested.
+
+    ``enabled`` is the master switch: the two sub-flags are inert while it is
+    ``False``, so a sweep may stage them in an override file without changing
+    behaviour.  When active:
+
+    * ``trainable_alpha`` -- one free parameter per neuron, ``raw_i``, whose
+      sigmoid is that neuron's leak ``alpha_i = sigmoid(raw_i)``.  ``raw_i`` is
+      initialised to ``logit(alpha_init)``, so every neuron starts at exactly
+      ``alpha_init``; the leak is then learned per neuron and multiplies the
+      whole ``D``-dimensional state of that neuron.
+    * ``learnable_z0`` -- the initial state ``z_i(0) in R^D`` becomes an
+      ``(N, D)`` parameter, initialised exactly to zero.
+
+    ``alpha_init`` replaces the scalar ``V3Config.alpha`` *only* when
+    ``trainable_alpha`` is in force; the scalar field keeps its meaning for the
+    baseline path and as the initialisation reference.
+    """
+
+    enabled: bool = False
+    trainable_alpha: bool = False
+    learnable_z0: bool = False
+    alpha_init: float = 0.1
+
+    @property
+    def alpha_trainable(self) -> bool:
+        """``trainable_alpha`` is actually in force (master switch on)."""
+        return bool(self.enabled and self.trainable_alpha)
+
+    @property
+    def z0_learnable(self) -> bool:
+        """``learnable_z0`` is actually in force (master switch on)."""
+        return bool(self.enabled and self.learnable_z0)
+
+    @property
+    def active(self) -> bool:
+        """At least one of the two trainable state features is in force."""
+        return self.alpha_trainable or self.z0_learnable
+
+    def alpha_init_logit(self) -> float:
+        """``logit(alpha_init)``: the initial value of each raw alpha parameter."""
+        p = float(self.alpha_init)
+        return math.log(p / (1.0 - p))
+
+    def validate(self) -> None:
+        if not math.isfinite(float(self.alpha_init)):
+            raise ValueError("state_dynamics.alpha_init must be finite")
+        if self.alpha_trainable and not 0.0 < float(self.alpha_init) < 1.0:
+            raise ValueError(
+                "state_dynamics.alpha_init must be strictly between 0 and 1 when "
+                f"trainable_alpha is enabled, got {self.alpha_init!r}"
+            )
+
+    @classmethod
+    def from_dict(cls, data: dict, strict: bool = False) -> "StateDynamicsConfig":
+        return _block_from_dict(cls, data, strict, "state_dynamics")
+
+
+@dataclass
 class TimeJitterConfig:
     """Per-event timestamp jitter: ``t_i' = t_i + eps_i``, ``eps_i ~ N(0, std_ms^2)``."""
 
@@ -478,6 +541,14 @@ class V3Config:
         default_factory=StateRegularizationConfig
     )
 
+    # ---- trainable state dynamics (disabled by default) -------------------
+    # Per-neuron leak (tau) and per-neuron initial state z(0).  Both flags are
+    # off, so the default forward pass is exactly the fixed-alpha, zero-state
+    # baseline.
+    state_dynamics: StateDynamicsConfig = field(
+        default_factory=StateDynamicsConfig
+    )
+
     # ---- raw-event augmentation (disabled by default) ---------------------
     # Applied to the raw (time, channel) events *before* the 2-ms binning; the
     # binned tensor is never perturbed.  All defaults are off, so the default
@@ -535,7 +606,11 @@ class V3Config:
 
     @property
     def alpha(self) -> float:
-        """Discrete leak factor ``dt / tau`` of the state update."""
+        """Discrete leak factor ``dt / tau`` of the state update.
+
+        Baseline path only: when ``state_dynamics.alpha_trainable`` is in force,
+        the model uses the per-neuron ``sigmoid(raw_i)`` leak instead.
+        """
         return min(1.0, float(self.dt_ms) / float(self.tau_ms))
 
     @property
@@ -576,6 +651,7 @@ class V3Config:
         if self.max_train_batches is not None and int(self.max_train_batches) < 1:
             raise ValueError("max_train_batches must be null (all batches) or >= 1")
         self.state_regularization.validate()
+        self.state_dynamics.validate()
         self.augmentation.validate()
         self.adaptation.validate()
 
@@ -635,6 +711,8 @@ class V3Config:
                 continue
             if k == "state_regularization" and isinstance(v, dict):
                 v = StateRegularizationConfig.from_dict(v, strict=strict)
+            elif k == "state_dynamics" and isinstance(v, dict):
+                v = StateDynamicsConfig.from_dict(v, strict=strict)
             elif k == "augmentation" and isinstance(v, dict):
                 v = EventAugmentationConfig.from_dict(v, strict=strict)
             elif k == "adaptation" and isinstance(v, dict):
@@ -660,6 +738,7 @@ class V3Config:
 NESTED_BLOCKS: dict[str, type] = {
     "timing": TimingConfig,
     "state_regularization": StateRegularizationConfig,
+    "state_dynamics": StateDynamicsConfig,
     "augmentation": EventAugmentationConfig,
     "adaptation": AdaptationConfig,
 }
@@ -820,6 +899,7 @@ __all__ = [
     "TimingConfig",
     "StateRegularizationConfig",
     "AdaptationConfig",
+    "StateDynamicsConfig",
     "TimeJitterConfig",
     "EventDropoutConfig",
     "EventInsertionConfig",
