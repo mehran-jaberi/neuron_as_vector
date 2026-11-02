@@ -331,3 +331,31 @@ and M2 was the best of six arms at 5 epochs, so selection is not controlled.
 **Verdicts** (accuracy only): M1 alive and the best screening gain; M2 alive and
 confirmed at 20 epochs via `z0`; M3 dead; M4 not pursued; M5 dead; M6 dead. The
 full branch ledger is in `V3/TODO.md`.
+
+### 2026-11-02 — M1/M2/M4 merged into `main` (PI-directed)
+
+The PI's hypothesis at this point is that some runs are at the ceiling of what
+64 neurons can do; testing it needs N>64 at 20 epochs, which there is no time
+for. Instead the three branches that were not dead on accuracy were merged so a
+future run can switch them on individually or together: `feat/m1-adaptation`
+→ `9201b18`, `feat/m2-tau-z0` → `e1fcbfc`, `feat/m4-delays` → `8074cd2` on
+`main`. Each is a default-off nested config block (`adaptation`,
+`state_dynamics`, `input_delays`).
+
+Conflicts were structural, not semantic: `V3/v3/config.py` (each branch adds one
+nested-block dataclass, one `validate()` call, one `from_dict` branch, one
+`NESTED_BLOCKS` entry and one `__all__` entry) and `V3/v3/model.py` (parameter
+registration; the adaptation branch also extends the `_segment` return arity with
+the `b` trace, while the state-dynamics branch extends `init_state`/`_segment`
+with the per-neuron leak). Resolution keeps all three additions side by side.
+
+Verification: **257 tests pass**; the all-off path is **bit-identical to the
+pre-merge commit `e01aaba`** — same logits hash and same parameter count on a
+tiny fixed config, checked from a separate checkout of `e01aaba` — and a run
+with all three blocks enabled trains (finite forward/backward, non-zero gradient
+in `w_ad`, `raw_alpha`, `z0` and `input_delay_raw`). The new
+`V3/tests/test_feature_combinations.py` pins every subset down.
+
+What the merge does *not* claim: no combination of the three has been trained
+yet, and two of the three (M1, M4) lost their 5-epoch gain at 20 epochs on their
+own. The merged `main` is infrastructure, not a result.

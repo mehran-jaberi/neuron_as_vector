@@ -251,14 +251,28 @@ official TEST set (n=2264, SE ±0.87 pp), and re-screened after their bugs were
 fixed. Verdicts are on accuracy alone; "dead" means the branch is not merged and
 is kept only as history.
 
-| branch | feature | 5-ep first | 5-ep re-screen | verdict |
-|---|---|---|---|---|
-| `feat/m1-adaptation` | adaptive threshold (SFA), gain 0.1 | 75.49 % (gain 0) | **81.85 %** | **alive** — +5.70 pp, needs a 20-epoch run |
-| `feat/m2-tau-z0` | per-neuron alpha + learnable z0 | 76.86 % | — (20 ep instead) | **alive** — 20-epoch **85.20 %**, +2.69 pp; the gain is `z0` |
-| `feat/m3-reset` | multiplicative spike reset | 75.53 % (beta 0.5) | 75.44 % (beta 0.02) | **dead** — fixed but no gain |
-| `feat/m4-delays` | learnable input delays 0–20 ms | 76.15 % (zero-grad bug) | 78.14 % (fixed) | **dead** — +1.99 pp is inside twice the SE and the feature is 700 extra parameters; not pursued |
-| `feat/m5-emission` | per-neuron rank-8 emission | 75.80 % | — | **dead** — −0.35 pp for +520 k params |
-| `feat/m6-optimizer` | arctan surrogate / AdamW / readout LR | 20.67 / 75.93 / 75.97 % | — | **dead** — arctan diverged at alpha=1.0 (stability bug, not the surrogate); AdamW and readout-LR are neutral-to-worse |
+| branch | feature | 5-ep first | 5-ep re-screen | 20-ep | verdict |
+|---|---|---|---|---|---|
+| `feat/m1-adaptation` | adaptive threshold (SFA), gain 0.1 | 75.49 % (gain 0) | **81.85 %** | 82.20 % (−0.31) | **merged** — kept as a default-off block; the 5-epoch gain did not survive 20 epochs |
+| `feat/m2-tau-z0` | per-neuron alpha + learnable z0 | 76.86 % | — (20 ep instead) | **85.20 % (+2.69)** | **merged** — the only surviving gain; it comes from `z0`, the learned alpha stayed at 0.098 |
+| `feat/m3-reset` | multiplicative spike reset | 75.53 % (beta 0.5) | 75.44 % (beta 0.02) | not run | **dead** — fixed but no gain |
+| `feat/m4-delays` | learnable input delays 0–20 ms | 76.15 % (zero-grad bug) | **78.14 %** (fixed) | 81.14 % (−1.37) | **merged** — kept as a default-off block; same 5→20 regression |
+| `feat/m5-emission` | per-neuron rank-8 emission | 75.80 % | — | not run | **dead** — −0.35 pp for +520 k params |
+| `feat/m6-optimizer` | arctan surrogate / AdamW / readout LR | 20.67 / 75.93 / 75.97 % | — | not run | **dead** — arctan diverged at alpha=1.0 (stability bug, not the surrogate); AdamW and readout-LR are neutral-to-worse |
 
 Baseline row for every comparison: `v3_vector_d1000`, 5 epochs, 1724/2264 =
 76.15 %, or 20 epochs, 1868/2264 = 82.51 %.
+
+**Merge (2026-11-02, PI-directed).** `M1`, `M2` and `M4` are merged into `main`
+(`9201b18`, `e1fcbfc`, `8074cd2`) as three independent, default-off config
+blocks (`adaptation`, `state_dynamics`, `input_delays`). Conflicts were in
+`V3/v3/config.py` (three nested-block dataclasses, validation, `from_dict`,
+`NESTED_BLOCKS`, `__all__`) and in `V3/v3/model.py` (parameter registration and
+the `_segment` signature/return arity: adaptation adds the `b` trace to the
+segment tuple). Verified after the merge:
+`V3/tests` 257 passed; the disabled path is **bit-identical** to the pre-merge
+commit (same parameter count 11876 on the tiny test config and the same logits
+hash, cross-checked against a checkout of `e01aaba`); all three features at once
+train (forward + backward finite, every new parameter group non-zero gradient);
+new `V3/tests/test_feature_combinations.py` pins down "each alone, any pair, all
+three" so a later merge cannot silently break the combination.

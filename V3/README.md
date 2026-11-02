@@ -530,6 +530,39 @@ Suggested screening values: `noise_std` ∈ {0.001, 0.005, 0.01, 0.02, 0.05};
 command runs exactly one configuration and records exactly one row. The measured
 5-epoch 2 ms baseline is 76.15% (1724/2264) for context.
 
+### Optional model features on `main` (all default off)
+
+Three features were developed on their own branches, screened, and merged into
+`main` after the screen. Each is an independent nested config block, disabled by
+default, and **the disabled path is bit-identical to the baseline** (verified by
+`V3/tests/test_feature_combinations.py` and by a cross-checkout logits hash
+against the pre-merge commit). They can be enabled individually, in any pair, or
+all at once:
+
+| block | feature | extra parameters (N=64, D=1000) |
+|---|---|---|
+| `adaptation` | spike-frequency adaptation: `pot -= w_ad * b`, `b = rho*b + s` | 64 (`w_ad`) |
+| `state_dynamics` | per-neuron leak `alpha_i = sigmoid(raw_i)` and learned `z0` | 64 + 64,000 |
+| `input_delays` | per-input-channel fractional delays, `0.5–10 ms` init | 700 |
+
+```powershell
+# all three at once
+.venv\Scripts\python.exe V3\run_experiment.py --variant vector --override epochs=5 `
+  --override adaptation.enabled=true `
+  --override state_dynamics.enabled=true `
+  --override state_dynamics.trainable_alpha=true `
+  --override state_dynamics.learnable_z0=true `
+  --override input_delays.enabled=true
+```
+
+Screen status of each block (5 epochs, official TEST, N=64/D=1000, baseline
+1724 = 76.15%): `adaptation` 1853 = 81.85% at 5 epochs but **1861 = 82.20%** at
+20 epochs (−0.31 vs reference); `state_dynamics` 1740 = 76.86% at 5 epochs and
+**1929 = 85.20%** at 20 epochs (+2.69, the gain comes from the learned `z0`, not
+the leak — the learned `alpha` stayed at 0.098); `input_delays` 1769 = 78.14% at
+5 epochs and **1837 = 81.14%** at 20 epochs (−1.37). Numbers carry the
+`confirmed` (20 epochs) / `screening` (5 epochs) tag of rule 6.
+
 ## 12. Current experimental reference
 
 ```
