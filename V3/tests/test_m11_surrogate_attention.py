@@ -93,7 +93,7 @@ def test_shipped_yaml_defaults_are_the_baseline_path():
         Path(__file__).resolve().parents[1] / "configs" / "v3_default.yaml"
     )
     assert cfg.surrogate == "fast_sigmoid"
-    assert cfg.surrogate_alpha == 0.5
+    assert cfg.surrogate_alpha == 2.0       # stability-driven default (M11a fix)
     assert cfg.readout == "sum"
     assert cfg.attention.enabled is False
 
@@ -191,7 +191,7 @@ def test_surrogate_gradient_is_fp32_and_ignores_autocast(dtype):
     u32 = torch.linspace(-3.0, 3.0, 17, dtype=torch.float32)
     u_low = u32.to(dtype)
     u_wide = u_low.float()                               # what the model will see
-    reference = 1.0 / (1.0 + 0.5 * u_wide.abs()).square()
+    reference = 1.0 / (1.0 + 2.0 * u_wide.abs()).square()   # default alpha == 2.0
 
     assert surrogate_derivative(u_low, kind="slayer").dtype == torch.float32
     assert torch.equal(surrogate_derivative(u_low, kind="slayer"), reference)
@@ -338,13 +338,15 @@ def test_attention_weights_form_a_distribution():
         m.attention_weights(5)
 
 
-def test_attention_starts_uniform_and_matches_mean_counts():
+def test_attention_starts_uniform_and_reproduces_the_plain_count_sum():
     m = _model(_cfg(attention=AttentionConfig(enabled=True)))
     m.eval()
     with torch.no_grad():
         _logits, spikes = m(_dense_x())
     assert torch.equal(m.attention_weights(), torch.full((4,), 0.25))
-    assert torch.equal(m.readout_counts(spikes), spikes.float().mean(1))
+    # the readout multiplies the softmax weights by T, so uniform attention is
+    # exactly the historical count readout (not 1/T of it).
+    assert torch.equal(m.readout_counts(spikes), spikes.float().sum(1))
 
 
 def test_hand_computed_two_bin_attention_readout():
@@ -366,7 +368,8 @@ def test_hand_computed_two_bin_attention_readout():
     assert spikes.shape == (2, 2, 4)
 
     a = torch.softmax(logits_in, dim=0)
-    counts = spikes.float()[:, 0, :] * a[0] + spikes.float()[:, 1, :] * a[1]
+    # the readout rescales the distribution by T, so a_t enters as T * a_t
+    counts = 2.0 * (spikes.float()[:, 0, :] * a[0] + spikes.float()[:, 1, :] * a[1])
     assert torch.equal(logits, counts @ w)
 
     # independent double-precision hand computation for sample 0
@@ -374,7 +377,7 @@ def test_hand_computed_two_bin_attention_readout():
     a1 = 1.0 - a0
     s = spikes.tolist()[0]
     w_list = w.tolist()
-    cnt = [a0 * s[0][n] + a1 * s[1][n] for n in range(4)]
+    cnt = [2.0 * (a0 * s[0][n] + a1 * s[1][n]) for n in range(4)]
     expected = [sum(cnt[n] * w_list[n][k] for n in range(4)) for k in range(3)]
     assert logits.tolist()[0] == pytest.approx(expected, abs=1e-5)
 
@@ -407,3 +410,128 @@ def test_attention_gradients_reach_the_attention_parameters():
     assert float(m.attn_logits.grad.abs().sum()) > 0.0
     assert m.w_cls.grad is not None
     assert float(m.w_cls.grad.abs().sum()) > 0.0
+
+
+def test_attention_uniform_attention_is_the_plain_count_sum_at_t500():
+    """The softmax's 1/T normalisation is undone by the readout's T factor."""
+    m = _model(
+        _cfg(
+            attention=AttentionConfig(enabled=True),
+            timing=TimingConfig(1000.0, 2.0),        # T = 500, the shipped timing
+        )
+    )
+    m.eval()
+    g = torch.Generator().manual_seed(0)
+    spikes = (torch.rand(2, 500, 4, generator=g) < 0.05).to(torch.float32)
+    with torch.no_grad():
+        counts = m.readout_counts(spikes)
+    assert torch.equal(m.attention_weights(), torch.full((500,), 1.0 / 500.0))
+    # uniform attention == historical readout, bit for bit (not 1/T of it)
+    assert torch.equal(counts, spikes.sum(1))
+
+
+@pytest.mark.parametrize("T", [4, 500])
+def test_attention_gradient_is_t_times_the_unscaled_softmax_readout(T):
+    """Reference check of the fix: grad_new == T * grad_old (pre-fix readout)."""
+    m = _model(
+        _cfg(
+            attention=AttentionConfig(enabled=True),
+            timing=TimingConfig(2.0 * T, 2.0),       # n_bins == T
+        )
+    )
+    m.eval()
+    gen = torch.Generator().manual_seed(1)
+    spikes = (torch.rand(2, T, 4, generator=gen) < 0.2).to(torch.float32)
+    g_out = torch.randn(2, 4, generator=torch.Generator().manual_seed(2))
+
+    loss = (g_out * m.readout_counts(spikes)).sum()
+    loss.backward()
+    new_grad = m.attn_logits.grad.detach().clone()
+
+    # the pre-fix readout, written out again: a = softmax(z), counts = sum_t a_t c_t
+    z_old = torch.zeros(T, dtype=torch.float32, requires_grad=True)
+    a_old = torch.softmax(z_old, dim=0)
+    counts_old = (spikes * a_old.view(1, T, 1)).sum(1)
+    (g_out * counts_old).sum().backward()
+    old_grad = z_old.grad.detach().clone()
+
+    # analytic uniform-attention gradient: (1/tau) * [s_k - mean_j s_j], tau = 1
+    s = (spikes * g_out.view(2, 1, 4)).sum(2)        # (B, T)
+    per_bin = s.sum(0)                               # (T,)
+    expected = per_bin - per_bin.mean()
+
+    assert torch.allclose(new_grad, expected, atol=1e-6)
+    assert torch.allclose(old_grad, expected / T, atol=1e-6)
+    assert torch.allclose(new_grad, T * old_grad, atol=1e-6)
+    assert float(old_grad.abs().sum()) > 0.0          # the ratio is meaningful
+
+
+def test_attention_gets_a_nonzero_gradient_after_one_optimiser_step():
+    """Zero w_cls makes the first attn gradient exactly 0; the first step moves
+    w_cls, so the attention logits then train at the plain count scale."""
+    m = _model(_cfg(attention=AttentionConfig(enabled=True)))
+    m.eval()
+    opt = torch.optim.SGD([p for p in m.parameters()], lr=0.1)
+    x, y = _dense_x(), torch.tensor([0, 2])
+
+    logits, spikes = m(x)
+    loss, _ce = m.loss(logits, spikes, y)
+    loss.backward()
+    assert m.w_cls.grad is not None
+    assert float(m.w_cls.grad.abs().sum()) > 0.0     # classifier does move
+    assert torch.equal(m.attn_logits.grad, torch.zeros(4))
+
+    before = m.w_cls.detach().clone()
+    opt.step()
+    opt.zero_grad(set_to_none=True)
+    assert not torch.equal(m.w_cls.detach(), before)
+
+    logits, spikes = m(x)
+    loss, _ce = m.loss(logits, spikes, y)
+    loss.backward()
+    assert m.attn_logits.grad is not None
+    assert torch.isfinite(m.attn_logits.grad).all()
+    assert float(m.attn_logits.grad.abs().sum()) > 0.0
+
+
+# ---------------------------------------------------------------------- #
+# M11a fix: the default SLAYER width keeps the far-field gradient bounded
+# ---------------------------------------------------------------------- #
+def test_slayer_default_alpha_bounds_the_far_field_gradient_ratio():
+    u = torch.tensor([0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 64.0, 256.0], dtype=torch.float64)
+    baseline = surrogate_derivative(u, kind="fast_sigmoid")
+    slayer = surrogate_derivative(u, kind="slayer")      # default alpha == 2.0
+    ratio = slayer / baseline
+
+    assert float(ratio[0]) == 1.0                        # both 1 at threshold
+    assert float(ratio.min()) >= 1.0
+    # (1 + 4|u|)^2 / (1 + 2|u|)^2 -> 4 asymptotically; measured <= 3.99 at 256.
+    assert float(ratio.max()) <= 4.0
+    assert float(ratio[-1]) == pytest.approx(3.99, abs=0.01)
+    assert float(ratio[4]) == pytest.approx(3.766, abs=0.01)   # |u| = 8
+
+    # the pre-fix alpha=0.5 width was 63x the baseline in the far field: this is
+    # the regime that overflowed the 500-step fp16 BPTT.
+    old = surrogate_derivative(u, kind="slayer", alpha=0.5)
+    assert float((old / baseline)[-1]) == pytest.approx(63.13, abs=0.05)
+    assert float((old / baseline)[-1]) > 40.0
+
+
+def test_slayer_fp16_forward_and_loss_scaled_backward_stay_finite():
+    """CPU smoke test of the AMP-like path: fp16 state + 2048x loss scale."""
+    cfg = _cfg(surrogate="slayer", surrogate_alpha=2.0, dtype="float16", amp=False)
+    m = _model(cfg)
+    m.eval()
+    with torch.no_grad():
+        m.w_cls.normal_(0.0, 0.1, generator=torch.Generator().manual_seed(3))
+    x, y = _dense_x().to(torch.float16), torch.tensor([0, 2])
+    logits, spikes = m(x)
+    loss, _ce = m.loss(logits, spikes, y)
+    (loss * 2048.0).backward()                  # AMP scales the loss before backward
+    assert torch.isfinite(loss)
+    for name, p in m.named_parameters():
+        if p.grad is not None:
+            assert torch.isfinite(p.grad).all(), f"non-finite gradient in {name}"
+    assert m.theta.grad is not None
+    assert float(m.theta.grad.abs().sum()) > 0.0
+

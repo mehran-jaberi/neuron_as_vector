@@ -32,7 +32,10 @@ REPO_ROOT = V3_ROOT.parent
 #: ``fast_sigmoid`` (default) is ``gamma / (1 + beta|u|)^2``, the derivative of
 #: ``gamma*u / (1 + beta|u|)``; it is the recorded baseline and must stay
 #: bit-identical.  ``slayer`` (M11a) is ``1 / (1 + alpha|u|)^2`` with its own
-#: ``surrogate_alpha`` width.
+#: ``surrogate_alpha`` width whose default is stability-driven (see
+#: ``V3Config.surrogate_alpha``): at ``alpha=2`` the far-field derivative is at
+#: most 4x the baseline's, whereas the old ``alpha=0.5`` reached 63x and
+#: overflowed the fp16 BPTT.
 SURROGATE_KINDS = ("fast_sigmoid", "slayer")
 
 #: Readout modes.  ``sum``/``mean`` are the historical count readouts;
@@ -332,14 +335,21 @@ class AttentionConfig:
     with a learned probability distribution over bins::
 
         a = softmax(attn_logits / temperature)        # (T,), sums to 1
-        counts_att = sum_t a_t * c_t                  # (B, N)
+        counts_att = sum_t (T * a_t) * c_t            # (B, N), count scale
         logits = counts_att @ W_cls
+
+    The ``T *`` factor restores the plain spike-count scale: without it the
+    uniform distribution would give ``1/T`` of the historical count readout
+    (T=500), suppress every classifier gradient by ~500x and leave the
+    zero-initialised readout stuck.  With it, uniform attention reproduces the
+    plain count sum and the classifier starts with the baseline gradient
+    (M11b), while the attention logits see the full, un-suppressed gradient as
+    soon as ``W_cls`` leaves zero.
 
     The distribution is parameterised directly by one logit per bin (``T``
     parameters, no hidden MLP) and the logits are zero-initialised, so the
-    initial forward is the uniform average of the per-bin counts (the historical
-    ``mean`` readout) up to floating-point order.  ``temperature`` sharpens
-    (``< 1``) or flattens (``> 1``) the distribution.
+    initial forward reuses the plain spike-count readout.  ``temperature``
+    sharpens (``< 1``) or flattens (``> 1``) the distribution.
 
     ``enabled=False`` (the default) leaves the readout exactly as before and
     adds **no parameters** to the model.
@@ -450,7 +460,9 @@ class V3Config:
     surrogate: str = "fast_sigmoid"  # "fast_sigmoid" (baseline) | "slayer"
     surrogate_beta: float = 4.0  # fast-sigmoid surrogate slope
     surrogate_gamma: float = 1.0 # fast-sigmoid surrogate gain
-    surrogate_alpha: float = 0.5 # SLAYER surrogate width: 1/(1 + alpha|u|)^2
+    surrogate_alpha: float = 2.0 # SLAYER width: 1/(1 + alpha|u|)^2; 2.0 keeps the
+    #                              far-field gradient <= 4x fast_sigmoid so the fp16
+    #                              BPTT keeps the baseline's loss-scale headroom
     readout: str = "sum"         # "sum" (spike count) | "mean"
     rate_reg: float = 1.0e-4     # weight of the firing-rate regulariser (0 disables)
     rate_target_hz: float = 10.0

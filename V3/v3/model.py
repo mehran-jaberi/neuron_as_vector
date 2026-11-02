@@ -100,7 +100,7 @@ def surrogate_derivative(
     gamma: float = 1.0,
     *,
     kind: str = "fast_sigmoid",
-    alpha: float = 0.5,
+    alpha: float = 2.0,
 ) -> torch.Tensor:
     """Derivative of the spike surrogate with respect to the potential ``u``.
 
@@ -113,6 +113,11 @@ def surrogate_derivative(
         implementation (same operands, same order).
     ``slayer`` (M11a)
         ``1 / (1 + alpha*|u|)^2``, the SLAYER fast-sigmoid derivative.
+        ``alpha`` defaults to ``2.0`` (M11a robustness fix): the derivative is
+        then at most ``(beta/alpha)^2 = 4`` times the baseline fast-sigmoid
+        derivative for every ``|u|`` (asymptotically 4x, 3.77x at ``|u|=8``),
+        whereas the old ``alpha=0.5`` width reached 63x in the far field and
+        overflowed the fp16 BPTT (pinned by the M11a tests).
 
     Precision contract
     ------------------
@@ -163,7 +168,7 @@ class SurrogateSpike(torch.autograd.Function):
         beta: float,
         gamma: float,
         kind: str = "fast_sigmoid",
-        alpha: float = 0.5,
+        alpha: float = 2.0,
     ) -> torch.Tensor:
         u_w = u if u.dtype in (torch.float32, torch.float64) else u.float()
         ctx.save_for_backward(u_w)
@@ -188,7 +193,7 @@ def surrogate_spike(
     gamma: float = 1.0,
     *,
     kind: str = "fast_sigmoid",
-    alpha: float = 0.5,
+    alpha: float = 2.0,
 ) -> torch.Tensor:
     """Heaviside spike; ``kind`` selects the surrogate gradient (see M11a)."""
     return SurrogateSpike.apply(u, beta, gamma, kind, alpha)
@@ -235,9 +240,10 @@ class VectorNeuronPopulation(nn.Module):
 
         # ---- learnt temporal attention over the readout (M11b) -----------
         # One logit per time bin, zero-initialised so the softmax starts uniform
-        # and the initial forward is the mean-count readout.  The parameter is
-        # created *only* when the block is enabled: the disabled model has the
-        # exact same parameter set and forward as before.
+        # and the initial forward reuses the plain spike-count readout (the
+        # readout rescales the uniform weights back to the count scale).  The
+        # parameter is created *only* when the block is enabled: the disabled
+        # model has the exact same parameter set and forward as before.
         if bool(cfg.attention.enabled):
             self.attn_logits = nn.Parameter(torch.zeros(int(cfg.n_bins), dtype=torch.float32))
         else:
@@ -306,9 +312,15 @@ class VectorNeuronPopulation(nn.Module):
 
         Off (default): exact spike-count sum, or its mean when ``cfg.readout ==
         "mean"`` -- identical operations and order to the historical readout.
-        On: ``sum_t a_t * c_t`` with the learned bin distribution ``a``.  In
-        that case ``cfg.readout`` is ignored: the softmax already normalises
-        over bins, so dividing by ``T`` again would shrink the logit scale.
+
+        On: ``sum_t (T * a_t) * c_t`` with the learned bin distribution ``a``.
+        The softmax normalises over bins, so ``a`` sums to 1; left like that,
+        ``counts_att`` would be ``1/T`` of the plain count scale (T=500), which
+        made the classifier gradient 500x too small and left the zero-initialised
+        readout stuck.  The weights are therefore multiplied by ``T`` *before*
+        the reduction, so their mean is 1 and uniform attention reproduces the
+        plain count sum exactly (``T * (1/T) == 1`` in fp32 for the bin counts
+        used here).  ``cfg.readout`` is ignored when attention is on.
         """
         T = int(spikes.shape[1])
         counts = spikes.float().sum(1)                     # (B, N) exact integers
@@ -317,7 +329,8 @@ class VectorNeuronPopulation(nn.Module):
                 counts = counts / T
             return counts
         a = self.attention_weights(T)                      # (T,) fp32, sums to 1
-        return (spikes.float() * a.view(1, T, 1)).sum(1)   # (B, N)
+        scale = a * T                                      # (T,), mean == 1
+        return (spikes.float() * scale.view(1, T, 1)).sum(1)   # (B, N)
 
     # ------------------------------------------------------------------ #
     def _weights(self):
