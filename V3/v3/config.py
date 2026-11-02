@@ -123,6 +123,45 @@ def _block_from_dict(cls, data: dict, strict: bool, label: str):
 
 
 @dataclass
+class TwoStageConfig:
+    """A second, independent rank-R mixing stage inside one timestep (M12).
+
+    Off by default.  With ``enabled = False`` no parameter is created and the
+    timestep update is exactly the single-mixer baseline, so the default model is
+    bit-identical.  With ``enabled = True`` each step becomes::
+
+        mix2  = (z @ w_down2) @ w_up2       rank R2, independent of w_down / w_up
+        inner = tanh(mix2 + drive)
+        z    <- z + alpha * (tanh(mix + lam * inner) - z)
+
+    ``lam`` is a learned scalar initialised to ``lam_init`` (1.0).  ``w_down2``
+    is initialised **exactly like** ``w_down`` (``randn(D, R2) / sqrt(D)``, same
+    generator), and ``w_up2`` like ``w_up`` (``randn(R2, D) * 0.5 / sqrt(R2)``),
+    so the inner stage starts with the same mixing gain as the outer one: a zero
+    or scaled-down init would leave it -- and ``lam`` -- inert from step 0.
+    """
+
+    enabled: bool = False
+    rank: int = 64
+    lam_init: float = 1.0
+
+    @property
+    def active(self) -> bool:
+        """The second mixing stage is in force."""
+        return bool(self.enabled)
+
+    def validate(self) -> None:
+        if int(self.rank) < 1:
+            raise ValueError("two_stage.rank must be >= 1")
+        if not math.isfinite(float(self.lam_init)):
+            raise ValueError("two_stage.lam_init must be finite")
+
+    @classmethod
+    def from_dict(cls, data: dict, strict: bool = False) -> "TwoStageConfig":
+        return _block_from_dict(cls, data, strict, "two_stage")
+
+
+@dataclass
 class TimeJitterConfig:
     """Per-event timestamp jitter: ``t_i' = t_i + eps_i``, ``eps_i ~ N(0, std_ms^2)``."""
 
@@ -434,6 +473,12 @@ class V3Config:
         default_factory=StateRegularizationConfig
     )
 
+    # ---- second nonlinear mixing stage (disabled by default) --------------
+    # Extra depth *inside* one timestep: an independent rank-R2 mixer feeding a
+    # second tanh before the state update.  Off by default, and the parameters
+    # are created only when enabled, so the baseline model is unchanged.
+    two_stage: TwoStageConfig = field(default_factory=TwoStageConfig)
+
     # ---- raw-event augmentation (disabled by default) ---------------------
     # Applied to the raw (time, channel) events *before* the 2-ms binning; the
     # binned tensor is never perturbed.  All defaults are off, so the default
@@ -525,6 +570,7 @@ class V3Config:
         if self.max_train_batches is not None and int(self.max_train_batches) < 1:
             raise ValueError("max_train_batches must be null (all batches) or >= 1")
         self.state_regularization.validate()
+        self.two_stage.validate()
         self.augmentation.validate()
 
     # ------------------------------------------------------------------ #
@@ -583,6 +629,8 @@ class V3Config:
                 continue
             if k == "state_regularization" and isinstance(v, dict):
                 v = StateRegularizationConfig.from_dict(v, strict=strict)
+            elif k == "two_stage" and isinstance(v, dict):
+                v = TwoStageConfig.from_dict(v, strict=strict)
             elif k == "augmentation" and isinstance(v, dict):
                 v = EventAugmentationConfig.from_dict(v, strict=strict)
             elif k == "timing" and isinstance(v, dict):
@@ -606,6 +654,7 @@ class V3Config:
 NESTED_BLOCKS: dict[str, type] = {
     "timing": TimingConfig,
     "state_regularization": StateRegularizationConfig,
+    "two_stage": TwoStageConfig,
     "augmentation": EventAugmentationConfig,
 }
 
@@ -754,6 +803,13 @@ def parameter_groups(cfg: V3Config) -> dict:
         "theta": N,
         "w_cls": N * cfg.n_classes,
     }
+    if cfg.two_stage.active:
+        # the second mixer is an independent rank-R2 pair plus the scalar lam;
+        # absent by default, so the baseline budget is unchanged.
+        R2 = min(int(cfg.two_stage.rank), D)
+        groups["w_down2"] = D * R2
+        groups["w_up2"] = R2 * D
+        groups["lam"] = 1
     groups["total"] = sum(groups.values())
     return groups
 
@@ -762,6 +818,7 @@ __all__ = [
     "V3Config",
     "TimingConfig",
     "StateRegularizationConfig",
+    "TwoStageConfig",
     "TimeJitterConfig",
     "EventDropoutConfig",
     "EventInsertionConfig",

@@ -38,6 +38,21 @@ input projection and ``s(t) in {0,1}^N`` the population spike vector:
        m_i(t) = ( z_i(t) W_down ) W_up^T              in R^D    (shared rank-R mixing)
        z_i(t+1) = (1 - alpha) z_i(t) + alpha * tanh( m_i(t) + d_i(t) )
 
+Optional second nonlinear mixing stage (``V3Config.two_stage``, off by default)
+------------------------------------------------------------------------------
+With ``two_stage.enabled`` each step gains an independent rank-``R2`` mixer and
+a second ``tanh`` *before* the state update::
+
+       m2_i(t) = ( z_i(t) W_down2 ) W_up2^T           in R^D    (inner mixer)
+       inner   = tanh( m2_i(t) + d_i(t) )
+       z_i(t+1) = (1 - alpha) z_i(t) + alpha * tanh( m_i(t) + lam * inner )
+
+``lam`` is a learned scalar initialised to 1.0.  This adds depth *inside* one
+timestep without cutting the state's connection to its own history: ``z_i(t)``
+is still the only recurrent variable, and the outer mixing ``m_i(t)`` and the
+drive ``d_i(t)`` are unchanged.  With ``enabled = False`` no parameter is
+created and the baseline update above runs unchanged (bit-identical).
+
 Readout (spike counts, 20 SHD classes)::
 
        logits = ( sum_t s(t) ) W_cls                  in R^20
@@ -149,6 +164,23 @@ class VectorNeuronPopulation(nn.Module):
         # far from the loss basin.
         self.w_cls = nn.Parameter(torch.zeros(N, K, dtype=torch.float32))
 
+        # ---- optional second nonlinear mixing stage (M12, off by default) ----
+        # Created only when enabled, so the default model keeps exactly the
+        # baseline parameter set (state_dict order, optimiser state and the
+        # registry parameter budget).  ``w_down2`` uses the *same* scheme and
+        # scale as ``w_down``, and ``w_up2`` the same as ``w_up``: a zero or
+        # shrunken init would leave the inner stage -- and ``lam`` -- inert at
+        # step 0, the failure mode this feature has to avoid.
+        ts = cfg.two_stage
+        self.w_down2: nn.Parameter | None = None   # (D, R2) inner down-projection
+        self.w_up2: nn.Parameter | None = None     # (R2, D) inner up-projection
+        self.lam: nn.Parameter | None = None       # scalar gain of the inner stage
+        if ts.active:
+            R2 = int(min(int(ts.rank), D))
+            self.w_down2 = nn.Parameter(rnd(D, R2, scale=1.0 / math.sqrt(D)))
+            self.w_up2 = nn.Parameter(rnd(R2, D, scale=0.5 / math.sqrt(R2)))
+            self.lam = nn.Parameter(torch.tensor(float(ts.lam_init), dtype=torch.float32))
+
         # expose the analytic flag so the class itself never hard-codes D > 1
         self.is_scalar_baseline = D == 1
         # mean-field scaling: a sum of N unit contributions has magnitude ~sqrt(N),
@@ -206,6 +238,21 @@ class VectorNeuronPopulation(nn.Module):
         )
 
     # ------------------------------------------------------------------ #
+    def two_stage_weights(self):
+        """Casted ``(w_down2, w_up2, lam)`` of the second stage, or ``None``.
+
+        ``None`` whenever ``two_stage.enabled`` is false, in which case the
+        timestep update runs the baseline single-mixer expression untouched.
+        Kept as a method (not part of :meth:`_weights`) so the baseline weight
+        tuple and its unpacking are unchanged.
+        """
+        w_down2, w_up2, lam = self.w_down2, self.w_up2, self.lam
+        if w_down2 is None or w_up2 is None or lam is None:
+            return None
+        dt = self.state_dtype
+        return w_down2.to(dt), w_up2.to(dt), lam.to(dt)
+
+    # ------------------------------------------------------------------ #
     def _segment(
         self,
         z: torch.Tensor,
@@ -225,6 +272,9 @@ class VectorNeuronPopulation(nn.Module):
         dt = self.state_dtype
         alpha = float(self.cfg.alpha)
         beta, gamma = float(self.cfg.surrogate_beta), float(self.cfg.surrogate_gamma)
+        two_stage = self.two_stage_weights()   # None on the baseline path
+        if two_stage is not None:
+            w_down2, w_up2, lam = two_stage
 
         spikes, pots = [], []
         for k in range(a_chunk.shape[1]):
@@ -238,7 +288,14 @@ class VectorNeuronPopulation(nn.Module):
             c = s @ w_rec                                              # (B, N)
             mix = (z @ w_down) @ w_up                                   # (B, N, D)
             drive = gate * a_chunk[:, k].unsqueeze(1) + c.unsqueeze(-1) * h.unsqueeze(1) + bias
-            z = z + alpha * (torch.tanh(mix + drive) - z)
+            if two_stage is None:
+                z = z + alpha * (torch.tanh(mix + drive) - z)
+            else:
+                # second, independent rank-R2 mixer + tanh, at the same state;
+                # `drive` is shared and `lam` (init 1.0) gates the inner stage.
+                mix2 = (z @ w_down2) @ w_up2
+                inner = torch.tanh(mix2 + drive)
+                z = z + alpha * (torch.tanh(mix + lam * inner) - z)
             z = z.to(dt)
             # controlled imprecision is applied to the *actual* state that the
             # next timestep's spike generation / population signal / mixing read,
