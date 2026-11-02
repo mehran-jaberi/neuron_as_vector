@@ -149,6 +149,21 @@ class VectorNeuronPopulation(nn.Module):
         # far from the loss basin.
         self.w_cls = nn.Parameter(torch.zeros(N, K, dtype=torch.float32))
 
+        # Spike-frequency adaptation (off by default): one scalar adaptive gain
+        # per neuron, read against a decaying spike-count trace.  When the
+        # feature is disabled nothing is registered, so the baseline parameter
+        # set and the baseline computation are unchanged.
+        ad = cfg.adaptation
+        if not ad.enabled:
+            self.w_ad = None
+        else:
+            gain = torch.full((N,), float(ad.gain_init), dtype=torch.float32)
+            if ad.learnable_gain:
+                self.w_ad = nn.Parameter(gain)
+            else:
+                # fixed gain: a buffer, so the optimiser never sees it
+                self.register_buffer("w_ad", gain)
+
         # expose the analytic flag so the class itself never hard-codes D > 1
         self.is_scalar_baseline = D == 1
         # mean-field scaling: a sum of N unit contributions has magnitude ~sqrt(N),
@@ -184,14 +199,22 @@ class VectorNeuronPopulation(nn.Module):
             batch, self.n_neurons, self.state_dim, device=device, dtype=self.state_dtype
         )
 
+    def init_adaptation_state(self, batch: int, device: torch.device) -> torch.Tensor:
+        """Initial (zero) adaptation trace ``b`` of shape ``(B, N)``."""
+        return torch.zeros(
+            batch, self.n_neurons, device=device, dtype=self.state_dtype
+        )
+
     # ------------------------------------------------------------------ #
     def _weights(self):
         """Cast every weight tensor to the state dtype (fp16 by default).
 
         Master weights stay fp32 so the optimizer keeps full precision; the
-        computation itself is genuinely fp16.
+        computation itself is genuinely fp16.  ``w_ad`` is ``None`` when
+        spike-frequency adaptation is disabled (nothing registered then).
         """
         dt = self.state_dtype
+        w_ad = None if self.w_ad is None else self.w_ad.to(dt)
         return (
             self.w_in.to(dt),
             self.w_down.to(dt),
@@ -203,6 +226,7 @@ class VectorNeuronPopulation(nn.Module):
             self.w_out.to(dt),
             self.theta.to(dt),
             self.w_cls.to(dt),
+            w_ad,
         )
 
     # ------------------------------------------------------------------ #
@@ -210,30 +234,50 @@ class VectorNeuronPopulation(nn.Module):
         self,
         z: torch.Tensor,
         a_chunk: torch.Tensor,
+        b: torch.Tensor | None = None,
         state_sum: torch.Tensor | None = None,
     ):
         """Run one chunk of timesteps.  Returns ``(z_next, spikes, potentials)``.
 
-        Kept as a bound method so ``torch.utils.checkpoint`` can recompute it.
+        Kept as a bound method so ``torch.utils.checkpoint`` can recompute it;
+        the positional arguments are all tensors so the checkpointed call needs
+        no non-tensor arguments.
+
+        ``b`` is the optional ``(B, N)`` spike-frequency adaptation trace.  With
+        ``cfg.adaptation.enabled`` the spike-generation potential becomes
+        ``pot = (z * w_out).sum(-1) + theta - w_ad * b`` and the trace is updated
+        after the spike as ``b = rho * b + s``.  ``b`` is carried across segments
+        exactly like the state ``z`` (passing ``b=None`` starts from a zero
+        trace), so the returned tuple then has a fourth element ``b_next``; with
+        the feature off the three-tuple and the computation are exactly the
+        baseline.
 
         ``state_sum`` is an optional ``(B, N, D)`` fp32 accumulator; when given,
         the state that is *read* at every timestep is added to it in place.  It is
         used by :meth:`forward` (``return_states=True``) to obtain the time-mean
         state without storing per-timestep states, and must not require grad.
         """
-        w_in, w_down, w_up, w_emit, w_rec, gate, bias, w_out, theta, _ = self._weights()
+        w_in, w_down, w_up, w_emit, w_rec, gate, bias, w_out, theta, _, w_ad = self._weights()
         dt = self.state_dtype
         alpha = float(self.cfg.alpha)
         beta, gamma = float(self.cfg.surrogate_beta), float(self.cfg.surrogate_gamma)
+        adapt = bool(self.cfg.adaptation.enabled)
+        rho = float(self.cfg.adaptation.rho)
+        if adapt and b is None:
+            b = self.init_adaptation_state(int(z.shape[0]), z.device)
 
         spikes, pots = [], []
         for k in range(a_chunk.shape[1]):
             if state_sum is not None:
                 state_sum += z                                        # fp32 running sum
             pot = (z * w_out).sum(-1) + theta                          # (B, N) fp16
+            if adapt:
+                pot = pot - w_ad * b                                   # adaptation current
             pots.append(pot)
             s = surrogate_spike(pot, beta, gamma)                      # (B, N) fp16
             spikes.append(s)
+            if adapt:
+                b = rho * b + s                                        # decaying spike trace
             h = ((s.unsqueeze(-1) * z).sum(1) * self.pop_scale) @ w_emit    # (B, D)
             c = s @ w_rec                                              # (B, N)
             mix = (z @ w_down) @ w_up                                   # (B, N, D)
@@ -245,7 +289,10 @@ class VectorNeuronPopulation(nn.Module):
             # so its effect genuinely propagates through the dynamics.
             if self.cfg.state_regularization.mode != "none":
                 z = regularize_state(z, self.cfg.state_regularization, self._reg_phase())
-        return z, torch.stack(spikes, dim=1), torch.stack(pots, dim=1)
+        out = (z, torch.stack(spikes, dim=1), torch.stack(pots, dim=1))
+        if adapt:
+            return out + (b,)
+        return out
 
     # ------------------------------------------------------------------ #
     def forward(
@@ -262,6 +309,10 @@ class VectorNeuronPopulation(nn.Module):
         time-mean of the state read at each timestep (accumulated in fp32,
         returned in the state dtype).  ``return_states=True`` is an analysis
         path: it is not supported together with gradient checkpointing.
+
+        ``cfg.adaptation.enabled`` changes no return value: the ``(B, N)``
+        adaptation trace is internal state, zero at the first timestep and
+        carried across the time segments exactly like ``z``.
         """
         B, T, C = x.shape
         if C != self.n_inputs:
@@ -275,6 +326,10 @@ class VectorNeuronPopulation(nn.Module):
         a = (x.reshape(B * T, C).to(dt) @ w_in).reshape(B, T, self.state_dim)
 
         z = self.init_state(B, x.device)
+        adapt = bool(self.cfg.adaptation.enabled)
+        # adaptation trace (B, N): reset at the start of every sequence, then
+        # carried across the time segments exactly like the state z
+        b = self.init_adaptation_state(B, x.device) if adapt else None
         chunks = int(self.cfg.grad_checkpoint_chunks)
         step = max(1, math.ceil(T / chunks))
         use_ckpt = self.training and checkpoint_supported(z)
@@ -294,9 +349,18 @@ class VectorNeuronPopulation(nn.Module):
         for t0 in range(0, T, step):
             a_chunk = a[:, t0 : t0 + step]
             if use_ckpt:
-                z, s, p = checkpoint(self._segment, z, a_chunk, use_reentrant=False)
+                if adapt:
+                    # all positional args are tensors: z, a_chunk, b
+                    z, s, p, b = checkpoint(
+                        self._segment, z, a_chunk, b, use_reentrant=False
+                    )
+                else:
+                    z, s, p = checkpoint(self._segment, z, a_chunk, use_reentrant=False)
             else:
-                z, s, p = self._segment(z, a_chunk, state_sum)
+                if adapt:
+                    z, s, p, b = self._segment(z, a_chunk, b, state_sum)
+                else:
+                    z, s, p = self._segment(z, a_chunk, state_sum=state_sum)
             spikes.append(s)
             if return_potentials:
                 pots.append(p)

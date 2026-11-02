@@ -123,6 +123,50 @@ def _block_from_dict(cls, data: dict, strict: bool, label: str):
 
 
 @dataclass
+class AdaptationConfig:
+    """Spike-frequency adaptation channel of the vector neuron.
+
+    Each neuron owns one scalar adaptive gain ``w_ad_i`` that reads a decaying
+    spike-count trace ``b_i(t)`` and subtracts a recovery current from the
+    spike-generation potential::
+
+        pot_i(t) = <z_i(t), w_out_i> + theta_i - w_ad_i * b_i(t)
+        s_i(t)   = H(pot_i(t))
+        b_i(t+1) = rho * b_i(t) + s_i(t)
+
+    ``b`` is a **state**, not a parameter: it is zero at the start of every
+    sequence and is carried across the model's (gradient-checkpointed) time
+    segments exactly like the vector state ``z``.  ``w_ad`` is initialised to
+    ``gain_init`` (default 0.1, i.e. a tenth of a spike-trace unit of threshold
+    shift, so the mechanism can actually move the threshold); with
+    ``gain_init = 0`` the adaptive current ``w_ad * b`` vanishes identically and
+    the *enabled* forward pass is bit-identical to the baseline, which is why 0
+    left the first implementation inert.
+
+    All defaults are off: with ``enabled = False`` neither the gain nor the
+    buffer is registered and the forward pass is unchanged (bit-identical
+    baseline).  ``rho`` must be in ``[0, 1)`` (``rho = 1`` would integrate
+    without bound), ``learnable_gain = False`` registers ``w_ad`` as a fixed
+    (non-trainable) buffer instead of a parameter.
+    """
+
+    enabled: bool = False
+    rho: float = 0.95            # per-step decay: b <- rho * b + s
+    gain_init: float = 0.1       # initial w_ad (0 => adaptation silent at t = 0)
+    learnable_gain: bool = True  # False => w_ad is a buffer, no gradient
+
+    def validate(self) -> None:
+        if not 0.0 <= float(self.rho) < 1.0:
+            raise ValueError("adaptation.rho must be in [0, 1)")
+        if not math.isfinite(float(self.gain_init)):
+            raise ValueError("adaptation.gain_init must be finite")
+
+    @classmethod
+    def from_dict(cls, data: dict, strict: bool = False) -> "AdaptationConfig":
+        return _block_from_dict(cls, data, strict, "adaptation")
+
+
+@dataclass
 class TimeJitterConfig:
     """Per-event timestamp jitter: ``t_i' = t_i + eps_i``, ``eps_i ~ N(0, std_ms^2)``."""
 
@@ -442,6 +486,13 @@ class V3Config:
         default_factory=EventAugmentationConfig
     )
 
+    # ---- spike-frequency adaptation (disabled by default) -----------------
+    # A per-neuron slow negative feedback on the spike-generation potential:
+    # pot = <z, w_out> + theta - w_ad * b with b <- rho*b + s carried like the
+    # state.  Off by default and nothing is registered when off, so the
+    # baseline forward pass and parameter set are unchanged.
+    adaptation: AdaptationConfig = field(default_factory=AdaptationConfig)
+
     # ---- io --------------------------------------------------------------
     out_dir: str = "results"        # resolved relative to V3/ when not absolute
     ckpt_dir: str = "checkpoints"
@@ -526,6 +577,7 @@ class V3Config:
             raise ValueError("max_train_batches must be null (all batches) or >= 1")
         self.state_regularization.validate()
         self.augmentation.validate()
+        self.adaptation.validate()
 
     # ------------------------------------------------------------------ #
     def to_dict(self) -> dict:
@@ -585,6 +637,8 @@ class V3Config:
                 v = StateRegularizationConfig.from_dict(v, strict=strict)
             elif k == "augmentation" and isinstance(v, dict):
                 v = EventAugmentationConfig.from_dict(v, strict=strict)
+            elif k == "adaptation" and isinstance(v, dict):
+                v = AdaptationConfig.from_dict(v, strict=strict)
             elif k == "timing" and isinstance(v, dict):
                 v = TimingConfig.from_dict(v, strict=strict)
             kwargs[k] = v
@@ -607,6 +661,7 @@ NESTED_BLOCKS: dict[str, type] = {
     "timing": TimingConfig,
     "state_regularization": StateRegularizationConfig,
     "augmentation": EventAugmentationConfig,
+    "adaptation": AdaptationConfig,
 }
 
 
@@ -754,6 +809,8 @@ def parameter_groups(cfg: V3Config) -> dict:
         "theta": N,
         "w_cls": N * cfg.n_classes,
     }
+    if cfg.adaptation.enabled and cfg.adaptation.learnable_gain:
+        groups["w_ad"] = N
     groups["total"] = sum(groups.values())
     return groups
 
@@ -762,6 +819,7 @@ __all__ = [
     "V3Config",
     "TimingConfig",
     "StateRegularizationConfig",
+    "AdaptationConfig",
     "TimeJitterConfig",
     "EventDropoutConfig",
     "EventInsertionConfig",
