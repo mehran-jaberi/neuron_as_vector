@@ -614,6 +614,127 @@ class TimingConfig:
 
 
 @dataclass
+class InputDelayLineConfig:
+    """K time-shifted copies of the *already-binned* input (M10).
+
+    The binned input ``x`` of shape ``(B, T, C)`` is presented to the shared
+    input projection through a delay line: copy ``k`` (``k = 0 .. K-1``) is
+    ``x`` shifted right along the time axis by ``k * stride`` bins, with zeros
+    entering at the leading boundary.  Nothing is re-binned: this sits between
+    the dense (B, T, C) input and ``w_in``, inside :class:`v3.model.VectorNeuronPopulation`,
+    and is applied **once per batch before** the checkpointed temporal loop.
+
+    Modes
+    -----
+    ``concat``
+        the K shifted copies are stacked along the channel axis, so the tensor
+        entering ``w_in`` is ``(B, T, K*C)`` and ``w_in`` becomes
+        ``(K*C, D)``: **+(K-1)*C*D parameters** (+2.1 M at K=4, C=700,
+        D=1000).  Every delay tap gets its own input weights.
+    ``sum``
+        the K shifted copies are summed back into the original C channels; the
+        tensor stays ``(B, T, C)`` and ``w_in`` is unchanged -- no extra
+        parameters, no learning per tap.  A smoothing / fan-in transform: each
+        channel sees a short window of its own recent past.
+
+    ``enabled=False`` (the default) is a no-op *and* adds no parameters: the
+    model builds the same ``(C, D)`` ``w_in`` and the forward is bit-identical
+    to the baseline.  ``copies=1`` is likewise a no-op in both modes (the code
+    short-circuits to the original path).
+
+    Cost at K=4, C=700, D=1000 (fp16 state), B=32, T=500
+    ---------------------------------------------------
+    * ``concat``: ``w_in`` grows 0.7 M -> 2.8 M parameters (+2.1 M; the whole
+      model grows 2,025,440 -> 4,125,440, i.e. +2.1 M / +104 % at
+      N=64, D=1000, R=64) and the forward holds one extra
+      ``(B, T, K*C)`` input buffer -- 4*700*500*32 values = 89.6 MB in fp16
+      (179 MB if kept in fp32).  It is filled one copy at a time, so no list of
+      K full-size shifted tensors is ever built.
+    * ``sum``: 0 parameters, one ``(B, T, C)`` fp32 buffer (44.8 MB).
+    * ``copies`` is therefore capped at 4 in ``concat`` mode (validation):
+      beyond that the buffer and the ``(K*C, D)`` weight/gradient no longer fit
+      comfortably next to the ~2.3 GiB peak of the baseline at D=1000.
+
+    ``stride_ms`` must convert to a whole number of ``timing.time_bin_ms``
+    bins and must not exceed the sequence duration.  The timing-dependent
+    checks only run when the block is enabled, so an inert block can never
+    invalidate an otherwise unchanged run.
+    """
+
+    enabled: bool = False
+    copies: int = 4          # K
+    stride_ms: float = 10.0  # delay between successive copies (Nowotny: 30 ms)
+    mode: str = "concat"     # "concat" (K*C channels) | "sum" (C channels)
+
+    MODES = ("concat", "sum")
+    MAX_CONCAT_COPIES = 4
+
+    @property
+    def effective_copies(self) -> int:
+        """K actually presented (1 when the block is switched off)."""
+        return int(self.copies) if self.enabled else 1
+
+    @property
+    def widens_input(self) -> bool:
+        """True iff the delay line must widen ``w_in`` to ``(K*C, D)``."""
+        return self.enabled and self.mode == "concat" and int(self.copies) > 1
+
+    def input_channels(self, n_inputs: int) -> int:
+        """Width of the tensor handed to ``w_in``: ``K*C`` for an active concat, else ``C``."""
+        return int(n_inputs) * self.effective_copies if self.widens_input else int(n_inputs)
+
+    def stride_bins(self, bin_ms: float) -> int:
+        """Delay step in bins; rejects a stride that is not a whole number of bins."""
+        step = float(self.stride_ms) / float(bin_ms)
+        bins = int(round(step))
+        if abs(step - bins) > 1e-9:
+            raise ValueError(
+                f"input_delay_line.stride_ms={self.stride_ms:g} is not an integer "
+                f"multiple of timing.time_bin_ms={float(bin_ms):g}"
+            )
+        return bins
+
+    def validate(
+        self,
+        bin_ms: float | None = None,
+        sequence_duration_ms: float | None = None,
+    ) -> None:
+        if self.mode not in self.MODES:
+            raise ValueError(
+                f"input_delay_line.mode must be one of {self.MODES}, got {self.mode!r}"
+            )
+        if int(self.copies) < 1:
+            raise ValueError("input_delay_line.copies must be >= 1")
+        if float(self.stride_ms) < 0.0:
+            raise ValueError("input_delay_line.stride_ms must be >= 0")
+        if not self.enabled:
+            return  # inert block: timing-dependent checks would be noise
+        if self.mode == "concat" and int(self.copies) > self.MAX_CONCAT_COPIES:
+            raise ValueError(
+                "input_delay_line.copies is capped at "
+                f"{self.MAX_CONCAT_COPIES} for mode='concat' (each copy adds "
+                "C*D parameters and a full (B, T, C) input slice); use mode='sum' "
+                "for more copies"
+            )
+        if int(self.copies) > 1 and float(self.stride_ms) <= 0.0:
+            raise ValueError("input_delay_line.stride_ms must be > 0 when copies > 1")
+        if sequence_duration_ms is not None and float(self.stride_ms) > float(sequence_duration_ms):
+            raise ValueError(
+                f"input_delay_line.stride_ms={self.stride_ms:g} exceeds the sequence "
+                f"duration {float(sequence_duration_ms):g} ms"
+            )
+        if bin_ms is not None:
+            self.stride_bins(bin_ms)  # raises unless the stride is a whole number of bins
+
+    @classmethod
+    def from_dict(cls, data: dict, strict: bool = False) -> "InputDelayLineConfig":
+        return _block_from_dict(cls, data, strict, "input_delay_line")
+
+    def summary(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
 class V3Config:
     """All V3 experiment parameters."""
 
@@ -716,6 +837,14 @@ class V3Config:
     # state.  Off by default and nothing is registered when off, so the
     # baseline forward pass and parameter set are unchanged.
     adaptation: AdaptationConfig = field(default_factory=AdaptationConfig)
+    # ---- input delay line on the binned input (disabled by default) --------
+    # K time-shifted copies of the *already-binned* (B, T, C) input, applied
+    # once per batch before the checkpointed temporal loop.  Off by default:
+    # no extra parameters and a bit-identical forward (see
+    # InputDelayLineConfig for the K=4, D=1000 parameter/memory cost).
+    input_delay_line: InputDelayLineConfig = field(
+        default_factory=InputDelayLineConfig
+    )
 
     # ---- io --------------------------------------------------------------
     out_dir: str = "results"        # resolved relative to V3/ when not absolute
@@ -775,6 +904,11 @@ class V3Config:
         return self.timing.duration_s
 
     @property
+    def effective_input_channels(self) -> int:
+        """Width of the tensor entering ``w_in``: ``C``, or ``K*C`` for an active concat."""
+        return self.input_delay_line.input_channels(self.n_inputs)
+
+    @property
     def torch_dtype(self):
         import torch
 
@@ -809,6 +943,9 @@ class V3Config:
         self.augmentation.validate()
         self.adaptation.validate()
         self.input_delays.validate()
+        self.input_delay_line.validate(
+            bin_ms=self.bin_ms, sequence_duration_ms=self.sequence_duration_ms
+        )
 
     # ------------------------------------------------------------------ #
     def to_dict(self) -> dict:
@@ -876,6 +1013,8 @@ class V3Config:
                 v = AdaptationConfig.from_dict(v, strict=strict)
             elif k == "input_delays" and isinstance(v, dict):
                 v = InputDelayConfig.from_dict(v, strict=strict)
+            elif k == "input_delay_line" and isinstance(v, dict):
+                v = InputDelayLineConfig.from_dict(v, strict=strict)
             elif k == "timing" and isinstance(v, dict):
                 v = TimingConfig.from_dict(v, strict=strict)
             kwargs[k] = v
@@ -912,6 +1051,7 @@ NESTED_BLOCKS: dict[str, type] = {
     "augmentation": EventAugmentationConfig,
     "adaptation": AdaptationConfig,
     "input_delays": InputDelayConfig,
+    "input_delay_line": InputDelayLineConfig,
 }
 
 
@@ -1036,11 +1176,15 @@ def apply_override_items(cfg: V3Config, items: list[str]) -> "V3Config":
 def describe(cfg: V3Config) -> str:
     """Short human-readable summary used in logs and notebook output."""
     reg = cfg.state_regularization
+    dl = cfg.input_delay_line
+    delay = (
+        f", delay_line={dl.mode}x{dl.copies}@{dl.stride_ms:g}ms" if dl.enabled else ""
+    )
     return (
         f"V3Config(tag={cfg.tag!r}, N={cfg.n_neurons}, D={cfg.state_dim}, "
         f"T={cfg.num_time_steps}x{cfg.time_bin_ms:g}ms={cfg.sequence_duration_ms:g}ms, "
         f"batch={cfg.batch_size}, epochs={cfg.epochs}, lr={cfg.learning_rate:g}, "
-        f"device={cfg.device}, dtype={cfg.dtype}, state_reg={reg.mode})"
+        f"device={cfg.device}, dtype={cfg.dtype}, state_reg={reg.mode}{delay})"
     )
 
 
@@ -1048,7 +1192,8 @@ def parameter_groups(cfg: V3Config) -> dict:
     """Analytic parameter budget of the primary model (used for reporting)."""
     N, D, C, R = cfg.n_neurons, cfg.state_dim, cfg.n_inputs, min(cfg.mix_rank, cfg.state_dim)
     groups = {
-        "w_in": C * D,
+        # C, or K*C when the delay line stacks shifted copies along the channel axis
+        "w_in": cfg.effective_input_channels * D,
         "w_down": D * R,
         "w_up": R * D,
         "w_emit": D * D,
@@ -1088,6 +1233,7 @@ __all__ = [
     "GlobalTimeShiftConfig",
     "ChannelDropoutConfig",
     "EventAugmentationConfig",
+    "InputDelayLineConfig",
     "NESTED_BLOCKS",
     "apply_override_items",
     "apply_override_mapping",
