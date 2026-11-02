@@ -230,6 +230,57 @@ class StateDynamicsConfig:
 
 
 @dataclass
+class InputDelayConfig:
+    """Learnable per-input-channel conduction delays.
+
+    One delay per input channel (``n_inputs`` channels; 700 for SHD) in
+    milliseconds, applied to the binned input sequence *before* the shared input
+    projection.  The delay is **fractional**: channel ``c``'s sequence is
+    linearly interpolated between the two neighbouring bins, so the delay is
+    differentiable with respect to a genuine time shift.
+
+    The stored model parameter is the unconstrained pre-sigmoid value ``raw`` and
+    the effective delay is ``max_ms * sigmoid(raw)``: it is strictly inside
+    ``(0, max_ms)`` by construction, never sitting on a clamp boundary where the
+    gradient would be zero.  Delays start uniformly inside
+    ``[init_ms, max_ms / 2]`` (defaults ``[0.5, 10]`` ms, drawn from a dedicated
+    seeded generator), so they are strictly interior from the first step.
+
+    Defaults are off, so the input path is untouched and the baseline stays
+    bit-identical (no extra parameter, same ``state_dict`` keys).
+
+    ``learnable=False`` keeps the delays in the model (so a fixed delay map can
+    be supplied with :meth:`v3.model.VectorNeuronPopulation.set_input_delays_ms`)
+    but freezes them.
+    """
+
+    enabled: bool = False
+    max_ms: float = 20.0
+    learnable: bool = True
+    init_ms: float = 0.5        # lower bound of the interior uniform init [ms]
+
+    def validate(self) -> None:
+        if float(self.max_ms) < 0.0:
+            raise ValueError("input_delays.max_ms must be >= 0")
+        if float(self.init_ms) < 0.0:
+            raise ValueError("input_delays.init_ms must be >= 0")
+        if self.enabled and float(self.max_ms) <= 0.0:
+            # the forward map is delay = max_ms * sigmoid(raw)
+            raise ValueError("input_delays.max_ms must be > 0 when enabled")
+        if self.enabled and self.learnable:
+            # a learnable delay initialised on a bound receives no gradient
+            if not 0.0 < float(self.init_ms) < float(self.max_ms):
+                raise ValueError(
+                    "input_delays.init_ms must be strictly inside (0, max_ms) "
+                    "for learnable delays"
+                )
+
+    @classmethod
+    def from_dict(cls, data: dict, strict: bool = False) -> "InputDelayConfig":
+        return _block_from_dict(cls, data, strict, "input_delays")
+
+
+@dataclass
 class TimeJitterConfig:
     """Per-event timestamp jitter: ``t_i' = t_i + eps_i``, ``eps_i ~ N(0, std_ms^2)``."""
 
@@ -513,6 +564,14 @@ class V3Config:
     rate_target_hz: float = 10.0
     emit_identity_init: bool = True  # init W_emit ~ I (+ small noise)
 
+    # ---- learnable per-input-channel conduction delays (off by default) --
+    # One delay per input channel [ms], applied to the binned input sequence
+    # *before* the shared input projection (see V3/v3/model.py).  Disabled ->
+    # the input path is untouched (bit-identical baseline).  Enabled -> the
+    # delays start strictly interior (see InputDelayConfig) so the parameter
+    # receives gradient from the first step.
+    input_delays: InputDelayConfig = field(default_factory=InputDelayConfig)
+
     # ---- training --------------------------------------------------------
     batch_size: int = 32
     epochs: int = 5             # primary control of how much training is done
@@ -654,6 +713,7 @@ class V3Config:
         self.state_dynamics.validate()
         self.augmentation.validate()
         self.adaptation.validate()
+        self.input_delays.validate()
 
     # ------------------------------------------------------------------ #
     def to_dict(self) -> dict:
@@ -717,6 +777,8 @@ class V3Config:
                 v = EventAugmentationConfig.from_dict(v, strict=strict)
             elif k == "adaptation" and isinstance(v, dict):
                 v = AdaptationConfig.from_dict(v, strict=strict)
+            elif k == "input_delays" and isinstance(v, dict):
+                v = InputDelayConfig.from_dict(v, strict=strict)
             elif k == "timing" and isinstance(v, dict):
                 v = TimingConfig.from_dict(v, strict=strict)
             kwargs[k] = v
@@ -729,7 +791,17 @@ class V3Config:
         return cls.from_dict(data, strict=strict)
 
     def with_overrides(self, **overrides) -> "V3Config":
-        return dataclasses.replace(self, **overrides)
+        """Copy the configuration with ``overrides`` applied.
+
+        Plain field names (``epochs=3``, ``input_delays=InputDelayConfig(...)``)
+        replace the field directly.  Dotted keys (``input_delays.enabled``) go
+        through the same grammar as the CLI overrides, so a single leaf can be
+        changed without rebuilding its block.
+        """
+        plain = {k: v for k, v in overrides.items() if "." not in k}
+        nested = {k: v for k, v in overrides.items() if "." in k}
+        out = dataclasses.replace(self, **plain)
+        return apply_override_mapping(out, nested) if nested else out
 
 
 # ---------------------------------------------------------------------- #
@@ -741,6 +813,7 @@ NESTED_BLOCKS: dict[str, type] = {
     "state_dynamics": StateDynamicsConfig,
     "augmentation": EventAugmentationConfig,
     "adaptation": AdaptationConfig,
+    "input_delays": InputDelayConfig,
 }
 
 
@@ -890,6 +963,8 @@ def parameter_groups(cfg: V3Config) -> dict:
     }
     if cfg.adaptation.enabled and cfg.adaptation.learnable_gain:
         groups["w_ad"] = N
+    if cfg.input_delays.enabled:
+        groups["input_delays"] = C
     groups["total"] = sum(groups.values())
     return groups
 
@@ -900,6 +975,7 @@ __all__ = [
     "StateRegularizationConfig",
     "AdaptationConfig",
     "StateDynamicsConfig",
+    "InputDelayConfig",
     "TimeJitterConfig",
     "EventDropoutConfig",
     "EventInsertionConfig",

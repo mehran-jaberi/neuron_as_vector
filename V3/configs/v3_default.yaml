@@ -45,6 +45,17 @@ rate_reg: 1.0e-4       # firing-rate regulariser weight (0 disables)
 rate_target_hz: 10.0   # target rate used for threshold init and the regulariser
 emit_identity_init: true
 
+# ---- learnable per-input-channel conduction delays (off by default) ----
+# One delay per input channel [ms], applied to the binned input sequence BEFORE
+# the shared input projection.  Channel c is shifted forward in time by
+# round(delay_c / 2 ms) bins with zero fill at the start of the window.  With
+# `enabled: false` the input path is untouched (bit-identical baseline); a zero
+# delay (the initial value) is also exactly the baseline.
+input_delays:
+  enabled: false
+  max_ms: 20.0                    # effective delays are clamped to [0, max_ms]
+  learnable: true                 # false = frozen/fixed delay map
+
 # ---- training ----
 batch_size: 128
 epochs: 5            # primary control of how much training is performed
