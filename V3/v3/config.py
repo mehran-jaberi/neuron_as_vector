@@ -137,9 +137,11 @@ class AdaptationConfig:
     ``b`` is a **state**, not a parameter: it is zero at the start of every
     sequence and is carried across the model's (gradient-checkpointed) time
     segments exactly like the vector state ``z``.  ``w_ad`` is initialised to
-    ``gain_init``; with ``gain_init = 0`` the adaptive current ``w_ad * b``
-    vanishes identically, so the *enabled* forward pass is bit-identical to the
-    baseline and the parameter starts with zero adaptive drive.
+    ``gain_init`` (default 0.1, i.e. a tenth of a spike-trace unit of threshold
+    shift, so the mechanism can actually move the threshold); with
+    ``gain_init = 0`` the adaptive current ``w_ad * b`` vanishes identically and
+    the *enabled* forward pass is bit-identical to the baseline, which is why 0
+    left the first implementation inert.
 
     All defaults are off: with ``enabled = False`` neither the gain nor the
     buffer is registered and the forward pass is unchanged (bit-identical
@@ -150,7 +152,7 @@ class AdaptationConfig:
 
     enabled: bool = False
     rho: float = 0.95            # per-step decay: b <- rho * b + s
-    gain_init: float = 0.0       # initial w_ad (0 => baseline at t = 0)
+    gain_init: float = 0.1       # initial w_ad (0 => adaptation silent at t = 0)
     learnable_gain: bool = True  # False => w_ad is a buffer, no gradient
 
     def validate(self) -> None:

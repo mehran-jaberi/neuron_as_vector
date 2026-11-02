@@ -82,7 +82,7 @@ def test_adaptation_defaults_are_off():
     ad = AdaptationConfig()
     assert ad.enabled is False
     assert ad.rho == pytest.approx(0.95)
-    assert ad.gain_init == pytest.approx(0.0)
+    assert ad.gain_init == pytest.approx(0.1)
     assert ad.learnable_gain is True
     # the model config carries the block with exactly those defaults
     assert V3Config().adaptation == ad
@@ -131,7 +131,7 @@ def test_nested_override_mapping_merges_into_the_adaptation_block():
     )
     assert out.adaptation.enabled is True
     assert out.adaptation.rho == pytest.approx(0.5)
-    assert out.adaptation.gain_init == pytest.approx(0.0)  # unmentioned -> default
+    assert out.adaptation.gain_init == pytest.approx(0.1)  # unmentioned -> default
     assert out.adaptation.learnable_gain is True
     with pytest.raises(ValueError):
         apply_override_items(V3Config(), ["adaptation.nope=1"])
