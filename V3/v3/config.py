@@ -348,6 +348,65 @@ class AdlifConfig:
 
 
 @dataclass
+class TwoStageConfig:
+    """A second, independent rank-R mixing stage inside one timestep (M12).
+
+    Off by default.  With ``enabled = False`` no parameter is created and the
+    timestep update is exactly the single-mixer baseline, so the default model is
+    bit-identical.  With ``enabled = True`` each step becomes::
+
+        mix2  = (z @ w_down2) @ w_up2       rank R2, independent of w_down / w_up
+        inner = tanh(mix2 + drive)
+        z    <- z + alpha * (tanh(mix + lam * inner) - z)
+
+    The gain is **not** a free scalar.  The optimised quantity is a raw scalar
+    ``lam_raw`` and the gain is::
+
+        lam = lam_min + (lam_max - lam_min) * sigmoid(lam_raw)
+
+    with ``0 < lam_min < lam_init < lam_max``.  ``lam_raw`` is warm-started at
+    ``logit((lam_init - lam_min) / (lam_max - lam_min))``, so the stage starts at
+    ``lam = lam_init`` (1.0 by default).  Since ``lam_min > 0`` and the sigmoid
+    lies in ``(0, 1)``, ``lam`` is always finite and inside
+    ``(lam_min, lam_max)``: training can scale the inner drive, but it can never
+    multiply it away (the previous free ``lam`` could reach 0 or turn negative
+    and silently switch the stage -- and the spikes -- off).
+
+    ``w_down2`` is initialised **exactly like** ``w_down``
+    (``randn(D, R2) / sqrt(D)``, same generator), and ``w_up2`` like ``w_up``
+    (``randn(R2, D) * 0.5 / sqrt(R2)``), so the inner stage starts with the same
+    mixing gain as the outer one: a zero or scaled-down init would leave it --
+    and ``lam`` -- inert from step 0.
+    """
+
+    enabled: bool = False
+    rank: int = 64
+    lam_min: float = 0.1
+    lam_max: float = 2.0
+    lam_init: float = 1.0
+
+    @property
+    def active(self) -> bool:
+        """The second mixing stage is in force."""
+        return bool(self.enabled)
+
+    def validate(self) -> None:
+        if int(self.rank) < 1:
+            raise ValueError("two_stage.rank must be >= 1")
+        for name in ("lam_min", "lam_init", "lam_max"):
+            if not math.isfinite(float(getattr(self, name))):
+                raise ValueError(f"two_stage.{name} must be finite")
+        if float(self.lam_min) <= 0.0:
+            raise ValueError("two_stage.lam_min must be > 0")
+        if not float(self.lam_min) < float(self.lam_init) < float(self.lam_max):
+            raise ValueError("two_stage must satisfy lam_min < lam_init < lam_max")
+
+    @classmethod
+    def from_dict(cls, data: dict, strict: bool = False) -> "TwoStageConfig":
+        return _block_from_dict(cls, data, strict, "two_stage")
+
+
+@dataclass
 class TimeJitterConfig:
     """Per-event timestamp jitter: ``t_i' = t_i + eps_i``, ``eps_i ~ N(0, std_ms^2)``."""
 
@@ -884,6 +943,11 @@ class V3Config:
     # of the state update (inside the tanh).  Off by default: no parameter is
     # created and the baseline update rule stays bit-identical.
     adlif: AdlifConfig = field(default_factory=AdlifConfig)
+    # ---- second nonlinear mixing stage (disabled by default) --------------
+    # Extra depth *inside* one timestep: an independent rank-R2 mixer feeding a
+    # second tanh before the state update.  Off by default, and the parameters
+    # are created only when enabled, so the baseline model is unchanged.
+    two_stage: TwoStageConfig = field(default_factory=TwoStageConfig)
 
     # ---- raw-event augmentation (disabled by default) ---------------------
     # Applied to the raw (time, channel) events *before* the 2-ms binning; the
@@ -1013,6 +1077,7 @@ class V3Config:
         self.state_regularization.validate()
         self.state_dynamics.validate()
         self.adlif.validate()
+        self.two_stage.validate()
         self.augmentation.validate()
         self.adaptation.validate()
         self.input_delays.validate()
@@ -1081,6 +1146,8 @@ class V3Config:
                 v = StateDynamicsConfig.from_dict(v, strict=strict)
             elif k == "adlif" and isinstance(v, dict):
                 v = AdlifConfig.from_dict(v, strict=strict)
+            elif k == "two_stage" and isinstance(v, dict):
+                v = TwoStageConfig.from_dict(v, strict=strict)
             elif k == "augmentation" and isinstance(v, dict):
                 v = EventAugmentationConfig.from_dict(v, strict=strict)
             elif k == "adaptation" and isinstance(v, dict):
@@ -1124,6 +1191,7 @@ NESTED_BLOCKS: dict[str, type] = {
     "state_regularization": StateRegularizationConfig,
     "state_dynamics": StateDynamicsConfig,
     "adlif": AdlifConfig,
+    "two_stage": TwoStageConfig,
     "augmentation": EventAugmentationConfig,
     "adaptation": AdaptationConfig,
     "input_delays": InputDelayConfig,
@@ -1296,6 +1364,14 @@ def parameter_groups(cfg: V3Config) -> dict:
     if cfg.attention.enabled:
         # one learned logit per time bin; absent (and budget-neutral) when off
         groups["attn_logits"] = cfg.n_bins
+    if cfg.two_stage.active:
+        # the second mixer is an independent rank-R2 pair plus the raw scalar
+        # lam_raw (the effective lam is a sigmoid of it, so still one parameter);
+        # absent by default, so the baseline budget is unchanged.
+        R2 = min(int(cfg.two_stage.rank), D)
+        groups["w_down2"] = D * R2
+        groups["w_up2"] = R2 * D
+        groups["lam_raw"] = 1
     groups["total"] = sum(groups.values())
     return groups
 
@@ -1309,6 +1385,7 @@ __all__ = [
     "InputDelayConfig",
     "AdlifConfig",
     "AttentionConfig",
+    "TwoStageConfig",
     "TimeJitterConfig",
     "EventBlendConfig",
     "EventDropoutConfig",

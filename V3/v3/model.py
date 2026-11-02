@@ -43,6 +43,26 @@ replace the scalar ``alpha`` with a per-neuron ``alpha_i = sigmoid(raw_i)``
 (``trainable_alpha``) and/or replace ``z(0) = 0`` with a learned ``(N, D)``
 initial state (``learnable_z0``).  With both flags off, the update above is
 executed unchanged, so the baseline stays bit-identical.
+Optional second nonlinear mixing stage (``V3Config.two_stage``, off by default)
+------------------------------------------------------------------------------
+With ``two_stage.enabled`` each step gains an independent rank-``R2`` mixer and
+a second ``tanh`` *before* the state update::
+
+       m2_i(t) = ( z_i(t) W_down2 ) W_up2^T           in R^D    (inner mixer)
+       inner   = tanh( m2_i(t) + d_i(t) )
+       z_i(t+1) = (1 - alpha) z_i(t) + alpha * tanh( m_i(t) + lam * inner )
+
+``lam`` is not a free scalar.  The optimised quantity is a raw scalar
+``lam_raw`` and the gain is
+``lam = lam_min + (lam_max - lam_min) * sigmoid(lam_raw)``, warm-started at
+``lam = lam_init`` (1.0 by default).  With ``0 < lam_min < lam_init < lam_max``
+the gain always lies inside ``(lam_min, lam_max)``: finite and strictly positive
+for every finite ``lam_raw``, so training can scale the inner stage but can
+never switch its drive off.  This adds depth *inside* one
+timestep without cutting the state's connection to its own history: ``z_i(t)``
+is still the only recurrent variable, and the outer mixing ``m_i(t)`` and the
+drive ``d_i(t)`` are unchanged.  With ``enabled = False`` no parameter is
+created and the baseline update above runs unchanged (bit-identical).
 
 Readout (spike counts, 20 SHD classes)::
 
@@ -248,6 +268,19 @@ def surrogate_spike(
     return SurrogateSpike.apply(u, beta, gamma, kind, alpha)
 
 
+def _lam_raw_init(lam_init: float, lam_min: float, lam_max: float) -> float:
+    """Raw logit whose sigmoid maps back to the warm-start ``lam_init``.
+
+    ``lam_init`` must lie strictly inside ``(lam_min, lam_max)``, which
+    ``TwoStageConfig.validate`` enforces; the ratio is still clamped away from
+    the open interval's endpoints so an extreme (but finite) setting cannot
+    produce an infinite raw parameter.
+    """
+    p = (float(lam_init) - float(lam_min)) / (float(lam_max) - float(lam_min))
+    p = min(max(p, 1e-6), 1.0 - 1e-6)
+    return math.log(p / (1.0 - p))
+
+
 # ---------------------------------------------------------------------- #
 class VectorNeuronPopulation(nn.Module):
     """``N`` neurons, each with a trainable ``D``-dimensional dynamical state."""
@@ -371,6 +404,30 @@ class VectorNeuronPopulation(nn.Module):
             self.attn_logits = nn.Parameter(torch.zeros(int(cfg.n_bins), dtype=torch.float32))
         else:
             self.attn_logits = None
+
+        # ---- optional second nonlinear mixing stage (M12, off by default) ----
+        # Created only when enabled, so the default model keeps exactly the
+        # baseline parameter set (state_dict order, optimiser state and the
+        # registry parameter budget).  ``w_down2`` uses the *same* scheme and
+        # scale as ``w_down``, and ``w_up2`` the same as ``w_up``: a zero or
+        # shrunken init would leave the inner stage -- and ``lam`` -- inert at
+        # step 0, the failure mode this feature has to avoid.  The gain itself
+        # is a sigmoid of ``lam_raw`` (never a free scalar), so it cannot be
+        # trained to 0 or below.
+        ts = cfg.two_stage
+        self.w_down2: nn.Parameter | None = None   # (D, R2) inner down-projection
+        self.w_up2: nn.Parameter | None = None     # (R2, D) inner up-projection
+        self.lam_raw: nn.Parameter | None = None   # scalar logit of the inner-stage gain
+        if ts.active:
+            R2 = int(min(int(ts.rank), D))
+            self.w_down2 = nn.Parameter(rnd(D, R2, scale=1.0 / math.sqrt(D)))
+            self.w_up2 = nn.Parameter(rnd(R2, D, scale=0.5 / math.sqrt(R2)))
+            self.lam_raw = nn.Parameter(
+                torch.tensor(
+                    _lam_raw_init(ts.lam_init, ts.lam_min, ts.lam_max),
+                    dtype=torch.float32,
+                )
+            )
 
         # expose the analytic flag so the class itself never hard-codes D > 1
         self.is_scalar_baseline = D == 1
@@ -674,6 +731,37 @@ class VectorNeuronPopulation(nn.Module):
         )
 
     # ------------------------------------------------------------------ #
+    def effective_lam(self) -> torch.Tensor:
+        """Effective inner-stage gain in fp32: ``lam_min + span * sigmoid(raw)``.
+
+        Bounded by construction to ``(lam_min, lam_max)`` (up to fp32 saturation
+        exactly at the endpoints for ``|lam_raw|`` in the hundreds), hence
+        finite and strictly positive: no gradient can switch the stage off.
+        Only defined when ``two_stage.enabled`` is true.
+        """
+        if self.lam_raw is None:
+            raise RuntimeError("two_stage is disabled: effective_lam() is undefined")
+        ts = self.cfg.two_stage
+        lo, hi = float(ts.lam_min), float(ts.lam_max)
+        return lo + (hi - lo) * torch.sigmoid(self.lam_raw.float())
+
+    def two_stage_weights(self):
+        """Casted ``(w_down2, w_up2, lam)`` of the second stage, or ``None``.
+
+        ``lam`` is the *effective* gain
+        (:meth:`effective_lam`, cast to the state dtype); ``lam_raw`` itself is
+        never returned, so the update line sees a single bounded scalar.
+        ``None`` whenever ``two_stage.enabled`` is false, in which case the
+        timestep update runs the baseline single-mixer expression untouched.
+        Kept as a method (not part of :meth:`_weights`) so the baseline weight
+        tuple and its unpacking are unchanged.
+        """
+        if self.w_down2 is None or self.w_up2 is None or self.lam_raw is None:
+            return None
+        dt = self.state_dtype
+        return self.w_down2.to(dt), self.w_up2.to(dt), self.effective_lam().to(dt)
+
+    # ------------------------------------------------------------------ #
     def _segment_any(
         self,
         z: torch.Tensor,
@@ -717,6 +805,9 @@ class VectorNeuronPopulation(nn.Module):
         use_slow = u_slow is not None and u_slow.numel() > 0 and g_slow is not None
         surrogate_kind = str(self.cfg.surrogate)
         surrogate_alpha = float(self.cfg.surrogate_alpha)
+        two_stage = self.two_stage_weights()   # None on the baseline path
+        if two_stage is not None:
+            w_down2, w_up2, lam = two_stage
 
         spikes, pots = [], []
         for k in range(a_chunk.shape[1]):
@@ -741,10 +832,20 @@ class VectorNeuronPopulation(nn.Module):
                 pre = pre - (g_fast.view(1, -1, 1) * u_fast.unsqueeze(-1)).to(dt)
             if use_slow:
                 pre = pre - (g_slow.view(1, -1, 1) * u_slow.unsqueeze(-1)).to(dt)
-            if alpha_i is None:
-                z = z + alpha * (torch.tanh(pre) - z)
+            if two_stage is None:
+                new_z = torch.tanh(pre)
             else:
-                z = z + alpha_i * (torch.tanh(pre) - z)
+                # second, independent rank-R2 mixer + tanh, at the same state;
+                # `drive` is shared and `lam` (bounded sigmoid gain, init 1.0)
+                # gates the inner stage.  The adLIF currents act on `pre` only,
+                # so the inner stage sees the bare mix + drive, as on its branch.
+                mix2 = (z @ w_down2) @ w_up2
+                inner = torch.tanh(mix2 + drive)
+                new_z = torch.tanh(mix + lam * inner)
+            if alpha_i is None:
+                z = z + alpha * (new_z - z)
+            else:
+                z = z + alpha_i * (new_z - z)
             z = z.to(dt)
             if adlif:
                 if use_fast:
