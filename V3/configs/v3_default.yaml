@@ -38,8 +38,10 @@ state_dim: 1000        # D
 mix_rank: 64           # rank of the shared intra-neuron mixing operator
 tau_ms: 20.0           # state leak time constant
 input_gain: 5.0        # scale of the shared input projection init
+surrogate: fast_sigmoid  # fast_sigmoid (baseline) | slayer (M11a)
 surrogate_beta: 4.0
 surrogate_gamma: 1.0
+surrogate_alpha: 0.5   # SLAYER width: d/du = 1/(1 + alpha*|u|)^2 (M11a)
 readout: sum           # spike-count readout
 rate_reg: 1.0e-4       # firing-rate regulariser weight (0 disables)
 rate_target_hz: 10.0   # target rate used for threshold init and the regulariser
@@ -105,6 +107,16 @@ augmentation:
   apply_during_training: true
   apply_during_validation: false
   apply_during_test: false
+
+# ---- learned temporal attention readout (disabled by default; M11b) ----
+# When enabled, the readout learns a probability distribution over the T time
+# bins (one logit per bin, softmax of logits/temperature, zero-initialised so
+# it starts uniform) and feeds sum_t a_t * c_t to the unchanged classifier
+# W_cls.  Default off: the readout is the exact historical spike-count sum and
+# no parameters are added.
+attention:
+  enabled: false
+  temperature: 1.0              # a = softmax(attn_logits / temperature)
 
 # ---- io ----
 out_dir: results
