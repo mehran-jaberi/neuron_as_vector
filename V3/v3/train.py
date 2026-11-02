@@ -97,6 +97,31 @@ def _rate_stats(spikes: torch.Tensor, cfg: V3Config) -> dict:
 
 
 # ---------------------------------------------------------------------- #
+def clip_gradients_(
+    model: VectorNeuronPopulation,
+    optimizer,
+    scaler,
+    grad_clip: float,
+) -> float:
+    """Global-norm gradient clipping; ``grad_clip <= 0`` disables it.
+
+    The clip must run in the *unscaled* gradient space, so an enabled AMP scaler is
+    asked to unscale first.  ``scaler.step`` then refuses a double unscale and skips
+    the optimizer step itself if clipping produced non-finite gradients; that is the
+    documented ``torch.cuda.amp`` contract and why this stays a single helper instead
+    of clipping inline.  Returns the pre-clip total norm (``0.0`` when disabled).
+    """
+    if not grad_clip or float(grad_clip) <= 0:
+        return 0.0
+    if scaler is not None:
+        scaler.unscale_(optimizer)
+    total_norm = torch.nn.utils.clip_grad_norm_(
+        model.parameters(), float(grad_clip)
+    )
+    return float(total_norm)
+
+
+# ---------------------------------------------------------------------- #
 def train_one_epoch(
     model: VectorNeuronPopulation,
     store: SHDEventStore,
@@ -130,9 +155,7 @@ def train_one_epoch(
         logits, spikes = model(x)
         loss, ce = model.loss(logits, spikes, y)
         scaler.scale(loss).backward()
-        if cfg.grad_clip and cfg.grad_clip > 0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg.grad_clip))
+        clip_gradients_(model, optimizer, scaler, cfg.grad_clip)
         scaler.step(optimizer)
         scaler.update()
         if scheduler is not None:

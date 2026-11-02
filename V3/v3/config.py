@@ -27,6 +27,22 @@ import yaml
 V3_ROOT = Path(__file__).resolve().parent.parent
 REPO_ROOT = V3_ROOT.parent
 
+#: Spike surrogate gradients understood by :mod:`v3.model`.
+#:
+#: ``fast_sigmoid`` (default) is ``gamma / (1 + beta|u|)^2``, the derivative of
+#: ``gamma*u / (1 + beta|u|)``; it is the recorded baseline and must stay
+#: bit-identical.  ``slayer`` (M11a) is ``1 / (1 + alpha|u|)^2`` with its own
+#: ``surrogate_alpha`` width whose default is stability-driven (see
+#: ``V3Config.surrogate_alpha``): at ``alpha=2`` the far-field derivative is at
+#: most 4x the baseline's, whereas the old ``alpha=0.5`` reached 63x and
+#: overflowed the fp16 BPTT.
+SURROGATE_KINDS = ("fast_sigmoid", "slayer")
+
+#: Readout modes.  ``sum``/``mean`` are the historical count readouts;
+#: ``temporal_attention`` is selected through the ``attention`` block instead
+#: (M11b) and keeps the same classifier weights.
+READOUTS = ("sum", "mean")
+
 
 @dataclass
 class StateRegularizationConfig:
@@ -556,6 +572,48 @@ class EventAugmentationConfig:
 
 
 @dataclass
+class AttentionConfig:
+    """Learned temporal attention over the readout (M11b).
+
+    A spike-count readout collapses all ``T`` bins into ``(B, N)``; the linear
+    classifier therefore cannot weight *when* a spike happened.  When this block
+    is enabled the model keeps per-bin counts ``c_t`` (B, T, N) and combines them
+    with a learned probability distribution over bins::
+
+        a = softmax(attn_logits / temperature)        # (T,), sums to 1
+        counts_att = sum_t (T * a_t) * c_t            # (B, N), count scale
+        logits = counts_att @ W_cls
+
+    The ``T *`` factor restores the plain spike-count scale: without it the
+    uniform distribution would give ``1/T`` of the historical count readout
+    (T=500), suppress every classifier gradient by ~500x and leave the
+    zero-initialised readout stuck.  With it, uniform attention reproduces the
+    plain count sum and the classifier starts with the baseline gradient
+    (M11b), while the attention logits see the full, un-suppressed gradient as
+    soon as ``W_cls`` leaves zero.
+
+    The distribution is parameterised directly by one logit per bin (``T``
+    parameters, no hidden MLP) and the logits are zero-initialised, so the
+    initial forward reuses the plain spike-count readout.  ``temperature``
+    sharpens (``< 1``) or flattens (``> 1``) the distribution.
+
+    ``enabled=False`` (the default) leaves the readout exactly as before and
+    adds **no parameters** to the model.
+    """
+
+    enabled: bool = False
+    temperature: float = 1.0
+
+    def validate(self) -> None:
+        if float(self.temperature) <= 0.0:
+            raise ValueError("attention.temperature must be > 0")
+
+    @classmethod
+    def from_dict(cls, data: dict, strict: bool = False) -> "AttentionConfig":
+        return _block_from_dict(cls, data, strict, "attention")
+
+
+@dataclass
 class TimingConfig:
     """Temporal discretization of the SHD experiment.
 
@@ -766,8 +824,12 @@ class V3Config:
     mix_rank: int = 64           # rank of the shared intra-neuron mixing map
     tau_ms: float = 20.0         # state leak time constant [ms]
     input_gain: float = 5.0      # scale of the shared input projection init
+    surrogate: str = "fast_sigmoid"  # "fast_sigmoid" (baseline) | "slayer"
     surrogate_beta: float = 4.0  # fast-sigmoid surrogate slope
     surrogate_gamma: float = 1.0 # fast-sigmoid surrogate gain
+    surrogate_alpha: float = 2.0 # SLAYER width: 1/(1 + alpha|u|)^2; 2.0 keeps the
+    #                              far-field gradient <= 4x fast_sigmoid so the fp16
+    #                              BPTT keeps the baseline's loss-scale headroom
     readout: str = "sum"         # "sum" (spike count) | "mean"
     rate_reg: float = 1.0e-4     # weight of the firing-rate regulariser (0 disables)
     rate_target_hz: float = 10.0
@@ -845,6 +907,11 @@ class V3Config:
     input_delay_line: InputDelayLineConfig = field(
         default_factory=InputDelayLineConfig
     )
+    # ---- learned temporal attention readout (disabled by default) --------
+    # When enabled, the readout uses one learned weight per time bin instead of
+    # a plain count sum; see AttentionConfig.  The default (off) path is
+    # bit-identical and adds no parameters.
+    attention: AttentionConfig = field(default_factory=AttentionConfig)
 
     # ---- io --------------------------------------------------------------
     out_dir: str = "results"        # resolved relative to V3/ when not absolute
@@ -923,8 +990,14 @@ class V3Config:
         self.timing.validate()
         if not 0.0 <= self.val_fraction < 1.0:
             raise ValueError("val_fraction must be in [0, 1)")
-        if self.readout not in ("sum", "mean"):
-            raise ValueError("readout must be 'sum' or 'mean'")
+        if self.surrogate not in SURROGATE_KINDS:
+            raise ValueError(f"surrogate must be one of {SURROGATE_KINDS}, got {self.surrogate!r}")
+        if float(self.surrogate_alpha) <= 0.0:
+            raise ValueError("surrogate_alpha (SLAYER width) must be > 0")
+        if self.readout not in READOUTS:
+            raise ValueError(f"readout must be one of {READOUTS}, got {self.readout!r}")
+        if float(self.grad_clip) < 0.0:
+            raise ValueError("grad_clip must be >= 0 (0 disables global-norm clipping)")
         if self.optimizer not in ("adam", "adamw", "sgd"):
             raise ValueError("optimizer must be adam | adamw | sgd")
         if self.lr_schedule not in ("cosine", "none"):
@@ -946,6 +1019,7 @@ class V3Config:
         self.input_delay_line.validate(
             bin_ms=self.bin_ms, sequence_duration_ms=self.sequence_duration_ms
         )
+        self.attention.validate()
 
     # ------------------------------------------------------------------ #
     def to_dict(self) -> dict:
@@ -1015,6 +1089,8 @@ class V3Config:
                 v = InputDelayConfig.from_dict(v, strict=strict)
             elif k == "input_delay_line" and isinstance(v, dict):
                 v = InputDelayLineConfig.from_dict(v, strict=strict)
+            elif k == "attention" and isinstance(v, dict):
+                v = AttentionConfig.from_dict(v, strict=strict)
             elif k == "timing" and isinstance(v, dict):
                 v = TimingConfig.from_dict(v, strict=strict)
             kwargs[k] = v
@@ -1052,6 +1128,7 @@ NESTED_BLOCKS: dict[str, type] = {
     "adaptation": AdaptationConfig,
     "input_delays": InputDelayConfig,
     "input_delay_line": InputDelayLineConfig,
+    "attention": AttentionConfig,
 }
 
 
@@ -1180,11 +1257,13 @@ def describe(cfg: V3Config) -> str:
     delay = (
         f", delay_line={dl.mode}x{dl.copies}@{dl.stride_ms:g}ms" if dl.enabled else ""
     )
+    readout = "temporal_attention" if cfg.attention.enabled else cfg.readout
     return (
         f"V3Config(tag={cfg.tag!r}, N={cfg.n_neurons}, D={cfg.state_dim}, "
         f"T={cfg.num_time_steps}x{cfg.time_bin_ms:g}ms={cfg.sequence_duration_ms:g}ms, "
         f"batch={cfg.batch_size}, epochs={cfg.epochs}, lr={cfg.learning_rate:g}, "
-        f"device={cfg.device}, dtype={cfg.dtype}, state_reg={reg.mode}{delay})"
+        f"device={cfg.device}, dtype={cfg.dtype}, surrogate={cfg.surrogate}, "
+        f"readout={readout}, state_reg={reg.mode}{delay})"
     )
 
 
@@ -1214,6 +1293,9 @@ def parameter_groups(cfg: V3Config) -> dict:
             groups["adlif_gain_fast"] = N
         if cfg.adlif.use_slow:
             groups["adlif_gain_slow"] = N
+    if cfg.attention.enabled:
+        # one learned logit per time bin; absent (and budget-neutral) when off
+        groups["attn_logits"] = cfg.n_bins
     groups["total"] = sum(groups.values())
     return groups
 
@@ -1226,6 +1308,7 @@ __all__ = [
     "StateDynamicsConfig",
     "InputDelayConfig",
     "AdlifConfig",
+    "AttentionConfig",
     "TimeJitterConfig",
     "EventBlendConfig",
     "EventDropoutConfig",
@@ -1234,6 +1317,8 @@ __all__ = [
     "ChannelDropoutConfig",
     "EventAugmentationConfig",
     "InputDelayLineConfig",
+    "SURROGATE_KINDS",
+    "READOUTS",
     "NESTED_BLOCKS",
     "apply_override_items",
     "apply_override_mapping",

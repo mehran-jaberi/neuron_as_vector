@@ -114,6 +114,7 @@ the ``D`` coordinates; only the parameters are shared.
 
 from __future__ import annotations
 
+import contextlib
 import math
 
 import torch
@@ -122,40 +123,129 @@ from torch.utils.checkpoint import checkpoint
 
 from .config import V3Config
 from .input_delay_line import apply_input_delay_line
+from .config import SURROGATE_KINDS, V3Config
 from .state_regularization import regularize_state
 
 
 # ---------------------------------------------------------------------- #
+def _autocast_disabled(device_type: str):
+    """Context manager that forces full-precision surrogate-gradient math.
+
+    Autocast cannot be switched off on arbitrary devices with this API, so the
+    device types we run on get an explicit ``enabled=False`` region and anything
+    else (e.g. ``mps``) gets a no-op.  The surrogate gradient is a *backward*
+    computation: under ``torch.autocast`` its elementwise ops could otherwise be
+    silently downcast, which is exactly the fp16-saturation failure mode that
+    made the arctan surrogate diverge (see ``INVESTIGATION.md``).
+    """
+    if device_type in ("cpu", "cuda"):
+        return torch.autocast(device_type=device_type, enabled=False)
+    return contextlib.nullcontext()
+
+
+def surrogate_derivative(
+    u: torch.Tensor,
+    beta: float = 4.0,
+    gamma: float = 1.0,
+    *,
+    kind: str = "fast_sigmoid",
+    alpha: float = 2.0,
+) -> torch.Tensor:
+    """Derivative of the spike surrogate with respect to the potential ``u``.
+
+    ``u`` is the pre-activation distance from threshold; a spike is emitted for
+    ``u > 0``.  Two shapes are supported:
+
+    ``fast_sigmoid`` (default, baseline)
+        derivative of ``gamma*u / (1 + beta*|u|)``, i.e.
+        ``gamma / (1 + beta*|u|)^2``.  Bit-identical to the historical
+        implementation (same operands, same order).
+    ``slayer`` (M11a)
+        ``1 / (1 + alpha*|u|)^2``, the SLAYER fast-sigmoid derivative.
+        ``alpha`` defaults to ``2.0`` (M11a robustness fix): the derivative is
+        then at most ``(beta/alpha)^2 = 4`` times the baseline fast-sigmoid
+        derivative for every ``|u|`` (asymptotically 4x, 3.77x at ``|u|=8``),
+        whereas the old ``alpha=0.5`` width reached 63x in the far field and
+        overflowed the fp16 BPTT (pinned by the M11a tests).
+
+    Precision contract
+    ------------------
+    Reduced-precision inputs (fp16/bf16, the model's state dtype) are promoted
+    to **fp32** and the whole derivative is evaluated inside an autocast-disabled
+    region, so the surrogate gradient is never computed in half precision and
+    never subject to autocast.  fp64 inputs keep fp64 arithmetic, which is what
+    the high-precision gradient checks in ``run_smoke_test.py`` assert; fp32
+    inputs are computed in fp32.
+    """
+    kind = str(kind)
+    if kind not in SURROGATE_KINDS:
+        raise ValueError(f"unknown surrogate {kind!r} (expected one of {SURROGATE_KINDS})")
+    if kind == "slayer":
+        alpha = float(alpha)
+        if not alpha > 0.0:
+            raise ValueError("SLAYER surrogate_alpha must be > 0")
+    u_det = u.detach()
+    u_w = u_det if u_det.dtype in (torch.float32, torch.float64) else u_det.float()
+    with _autocast_disabled(u.device.type):
+        if kind == "slayer":
+            return 1.0 / (1.0 + alpha * u_w.abs()).square()
+        return float(gamma) / (1.0 + float(beta) * u_w.abs()).square()
+
+
+# ---------------------------------------------------------------------- #
 class SurrogateSpike(torch.autograd.Function):
-    """Heaviside spike with a fast-sigmoid surrogate gradient.
+    """Heaviside spike with a fast-sigmoid or SLAYER surrogate gradient.
 
     Explicit autograd Function (rather than a hand-written straight-through
     expression) so that the gradient is exactly the derivative of the intended
-    surrogate primitive ``gamma * u / (1 + beta * |u|)``::
+    surrogate primitive:
 
-        d/du [ gamma * u / (1 + beta|u|) ] = gamma / (1 + beta|u|)^2
+    ``fast_sigmoid`` (default)
+        ``d/du [ gamma * u / (1 + beta|u|) ] = gamma / (1 + beta|u|)^2``
+    ``slayer`` (M11a)
+        ``d/du [ u / (1 + alpha|u|) ] = 1 / (1 + alpha|u|)^2``
 
-    which equals ``gamma`` at ``u = 0``.  ``tests``-style gradient checks in
-    ``run_smoke_test.py`` verify this numerically.
+    The forward is the exact Heaviside ``1[u > 0]`` in both cases.  Gradients
+    are computed by :func:`surrogate_derivative` in fp32 (fp64 for fp64 inputs)
+    with autocast explicitly disabled.
     """
 
     @staticmethod
-    def forward(ctx, u: torch.Tensor, beta: float, gamma: float) -> torch.Tensor:
+    def forward(
+        ctx,
+        u: torch.Tensor,
+        beta: float,
+        gamma: float,
+        kind: str = "fast_sigmoid",
+        alpha: float = 2.0,
+    ) -> torch.Tensor:
         u_w = u if u.dtype in (torch.float32, torch.float64) else u.float()
         ctx.save_for_backward(u_w)
         ctx.beta = float(beta)
         ctx.gamma = float(gamma)
+        ctx.kind = str(kind)
+        ctx.alpha = float(alpha)
         return (u_w > 0).to(u.dtype)
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
         (u_w,) = ctx.saved_tensors
-        deriv = ctx.gamma / (1.0 + ctx.beta * u_w.abs()).square()
-        return (grad_out.to(deriv.dtype) * deriv).to(grad_out.dtype), None, None
+        deriv = surrogate_derivative(
+            u_w, ctx.beta, ctx.gamma, kind=ctx.kind, alpha=ctx.alpha
+        )
+        return (grad_out.to(deriv.dtype) * deriv).to(grad_out.dtype), None, None, None, None
 
 
-def surrogate_spike(u: torch.Tensor, beta: float = 4.0, gamma: float = 1.0) -> torch.Tensor:
-    return SurrogateSpike.apply(u, beta, gamma)
+def surrogate_spike(
+    u: torch.Tensor,
+    beta: float = 4.0,
+    gamma: float = 1.0,
+    *,
+    kind: str = "fast_sigmoid",
+    alpha: float = 2.0,
+) -> torch.Tensor:
+    """Heaviside spike; ``kind`` selects the surrogate gradient (see M11a)."""
+    return SurrogateSpike.apply(u, beta, gamma, kind, alpha)
 
 
 # ---------------------------------------------------------------------- #
@@ -271,6 +361,16 @@ class VectorNeuronPopulation(nn.Module):
             self.adlif_gain_slow = nn.Parameter(
                 torch.full((N,), float(adlif.gain_init), dtype=torch.float32)
             )
+        # ---- learnt temporal attention over the readout (M11b) -----------
+        # One logit per time bin, zero-initialised so the softmax starts uniform
+        # and the initial forward reuses the plain spike-count readout (the
+        # readout rescales the uniform weights back to the count scale).  The
+        # parameter is created *only* when the block is enabled: the disabled
+        # model has the exact same parameter set and forward as before.
+        if bool(cfg.attention.enabled):
+            self.attn_logits = nn.Parameter(torch.zeros(int(cfg.n_bins), dtype=torch.float32))
+        else:
+            self.attn_logits = None
 
         # expose the analytic flag so the class itself never hard-codes D > 1
         self.is_scalar_baseline = D == 1
@@ -502,6 +602,54 @@ class VectorNeuronPopulation(nn.Module):
         )
 
     # ------------------------------------------------------------------ #
+    def attention_weights(self, num_bins: int | None = None) -> torch.Tensor:
+        """Learned probability distribution over the ``T`` time bins (M11b).
+
+        Returns ``softmax(attn_logits[:T] / temperature)`` as an fp32 ``(T,)``
+        tensor that sums to 1.  Raises if attention is disabled; this keeps the
+        disabled path parameter-free and makes misuse loud.
+        """
+        if self.attn_logits is None:
+            raise RuntimeError("temporal attention is disabled (cfg.attention.enabled=False)")
+        T = int(self.cfg.n_bins if num_bins is None else num_bins)
+        if T < 1 or T > self.attn_logits.numel():
+            raise ValueError(
+                f"attention has {self.attn_logits.numel()} bin logits, got T={T}"
+            )
+        temperature = float(self.cfg.attention.temperature)
+        if not temperature > 0.0:  # cfg.validate() checks this too
+            raise ValueError("attention.temperature must be > 0")
+        # fp32 math regardless of the state dtype: the distribution is a readout
+        # weight and T can be 500, so the softmax is never done in half precision
+        with _autocast_disabled(self.attn_logits.device.type):
+            return torch.softmax(self.attn_logits[:T].float() / temperature, dim=0)
+
+    def readout_counts(self, spikes: torch.Tensor) -> torch.Tensor:
+        """Collapse ``(B, T, N)`` spikes to the ``(B, N)`` classifier input.
+
+        Off (default): exact spike-count sum, or its mean when ``cfg.readout ==
+        "mean"`` -- identical operations and order to the historical readout.
+
+        On: ``sum_t (T * a_t) * c_t`` with the learned bin distribution ``a``.
+        The softmax normalises over bins, so ``a`` sums to 1; left like that,
+        ``counts_att`` would be ``1/T`` of the plain count scale (T=500), which
+        made the classifier gradient 500x too small and left the zero-initialised
+        readout stuck.  The weights are therefore multiplied by ``T`` *before*
+        the reduction, so their mean is 1 and uniform attention reproduces the
+        plain count sum exactly (``T * (1/T) == 1`` in fp32 for the bin counts
+        used here).  ``cfg.readout`` is ignored when attention is on.
+        """
+        T = int(spikes.shape[1])
+        counts = spikes.float().sum(1)                     # (B, N) exact integers
+        if self.attn_logits is None:
+            if self.cfg.readout == "mean":
+                counts = counts / T
+            return counts
+        a = self.attention_weights(T)                      # (T,) fp32, sums to 1
+        scale = a * T                                      # (T,), mean == 1
+        return (spikes.float() * scale.view(1, T, 1)).sum(1)   # (B, N)
+
+    # ------------------------------------------------------------------ #
     def _weights(self):
         """Cast every weight tensor to the state dtype (fp16 by default).
 
@@ -567,6 +715,8 @@ class VectorNeuronPopulation(nn.Module):
         g_slow = self.adlif_gain_slow.to(dt) if (adlif and self.adlif_use_slow) else None
         use_fast = u_fast is not None and u_fast.numel() > 0 and g_fast is not None
         use_slow = u_slow is not None and u_slow.numel() > 0 and g_slow is not None
+        surrogate_kind = str(self.cfg.surrogate)
+        surrogate_alpha = float(self.cfg.surrogate_alpha)
 
         spikes, pots = [], []
         for k in range(a_chunk.shape[1]):
@@ -576,7 +726,9 @@ class VectorNeuronPopulation(nn.Module):
             if adapt:
                 pot = pot - w_ad * b                                   # adaptation current
             pots.append(pot)
-            s = surrogate_spike(pot, beta, gamma)                      # (B, N) fp16
+            s = surrogate_spike(
+                pot, beta, gamma, kind=surrogate_kind, alpha=surrogate_alpha
+            )                                                          # (B, N) fp16
             spikes.append(s)
             if adapt:
                 b = rho * b + s                                        # decaying spike trace
@@ -727,9 +879,7 @@ class VectorNeuronPopulation(nn.Module):
                 pots.append(p)
         spikes = torch.cat(spikes, dim=1)                              # (B, T, N)
 
-        counts = spikes.float().sum(1)                                 # (B, N) exact integers
-        if self.cfg.readout == "mean":
-            counts = counts / spikes.shape[1]
+        counts = self.readout_counts(spikes)                           # (B, N) fp32
         logits = counts @ self.w_cls.float()                           # (B, K) fp32
         out = [logits, spikes]
         if return_potentials:
@@ -792,4 +942,5 @@ __all__ = [
     "VectorNeuronPopulation",
     "SurrogateSpike",
     "surrogate_spike",
+    "surrogate_derivative",
 ]
