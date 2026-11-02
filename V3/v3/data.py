@@ -54,7 +54,11 @@ class SHDEventStore:
     """Bins SHD events on demand, with an optional RAM cache of the binned codes.
 
     Only ``(bin, channel)`` pairs are kept; a batch is materialised on the GPU as
-    a dense ``(B, T, C)`` tensor.  Two samples' events are never mixed.
+    a dense ``(B, T, C)`` tensor.  Two samples' events are never mixed, with one
+    exception: the train-only same-class blend (``augmentation.event_blend``,
+    M7, disabled by default) overlays a FIT sample with a same-class FIT partner
+    before binning.  The partner pool is built once by
+    :meth:`build_partner_pool` and can never contain VAL or TEST indices.
     """
 
     def __init__(self, h5_path: str | Path, cfg: V3Config):
@@ -109,6 +113,10 @@ class SHDEventStore:
         self._aug_rng: np.random.Generator | None = None
         self._aug_mask: np.ndarray | None = None
         self._aug_forced_off = False
+        # same-class blend (M7): class -> FIT indices, built once by
+        # build_partner_pool(); empty means "no partner available", which is what
+        # the VAL/TEST stores always have.
+        self._partner_pool: dict[int, np.ndarray] = {}
 
     # ------------------------------------------------------------------ #
     def _file(self) -> h5py.File:
@@ -203,6 +211,62 @@ class SHDEventStore:
             mask[idx] = True
         self._aug_mask = mask
 
+    # ---- same-class blend partners (M7) --------------------------------- #
+    def build_partner_pool(self, indices) -> None:
+        """Index ``indices`` by class, so blending can pick a same-class partner.
+
+        Built **once** per store from the training file and never per batch: the
+        only caller is ``experiment.train_variant``, which passes the FIT split.
+        VAL and TEST indices are therefore structurally impossible in the pool --
+        they are never handed to this method.
+
+        The labels come from the H5 file itself (``self.labels``), not from the
+        split, so the mapping is ``class -> sorted indices of that class``.
+        """
+        idx = np.asarray(indices, dtype=np.int64).reshape(-1)
+        labs = self.labels[idx] if idx.size else np.zeros(0, dtype=np.int64)
+        self._partner_pool = {
+            int(c): np.sort(idx[labs == c]) for c in np.unique(labs)
+        }
+
+    @property
+    def partner_pool_indices(self) -> np.ndarray:
+        """Every index that may serve as a blend partner (sorted; may be empty)."""
+        if not self._partner_pool:
+            return np.zeros(0, dtype=np.int64)
+        return np.sort(np.concatenate(list(self._partner_pool.values())))
+
+    def partner_class_counts(self) -> dict[int, int]:
+        """Number of available partners per class (diagnostics / stats())."""
+        return {int(c): int(v.size) for c, v in self._partner_pool.items()}
+
+    def _partner_events(self, i: int) -> tuple[np.ndarray, np.ndarray] | None:
+        """Raw events of a random same-class partner of ``i``, or ``None``.
+
+        Returns ``None`` -- and draws **nothing** from the epoch RNG -- when
+        blending is disabled, its probability is 0, or the class has no other
+        FIT member.  A drawn partner is never ``i`` itself and is always taken
+        from :meth:`build_partner_pool`, i.e. from the FIT split.
+        """
+        blend = self.augmentation.event_blend
+        if not blend.enabled or float(blend.probability) <= 0.0:
+            return None
+        pool = self._partner_pool.get(int(self.labels[int(i)]))
+        if pool is None:
+            return None
+        n = int(pool.size)
+        pos = int(np.searchsorted(pool, int(i)))
+        is_self = pos < n and int(pool[pos]) == int(i)
+        n_available = n - 1 if is_self else n
+        if n_available < 1:
+            return None
+        if self._aug_rng is None:
+            self.set_epoch(self.epoch)
+        pick = int(self._aug_rng.integers(0, n_available))
+        if is_self and pick >= pos:
+            pick += 1
+        return self.sample_events(int(pool[pick]))
+
     def force_augmentation_off(self, off: bool = True) -> None:
         """Hard off-switch (VAL/TEST stores); overrides every config flag."""
         self._aug_forced_off = bool(off)
@@ -222,10 +286,11 @@ class SHDEventStore:
         return True
 
     def _augmented_codes(self, i: int) -> np.ndarray:
-        """Raw events -> augment -> bin, never cached."""
+        """Raw events (+ optional same-class partner) -> augment -> bin, never cached."""
         if self._aug_rng is None:
             self.set_epoch(self.epoch)
         ts, us = self.sample_events(i)
+        partner = self._partner_events(int(i))
         ts, us = augment(
             ts,
             us,
@@ -233,6 +298,7 @@ class SHDEventStore:
             self._aug_rng,
             window_s=self.window_s,
             n_inputs=self.n_inputs,
+            partner=partner,
         )
         return self._bin_events(ts, us)
 
@@ -300,6 +366,11 @@ class SHDEventStore:
             "binned_cache_requested": bool(getattr(self.cfg, "binned_cache", False)),
             "binned_cache_active": self.binned is not None,
             "augmentation": self.augmentation.summary(),
+            "event_blend_partner_pool": {
+                "built": bool(self._partner_pool),
+                "classes": len(self._partner_pool),
+                "samples": int(self.partner_pool_indices.size),
+            },
             "warnings": [self.cache_warning] if self.cache_warning else [],
         }
 

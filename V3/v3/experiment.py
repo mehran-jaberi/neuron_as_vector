@@ -187,6 +187,16 @@ def train_variant(
         fit_split = Split("fit_subset", sub, store.labels[sub], store.speakers[sub])
         print(f"[V3] QUICK MODE: training on the first {len(fit_split)} FIT samples only")
     store.set_augmentation_indices(fit_split.indices)
+    # M7 same-class blending needs a partner index per class.  The pool is built
+    # ONCE here, from the FIT split only, so VAL/TEST samples can never become a
+    # partner even by accident; it is never rebuilt per batch and stays empty for
+    # the VAL/TEST stores.
+    store.build_partner_pool(fit_split.indices)
+    if cfg.augmentation.active() and cfg.augmentation.event_blend.enabled:
+        counts = store.partner_class_counts()
+        print(f"[V3] event_blend: {len(counts)} classes, "
+              f"{int(store.partner_pool_indices.size)} FIT partner candidates, "
+              f"p={cfg.augmentation.event_blend.probability}")
     # ``fit`` evaluates VAL with this same store while it is in the training
     # phase, so verify on the real data that VAL bins identically with raw-event
     # augmentation on and off.  The phase/mask make this a hard invariant.
@@ -365,6 +375,8 @@ def test_variant(
     split = official_test_split(store)
     # TEST is never augmented: hard off-switch plus an empty index mask, then
     # verify the binned batches are byte-identical with augmentation on/off.
+    # ``build_partner_pool`` is deliberately NOT called on this store, so even a
+    # mis-set flag finds no partner to blend with.
     store.set_phase("test")
     store.force_augmentation_off(True)
     store.set_augmentation_indices(np.zeros(0, dtype=np.int64))

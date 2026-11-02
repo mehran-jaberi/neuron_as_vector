@@ -94,10 +94,14 @@ state_regularization:
 # ---- raw-event augmentation (disabled by default) ----
 # Applied to the raw (time, channel) events BEFORE the 2-ms binning, never to the
 # binned tensor.  Defaults are all off: the unaugmented path is bit-identical.
-# Fixed order: channel dropout -> event dropout -> insertion -> global shift ->
-# timestamp jitter -> window filter (0 <= t < 1000 ms).
+# Fixed order: same-class event blend -> channel dropout -> event dropout ->
+# insertion -> global shift -> timestamp jitter -> window filter (0 <= t < 1000 ms).
 augmentation:
   enabled: false                  # master switch
+  event_blend:                    # M7 "event mixup": two SAME-CLASS samples merged
+    enabled: false                # train-only; partner comes from the FIT split
+    probability: 0.5              # chance a FIT sample is blended with a partner
+    keep_probability: 0.5         # per-spike keep probability from each source
   time_jitter:
     enabled: false
     std_ms: 0.5                   # sigma of the per-event timestamp jitter
