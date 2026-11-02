@@ -42,6 +42,24 @@ Readout (spike counts, 20 SHD classes)::
 
        logits = ( sum_t s(t) ) W_cls                  in R^20
 
+Optional two-timescale adaptation (``adlif.enabled``)
+-----------------------------------------------------
+With the feature on, every neuron also carries two scalar spike-triggered
+currents (one fast, one slow) that subtract from the pre-activation *inside* the
+``tanh``::
+
+       u_fast(t) = rho_fast u_fast(t-1) + s(t-1),     rho_fast = 0.9
+       u_slow(t) = rho_slow u_slow(t-1) + s(t-1),     rho_slow = 0.99
+       pre_i(t)  = m_i(t) + d_i(t) - g_fast,i u_fast,i(t) - g_slow,i u_slow,i(t)
+
+``g_fast`` / ``g_slow`` are one learnable scalar per neuron, initialised at 0:
+the mechanism is exactly inert at initialisation but the currents still
+accumulate from the spikes, so the gains are not stuck on a zero gradient (see
+the M1 history in ``KNOWN_ISSUES.md`` / ``INVESTIGATION.md``).  Both currents
+are per-batch state and are zeroed at the start of every forward pass, exactly
+like ``z``; the update is threaded through the gradient-checkpointed chunks.
+With ``enabled = False`` no current, no parameter and no new code path exists.
+
 Why ``tanh``
 ------------
 The state must stay bounded for fp16 to be numerically safe, and ``tanh`` gives a
@@ -149,6 +167,27 @@ class VectorNeuronPopulation(nn.Module):
         # far from the loss basin.
         self.w_cls = nn.Parameter(torch.zeros(N, K, dtype=torch.float32))
 
+        # two-timescale adaptation currents (adlif.enabled): one learnable scalar
+        # gain per neuron per timescale.  They exist only when the feature is on,
+        # so the disabled path keeps the baseline parameter list and state_dict
+        # exactly.  `gain_init` is the initial *gain* value, not a raw
+        # reparameterisation: 0 (the default) makes the subtracted current
+        # exactly 0 at t = 0 while the currents themselves still accumulate.
+        adlif = cfg.adlif
+        self.adlif_enabled = bool(adlif.enabled)
+        self.adlif_use_fast = self.adlif_enabled and bool(adlif.use_fast)
+        self.adlif_use_slow = self.adlif_enabled and bool(adlif.use_slow)
+        self.register_parameter("adlif_gain_fast", None)
+        self.register_parameter("adlif_gain_slow", None)
+        if self.adlif_use_fast:
+            self.adlif_gain_fast = nn.Parameter(
+                torch.full((N,), float(adlif.gain_init), dtype=torch.float32)
+            )
+        if self.adlif_use_slow:
+            self.adlif_gain_slow = nn.Parameter(
+                torch.full((N,), float(adlif.gain_init), dtype=torch.float32)
+            )
+
         # expose the analytic flag so the class itself never hard-codes D > 1
         self.is_scalar_baseline = D == 1
         # mean-field scaling: a sum of N unit contributions has magnitude ~sqrt(N),
@@ -182,6 +221,26 @@ class VectorNeuronPopulation(nn.Module):
     def init_state(self, batch: int, device: torch.device) -> torch.Tensor:
         return torch.zeros(
             batch, self.n_neurons, self.state_dim, device=device, dtype=self.state_dtype
+        )
+
+    def init_adaptation(self, batch: int, device: torch.device):
+        """Zero adaptation currents for a fresh batch: ``(u_fast, u_slow)``.
+
+        Mirrors :meth:`init_state`: the currents are per-batch recurrent state and
+        must never leak from one batch into the next.  An inactive timescale is
+        ``None``; with the feature off both are ``None``.
+        """
+        if not self.adlif_enabled:
+            return None, None
+
+        def zeros() -> torch.Tensor:
+            return torch.zeros(
+                batch, self.n_neurons, device=device, dtype=self.state_dtype
+            )
+
+        return (
+            zeros() if self.adlif_use_fast else None,
+            zeros() if self.adlif_use_slow else None,
         )
 
     # ------------------------------------------------------------------ #
@@ -248,6 +307,83 @@ class VectorNeuronPopulation(nn.Module):
         return z, torch.stack(spikes, dim=1), torch.stack(pots, dim=1)
 
     # ------------------------------------------------------------------ #
+    def _segment_adlif(
+        self,
+        z: torch.Tensor,
+        a_chunk: torch.Tensor,
+        u_fast: torch.Tensor | None,
+        u_slow: torch.Tensor | None,
+        state_sum: torch.Tensor | None = None,
+    ):
+        """Run one chunk with the two-timescale adaptation currents (feature ON).
+
+        This is the adaptation-enabled twin of :meth:`_segment`; the original
+        method is deliberately left byte-identical so the disabled path cannot
+        drift and stays bit-identical to the baseline.  **Keep the two timestep
+        loops in sync when the base dynamics change.**
+
+        ``u_fast`` / ``u_slow`` are the ``(B, N)`` currents at the *start* of the
+        chunk (already advanced to time ``t0``), or ``None`` for an inactive
+        timescale.  Returns ``(z_next, u_fast, u_slow, spikes, potentials)``,
+        where the returned currents are the ones the next chunk starts from.
+
+        Ordering: the current entering step ``k`` is
+        ``u(k) = rho * u(k-1) + s(k-1)``.  It is advanced with *this* step's
+        spike right after the state update, so ``pre`` at step ``k`` reads the
+        current driven by ``s(k-1)`` (and step 0 reads ``u = 0``).
+        """
+        w_in, w_down, w_up, w_emit, w_rec, gate, bias, w_out, theta, _ = self._weights()
+        dt = self.state_dtype
+        alpha = float(self.cfg.alpha)
+        beta, gamma = float(self.cfg.surrogate_beta), float(self.cfg.surrogate_gamma)
+        rho_fast = float(self.cfg.adlif.rho_fast)
+        rho_slow = float(self.cfg.adlif.rho_slow)
+        # cast the per-neuron gains to the state dtype once per chunk
+        g_fast = self.adlif_gain_fast.to(dt) if u_fast is not None else None
+        g_slow = self.adlif_gain_slow.to(dt) if u_slow is not None else None
+
+        spikes, pots = [], []
+        for k in range(a_chunk.shape[1]):
+            if state_sum is not None:
+                state_sum += z                                        # fp32 running sum
+            pot = (z * w_out).sum(-1) + theta                          # (B, N) fp16
+            pots.append(pot)
+            s = surrogate_spike(pot, beta, gamma)                      # (B, N) fp16
+            spikes.append(s)
+            h = ((s.unsqueeze(-1) * z).sum(1) * self.pop_scale) @ w_emit    # (B, D)
+            c = s @ w_rec                                              # (B, N)
+            mix = (z @ w_down) @ w_up                                   # (B, N, D)
+            drive = gate * a_chunk[:, k].unsqueeze(1) + c.unsqueeze(-1) * h.unsqueeze(1) + bias
+            # adaptation currents: subtract `gain * u` inside the tanh, broadcast
+            # over the D coordinates.  Casting the term back to the state dtype
+            # keeps `pre` in the dtype the baseline uses; with gain_init = 0 the
+            # subtraction is exactly 0.0, so the enabled-at-init path is inert.
+            pre = mix + drive
+            if u_fast is not None:
+                pre = pre - (g_fast.view(1, -1, 1) * u_fast.unsqueeze(-1)).to(dt)
+            if u_slow is not None:
+                pre = pre - (g_slow.view(1, -1, 1) * u_slow.unsqueeze(-1)).to(dt)
+            z = z + alpha * (torch.tanh(pre) - z)
+            z = z.to(dt)
+            # advance the order-1 currents with this step's spike
+            if u_fast is not None:
+                u_fast = rho_fast * u_fast + s
+            if u_slow is not None:
+                u_slow = rho_slow * u_slow + s
+            # controlled imprecision is applied to the *actual* state that the
+            # next timestep's spike generation / population signal / mixing read,
+            # so its effect genuinely propagates through the dynamics.
+            if self.cfg.state_regularization.mode != "none":
+                z = regularize_state(z, self.cfg.state_regularization, self._reg_phase())
+        return (
+            z,
+            u_fast,
+            u_slow,
+            torch.stack(spikes, dim=1),
+            torch.stack(pots, dim=1),
+        )
+
+    # ------------------------------------------------------------------ #
     def forward(
         self,
         x: torch.Tensor,
@@ -291,9 +427,21 @@ class VectorNeuronPopulation(nn.Module):
             else None
         )
         spikes, pots = [], []
+        if self.adlif_enabled:
+            # per-batch reset of the adaptation currents, like `z` above
+            u_fast, u_slow = self.init_adaptation(B, x.device)
         for t0 in range(0, T, step):
             a_chunk = a[:, t0 : t0 + step]
-            if use_ckpt:
+            if self.adlif_enabled:
+                if use_ckpt:
+                    z, u_fast, u_slow, s, p = checkpoint(
+                        self._segment_adlif, z, a_chunk, u_fast, u_slow, use_reentrant=False
+                    )
+                else:
+                    z, u_fast, u_slow, s, p = self._segment_adlif(
+                        z, a_chunk, u_fast, u_slow, state_sum
+                    )
+            elif use_ckpt:
                 z, s, p = checkpoint(self._segment, z, a_chunk, use_reentrant=False)
             else:
                 z, s, p = self._segment(z, a_chunk, state_sum)
