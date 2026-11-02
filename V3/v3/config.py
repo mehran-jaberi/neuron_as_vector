@@ -590,6 +590,7 @@ class V3Config:
     amp: bool = True             # autocast + GradScaler for fp32 master params
     grad_checkpoint_chunks: int = 10  # split T into this many checkpointed chunks
     select_best_val: bool = True      # keep the best-validation-accuracy epoch as secondary
+    eval_test_each_epoch: bool = False  # score the official TEST split at the end of every epoch
 
     # ---- controlled state imprecision (disabled by default) --------------
     # This is the *only* new scientific manipulation in the imprecision stage: it

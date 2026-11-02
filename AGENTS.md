@@ -51,6 +51,11 @@ Append findings; do not rewrite history.
     launched as a separate command-line process with its own log and its built-in `tqdm`
     progress bar kept on (do not pass `--no-progress`); they never block the conversation
     turn. Monitor from that side shell, not by re-running the work inline.
+14. **Every accuracy report carries FIT, VAL and TEST together** (plus epochs, seed and
+    `correct/total`). TEST alone cannot show saturation: FIT at 100 % means the script
+    capacity is spent, and FIT/VAL/TEST together show whether a TEST difference is a
+    real generalisation gain or just a different amount of overfitting. A number quoted
+    without FIT and VAL is incomplete.
 
 ## Repo conventions
 

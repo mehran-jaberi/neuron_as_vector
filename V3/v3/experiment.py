@@ -14,8 +14,10 @@ test file is only ever opened inside :func:`test_variant`.
 from __future__ import annotations
 
 import json
+import shutil
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -201,6 +203,21 @@ def train_variant(
     print(f"[V3] threshold calibrated; parameters = {model.n_parameters():,}")
 
     train_state: dict = {}
+    test_epoch_eval = None
+    if bool(getattr(cfg, "eval_test_each_epoch", False)):
+        # Per-epoch TEST scoring.  TEST is opened here only to feed the history;
+        # it is frozen, never trained on, and always un-augmented.
+        test_store = SHDEventStore(cfg.path(cfg.test_h5), cfg)
+        test_split_pe = official_test_split(test_store)
+        test_store.set_phase("test")
+        test_store.force_augmentation_off(True)
+        test_store.set_augmentation_indices(np.zeros(0, dtype=np.int64))
+        assert_eval_batches_unchanged(test_store, test_split_pe, cfg, phase="test")
+        print(f"[V3] per-epoch TEST scoring ON ({len(test_split_pe)} samples)")
+
+        def test_epoch_eval():
+            return evaluate(model, test_store, test_split_pe, cfg, device, phase="test")
+
     store.set_phase("train")
     try:
         result = fit(
@@ -213,6 +230,7 @@ def train_variant(
             show_progress=show_progress,
             resume_state=resume_state,
             state_sink=train_state,
+            test_eval=test_epoch_eval,
         )
         # Per-epoch clamping happens at every ``model.set_phase("train")`` call
         # inside the epoch loop (see VectorNeuronPopulation.set_phase); this
@@ -250,6 +268,25 @@ def train_variant(
         },
         ckpt_path,
     )
+    if int(cfg.epochs) >= 20:
+        # Durable copy of every long run: these are the weights the paper's
+        # mechanism analysis needs to reload, so they must outlive a results-dir
+        # cleanup.  Kept out of the git tree (``V3/checkpoints`` is ignored).
+        archive = dirs["checkpoints"] / "archive_20plus"
+        archive.mkdir(parents=True, exist_ok=True)
+        dest = archive / f"{cfg.tag}_ep{int(cfg.epochs)}.pt"
+        shutil.copy2(ckpt_path, dest)
+        manifest = archive / "manifest.csv"
+        write_header = not manifest.exists()
+        with open(manifest, "a", encoding="utf-8") as fh:
+            if write_header:
+                fh.write("saved_at,tag,epochs,n_parameters,params_group,val_accuracy,path\n")
+            fh.write(
+                f"{datetime.now().isoformat(timespec='seconds')},{cfg.tag},{int(cfg.epochs)},"
+                f"{model.n_parameters()},{cfg.state_dim},"
+                f"{val_metrics.get('accuracy', float('nan'))},{dest.name}\n"
+            )
+        print(f"[V3] archived {int(cfg.epochs)}-epoch checkpoint -> {dest}")
     if result.state_dict is not None:
         torch.save(
             {"schema": "v3_checkpoint_bestval/v1", "config": cfg.to_dict(),

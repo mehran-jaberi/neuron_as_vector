@@ -298,8 +298,14 @@ def fit(
     show_progress: bool = True,
     resume_state: dict | None = None,
     state_sink: dict | None = None,
+    test_eval=None,
 ) -> FitResult:
     """Train the population.  The official test split is never passed in here.
+
+    ``test_eval`` (optional) is a zero-argument callable returning the official
+    TEST metrics; when supplied it is invoked at the end of every epoch so the
+    history records per-epoch train / val / test accuracy.  The caller owns the
+    TEST store and guarantees it is frozen and un-augmented.
 
     ``resume_state`` (optional) restores model/optimizer/scheduler/scaler weights,
     the epoch counter and the RNG snapshot written by an earlier run, then trains
@@ -381,12 +387,20 @@ def fit(
             rec["val_accuracy"] = va["accuracy"]
             rec["val_rate_mean_hz"] = va["rate_mean_hz"]
             rec["train_rate_mean_hz"] = tr["spikes_per_sample"] / cfg.duration_s / cfg.n_neurons
+        if test_eval is not None:
+            te = test_eval()
+            rec["test_loss"] = te.get("loss")
+            rec["test_accuracy"] = te.get("accuracy")
+            rec["test_correct"] = te.get("correct")
+            rec["test_total"] = te.get("n_samples")
+            rec["test_rate_mean_hz"] = te.get("rate_mean_hz")
         if device.type == "cuda":
             rec["peak_memory_mb"] = float(torch.cuda.max_memory_allocated() / 2**20)
         res.history.append(rec)
         print(
             f"epoch {epoch:3d}/{cfg.epochs}  loss {rec['loss']:.4f}  acc {rec['accuracy']:.4f}"
             + (f"  val_acc {rec.get('val_accuracy', float('nan')):.4f}" if "val_accuracy" in rec else "")
+            + (f"  test_acc {rec['test_accuracy']:.4f}" if rec.get("test_accuracy") is not None else "")
             + f"  lr {rec['lr']:.2e}  {rec['time_s']:.1f}s",
             flush=True,
         )
