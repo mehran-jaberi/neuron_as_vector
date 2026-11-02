@@ -265,7 +265,7 @@ def test_fractional_shift_is_applied_before_segmentation():
 
 
 def test_fp16_delayed_input_stays_finite_and_differentiable():
-    cfg = _cfg(dtype="float16")
+    cfg = _cfg(dtype="float16", input_delays=InputDelayConfig(enabled=True))
     model = VectorNeuronPopulation(cfg)
     x = (_rand(2, 6, cfg.n_inputs, seed=5) > 0.7).to(torch.float16)
     out = model.delayed_input(x)
