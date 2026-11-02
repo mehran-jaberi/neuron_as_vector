@@ -214,6 +214,11 @@ def train_variant(
             resume_state=resume_state,
             state_sink=train_state,
         )
+        # Per-epoch clamping happens at every ``model.set_phase("train")`` call
+        # inside the epoch loop (see VectorNeuronPopulation.set_phase); this
+        # post-training call additionally guarantees that the checkpoint written
+        # below and every reported delay are inside the safe range.
+        model.clamp_input_delays_()
     finally:
         # post-training FIT/VAL metrics, figures and test_variant must all be
         # deterministic and unaugmented

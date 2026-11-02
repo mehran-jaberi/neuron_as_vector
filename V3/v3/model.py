@@ -45,13 +45,26 @@ Readout (spike counts, 20 SHD classes)::
 Learnable input delays
 ----------------------
 With ``cfg.input_delays.enabled`` every input channel ``c`` owns one delay
-``d_c`` [ms].  The binned input sequence is shifted forward in time by
-``round(d_c / dt)`` bins (straight-through rounded, so ``d_c`` is trainable)
-with zero fill at the start of the window, and only then projected to ``a(t)``.
-The shift is applied to the whole sequence before it is split into the
-checkpointed segments, so a delayed sample never goes missing at a segment
-boundary.  Initial delays are 0 ms, so enabling the feature at initialisation
-reproduces the baseline exactly.
+``d_c`` [ms], stored as an unconstrained parameter ``r_c`` and mapped to
+``d_c = max_ms * sigmoid(r_c)``.  That keeps ``d_c`` strictly inside
+``(0, max_ms)`` *by construction* -- no clamp sits on the forward path, so the
+parameter is never pinned to a boundary where ``clamp``'s derivative is zero
+(the reason the first implementation, initialised at exactly 0 ms, never
+trained).
+
+The delay is applied as a **fractional** shift, i.e. linear interpolation
+between neighbouring bins.  With ``d_c / dt = k_c + f_c`` (``k_c`` integer,
+``f_c in [0, 1)``)::
+
+    out[t, c] = (1 - f_c) * x[t - k_c, c] + f_c * x[t - k_c - 1, c]
+
+with zero fill where an index is negative.  ``floor`` carries no gradient, so
+``d(out)/d(f_c) = x[t-k_c-1] - x[t-k_c]``: the delay receives the gradient of an
+actual time shift rather than the gradient of a constant DC offset (the second
+bug of the first implementation).  No ``round`` and no straight-through
+estimator is involved.  The shift is applied to the whole sequence before it is
+split into the checkpointed segments, so a delayed sample never goes missing at
+a segment boundary.
 
 Why ``tanh``
 ------------
@@ -121,25 +134,6 @@ def surrogate_spike(u: torch.Tensor, beta: float = 4.0, gamma: float = 1.0) -> t
     return SurrogateSpike.apply(u, beta, gamma)
 
 
-class StraightThroughRound(torch.autograd.Function):
-    """``round`` in the forward pass, the identity in the backward pass.
-
-    Converts a continuous delay in bins into the integer bin count that actually
-    shifts the input sequence.  The forward value is exactly ``round(x)`` -- so a
-    zero delay is a no-op and a delay of ``k`` bins shifts by exactly ``k``
-    timesteps -- while the backward pass pretends no rounding happened, so the
-    delay parameter receives a gradient.
-    """
-
-    @staticmethod
-    def forward(ctx, x: torch.Tensor) -> torch.Tensor:
-        return torch.round(x)
-
-    @staticmethod
-    def backward(ctx, grad_out: torch.Tensor):
-        return grad_out
-
-
 # ---------------------------------------------------------------------- #
 class VectorNeuronPopulation(nn.Module):
     """``N`` neurons, each with a trainable ``D``-dimensional dynamical state."""
@@ -179,13 +173,19 @@ class VectorNeuronPopulation(nn.Module):
         # far from the loss basin.
         self.w_cls = nn.Parameter(torch.zeros(N, K, dtype=torch.float32))
 
-        # learnable per-input-channel conduction delays [ms].  ``None`` when the
-        # feature is disabled: the disabled model then has exactly the baseline
-        # parameters and the input path is untouched (bit-identical).
-        self.input_delay_ms: nn.Parameter | None = None
+        # learnable per-input-channel conduction delays [ms].  The *stored*
+        # parameter is the unconstrained pre-sigmoid value ``raw``; the effective
+        # delay is ``max_ms * sigmoid(raw)``, so it is strictly inside
+        # ``(0, max_ms)`` and never sits on a boundary where the gradient dies.
+        # ``None`` when the feature is disabled: the disabled model then has
+        # exactly the baseline parameters and the input path is untouched
+        # (bit-identical).
+        self.input_delay_raw: nn.Parameter | None = None
         if cfg.input_delays.enabled:
-            self.input_delay_ms = nn.Parameter(
-                torch.zeros(C, dtype=torch.float32),
+            self.input_delay_raw = nn.Parameter(
+                self._delay_ms_to_raw(
+                    self._initial_input_delays_ms(C), float(cfg.input_delays.max_ms)
+                ),
                 requires_grad=bool(cfg.input_delays.learnable),
             )
 
@@ -209,10 +209,19 @@ class VectorNeuronPopulation(nn.Module):
         return int(sum(p.numel() for p in self.parameters()))
 
     def set_phase(self, phase: str) -> None:
-        """Select the phase ("train" | "val" | "test") for state imprecision."""
+        """Select the phase ("train" | "val" | "test") for state imprecision.
+
+        Entering the ``"train"`` phase is the per-epoch boundary of the training
+        loop (``v3.train.train_one_epoch`` calls this once, before the first
+        batch of the epoch), so the input-delay parameter is projected into its
+        safe pre-sigmoid range here -- see :meth:`clamp_input_delays_`.  The
+        effective delay itself is already bounded by construction.
+        """
         if phase not in ("train", "val", "test"):
             raise ValueError(f"unknown phase {phase!r}")
         self.state_reg_phase = phase
+        if phase == "train":
+            self.clamp_input_delays_()
 
     def _reg_phase(self) -> str:
         if self.state_reg_phase is not None:
@@ -227,47 +236,122 @@ class VectorNeuronPopulation(nn.Module):
     # ------------------------------------------------------------------ #
     # learnable per-input-channel conduction delays
     # ------------------------------------------------------------------ #
+    def _initial_input_delays_ms(self, n_channels: int) -> torch.Tensor:
+        """Deterministic interior init of the per-channel delays [ms].
+
+        The delays start uniformly inside ``[init_ms, max_ms / 2]`` -- with the
+        defaults ``[0.5, 10]`` ms -- i.e. strictly inside ``(0, max_ms)``.  An
+        exact boundary (the old 0 ms init) is precisely where ``clamp`` has zero
+        derivative and the parameter never trained, so it must not be used.
+
+        A dedicated generator keeps this draw out of the weight-initialisation
+        stream: enabling the feature does not perturb any other parameter, so the
+        A/B with ``enabled: false`` still differs only by the delay path.
+        """
+        delays = self.cfg.input_delays
+        max_ms = float(delays.max_ms)
+        lo = float(delays.init_ms)
+        hi = max(lo, 0.5 * max_ms)
+        gen = torch.Generator().manual_seed(int(self.cfg.seed) + 54321)
+        u = torch.rand(n_channels, generator=gen)
+        return (lo + (hi - lo) * u).to(torch.float32)
+
+    @staticmethod
+    def _delay_ms_to_raw(delays_ms: torch.Tensor, max_ms: float) -> torch.Tensor:
+        """Inverse of ``max_ms * sigmoid(raw)``; keeps ``raw`` finite and interior.
+
+        The ``1e-6`` guard only protects the inverse against a caller passing
+        exactly 0 / ``max_ms``; the forward mapping itself is a plain sigmoid,
+        with no clamp on the differentiable path.
+        """
+        p = (delays_ms / float(max_ms)).clamp(1e-6, 1.0 - 1e-6)
+        return torch.log(p / (1.0 - p)).to(torch.float32)
+
     def effective_input_delays_ms(self) -> torch.Tensor:
-        """Per-channel delays in ms, clamped to ``[0, max_ms]`` (differentiable)."""
-        if self.input_delay_ms is None:
+        """Per-channel delays in ms: ``max_ms * sigmoid(raw)`` (never at a bound)."""
+        if self.input_delay_raw is None:
             raise RuntimeError("input_delays.enabled is False for this model")
-        return torch.clamp(self.input_delay_ms, 0.0, float(self.cfg.input_delays.max_ms))
+        return float(self.cfg.input_delays.max_ms) * torch.sigmoid(self.input_delay_raw)
 
     def input_delay_bins(self) -> torch.Tensor:
-        """Per-channel delays in bins: ``round(delay_ms / dt)``, STE-differentiable."""
-        return StraightThroughRound.apply(
-            self.effective_input_delays_ms() / float(self.cfg.bin_ms)
+        """Per-channel delays in *fractional* bins: ``delay_ms / bin_ms``."""
+        return self.effective_input_delays_ms() / float(self.cfg.bin_ms)
+
+    @torch.no_grad()
+    def set_input_delays_ms(self, delays_ms) -> None:
+        """Write fixed delays given in ms (scalar broadcasts; used by tests)."""
+        if self.input_delay_raw is None:
+            raise RuntimeError("input_delays.enabled is False for this model")
+        d = torch.as_tensor(delays_ms, dtype=torch.float32, device=self.input_delay_raw.device)
+        d = torch.broadcast_to(d, self.input_delay_raw.shape)
+        self.input_delay_raw.copy_(
+            self._delay_ms_to_raw(d, float(self.cfg.input_delays.max_ms))
         )
 
     @torch.no_grad()
-    def clamp_input_delays_(self) -> int:
-        """Clamp the stored parameters into ``[0, max_ms]`` in place; return #changed.
+    def clamp_input_delays_(self, limit: float = 10.0) -> int:
+        """Project the pre-sigmoid parameter into ``[-limit, limit]``; return #changed.
 
-        :meth:`forward` already clamps the *effective* delay, so this only keeps
-        the optimised parameter itself inside the range (e.g. for checkpointing
-        or reporting).  A training loop can call it after each optimiser step.
+        The effective delay is bounded by construction (``max_ms * sigmoid``), so
+        this is a *numerical* guard, not the thing that enforces ``[0, max_ms]``:
+        it stops ``raw`` from drifting so far that fp32 ``sigmoid`` saturates to
+        exactly 0 or 1, which would freeze the delay at a bound (same failure
+        mode as the original zero init).  ``limit=10`` leaves ``sigmoid`` strictly
+        interior (``~4.5e-5`` slope).
+
+        Called once per training epoch from :meth:`set_phase` (the epoch boundary
+        of ``v3.train.train_one_epoch``) and once after ``fit`` in
+        ``v3.experiment.train_variant``.
         """
-        if self.input_delay_ms is None:
+        if self.input_delay_raw is None:
             return 0
-        max_ms = float(self.cfg.input_delays.max_ms)
-        before = self.input_delay_ms.detach().clone()
-        self.input_delay_ms.clamp_(0.0, max_ms)
-        return int((self.input_delay_ms.detach() != before).sum())
+        limit = float(limit)
+        before = self.input_delay_raw.detach().clone()
+        self.input_delay_raw.clamp_(-limit, limit)
+        return int((self.input_delay_raw.detach() != before).sum())
 
-    def _shift_input(self, x: torch.Tensor, bins: torch.Tensor) -> torch.Tensor:
-        """Integer per-channel shift with zero fill: ``out[t] = x[t - k_c]``."""
+    def _shift_by_bins(self, x: torch.Tensor, bins: torch.Tensor) -> torch.Tensor:
+        """Integer per-channel shift with zero fill: ``out[t, c] = x[t - k_c, c]``.
+
+        ``bins`` is a long tensor of non-negative bin counts.  A channel with
+        ``k_c >= T`` is left silent (all zeros); every other channel reads
+        zeros for the first ``k_c`` steps of the window.
+        """
         B, T, C = x.shape
         out = torch.zeros_like(x)
         if T == 0:
             return out
-        k = bins.detach().to(torch.long).clamp(0, T)   # k bins == the channel is silent
-        for kk in torch.unique(k).tolist():
-            mask = k == kk
+        for kk in torch.unique(bins).tolist():
+            if kk < 0 or kk >= T:
+                continue
+            mask = bins == kk
             if kk == 0:
                 out[:, :, mask] = x[:, :, mask]
-            elif kk < T:
-                out[:, kk:, mask] = x[:, :-kk, mask]
+            else:
+                out[:, kk:, mask] = x[:, : T - kk, mask]
         return out
+
+    def _fractional_shift(self, x: torch.Tensor, bins: torch.Tensor) -> torch.Tensor:
+        """Linear-interpolation (fractional) delay, differentiable in ``bins``.
+
+        For ``d_c = k_c + f_c`` bins (``k`` integer, ``f in [0, 1)``)::
+
+            out[t, c] = (1 - f_c) * x[t - k_c, c] + f_c * x[t - k_c - 1, c]
+
+        with zero fill where an index is negative.  ``floor`` has zero gradient,
+        so ``d(out)/d(f_c) = x[t-k_c-1] - x[t-k_c]`` and a delay change moves the
+        waveform in time instead of adding a constant.  No ``round`` and no
+        straight-through estimator on this path.
+        """
+        if x.shape[1] == 0:
+            return torch.zeros_like(x)
+        k = torch.floor(bins.detach()).to(torch.long)
+        f = bins - k.to(bins.dtype)                      # (C,) differentiable
+        x0 = self._shift_by_bins(x, k)
+        x1 = self._shift_by_bins(x, k + 1)
+        w0 = (1.0 - f).to(x.dtype).reshape(1, 1, -1)
+        w1 = f.to(x.dtype).reshape(1, 1, -1)
+        return x0 * w0 + x1 * w1
 
     def delayed_input(self, x: torch.Tensor) -> torch.Tensor:
         """Apply the per-channel delays to ``x: (B, T, C)``.
@@ -277,19 +361,13 @@ class VectorNeuronPopulation(nn.Module):
         segment boundary: a sample pulled from an earlier segment was already
         written into the shifted tensor.
 
-        Disabled -> ``x`` is returned unchanged.  With the initial zero delays
-        the result equals ``x`` exactly (a shift by 0 bins), so enabling the
-        feature at initialisation is a no-op.
+        Disabled -> ``x`` is returned unchanged (same object).  A delay of
+        exactly 0 bins would also be bit-identical to ``x``, but the sigmoid
+        parameterisation keeps the delay strictly positive.
         """
-        if self.input_delay_ms is None:
+        if self.input_delay_raw is None:
             return x
-        bins = self.input_delay_bins()
-        shifted = self._shift_input(x, bins)
-        # Straight-through term: exactly zero in the forward pass, but it carries
-        # d(bins)/d(delay) = 1/dt back to the delay parameter -- the integer shift
-        # itself has no gradient.
-        ste = (bins - bins.detach()).to(x.dtype).reshape(1, 1, -1)
-        return shifted + ste
+        return self._fractional_shift(x, self.input_delay_bins())
 
     # ------------------------------------------------------------------ #
     def _weights(self):
@@ -363,9 +441,10 @@ class VectorNeuronPopulation(nn.Module):
     ):
         """``x``: ``(B, T, C)`` float tensor.
 
-        With ``cfg.input_delays.enabled`` the input is first shifted per channel
-        by its learned delay (``delayed_input``) with zero fill at the start, so
-        the per-step gate ``a(t)`` is computed from the delayed sequence.
+        With ``cfg.input_delays.enabled`` the input is first delayed per channel
+        by its learned fractional delay (``delayed_input``, linear interpolation
+        between neighbouring bins, zero fill at the start of the window), so the
+        per-step gate ``a(t)`` is computed from the delayed sequence.
 
         Returns ``(logits, spikes[, pots][, z_final, z_mean])``; the optional
         state summary is appended after the optional potentials.  ``z_final`` is
@@ -480,6 +559,5 @@ def checkpoint_supported(z: torch.Tensor) -> bool:
 __all__ = [
     "VectorNeuronPopulation",
     "SurrogateSpike",
-    "StraightThroughRound",
     "surrogate_spike",
 ]
