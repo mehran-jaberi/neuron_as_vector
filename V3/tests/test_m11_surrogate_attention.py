@@ -308,7 +308,7 @@ def test_attention_off_is_parameter_free_and_bit_identical():
     assert torch.equal(logits, counts @ m.w_cls.float())
 
     on = _model(_cfg(attention=AttentionConfig(enabled=True)))
-    assert on.n_parameters() == m.n_parameters() + m.cfg.n_bins   # only the T logits
+    assert on.n_parameters() == m.n_parameters() + m.cfg.total_steps  # only the T logits
 
 
 # ---------------------------------------------------------------------- #

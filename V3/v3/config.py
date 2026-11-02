@@ -1411,7 +1411,7 @@ def parameter_groups(cfg: V3Config) -> dict:
             groups["adlif_gain_slow"] = N
     if cfg.attention.enabled:
         # one learned logit per time bin; absent (and budget-neutral) when off
-        groups["attn_logits"] = cfg.n_bins
+        groups["attn_logits"] = cfg.total_steps
     if cfg.two_stage.active:
         # the second mixer is an independent rank-R2 pair plus the raw scalar
         # lam_raw (the effective lam is a sigmoid of it, so still one parameter);

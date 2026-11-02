@@ -401,7 +401,9 @@ class VectorNeuronPopulation(nn.Module):
         # parameter is created *only* when the block is enabled: the disabled
         # model has the exact same parameter set and forward as before.
         if bool(cfg.attention.enabled):
-            self.attn_logits = nn.Parameter(torch.zeros(int(cfg.n_bins), dtype=torch.float32))
+            self.attn_logits = nn.Parameter(
+                torch.zeros(int(cfg.total_steps), dtype=torch.float32)
+            )
         else:
             self.attn_logits = None
 
@@ -668,7 +670,7 @@ class VectorNeuronPopulation(nn.Module):
         """
         if self.attn_logits is None:
             raise RuntimeError("temporal attention is disabled (cfg.attention.enabled=False)")
-        T = int(self.cfg.n_bins if num_bins is None else num_bins)
+        T = int(self.cfg.total_steps if num_bins is None else num_bins)
         if T < 1 or T > self.attn_logits.numel():
             raise ValueError(
                 f"attention has {self.attn_logits.numel()} bin logits, got T={T}"
