@@ -212,6 +212,37 @@ class ChannelDropoutConfig:
 
 
 @dataclass
+class EventBlendConfig:
+    """Same-class raw-event blend ("event mixup"): two samples of one class merged.
+
+    With probability ``probability`` a training sample is merged with a randomly
+    chosen **same-class** partner from the FIT split: both event trains are
+    shifted so their centres of mass (mean event time) coincide, each spike of
+    either source is kept independently with ``keep_probability``, and the merged
+    train is clipped to the window.  The label is unchanged.
+
+    Partners come from an index the data store builds **once** on the training
+    split, so a VAL or TEST sample can never become (or receive) a partner.
+    Disabled by default; ``probability: 0`` draws no random numbers at all, so
+    the enabled-but-zero path is identical to the off path.
+    """
+
+    enabled: bool = False
+    probability: float = 0.5
+    keep_probability: float = 0.5
+
+    def validate(self) -> None:
+        if not 0.0 <= float(self.probability) <= 1.0:
+            raise ValueError("augmentation.event_blend.probability must be in [0, 1]")
+        if not 0.0 <= float(self.keep_probability) <= 1.0:
+            raise ValueError("augmentation.event_blend.keep_probability must be in [0, 1]")
+
+    @classmethod
+    def from_dict(cls, data: dict, strict: bool = False) -> "EventBlendConfig":
+        return _block_from_dict(cls, data, strict, "augmentation.event_blend")
+
+
+@dataclass
 class EventAugmentationConfig:
     """Raw-event augmentation, applied **before** the 2-ms binning.
 
@@ -219,7 +250,7 @@ class EventAugmentationConfig:
     the binned ``(T, C)`` tensor.  Fixed operation order (see
     :func:`v3.event_augmentation.augment`)::
 
-        channel dropout -> event dropout -> insertion
+        same-class event blend -> channel dropout -> event dropout -> insertion
         -> global time shift -> timestamp jitter -> window filter
 
     ``enabled`` is the master switch and every sub-block has its own ``enabled``
@@ -227,9 +258,13 @@ class EventAugmentationConfig:
     the baseline.  The ``apply_during_*`` flags choose the phase exactly like
     :class:`StateRegularizationConfig`; default is training only, and the
     experiment additionally forces VAL/TEST stores off.
+
+    ``event_blend`` is the only op that needs another sample: the data store
+    supplies a same-class FIT partner, otherwise it is a no-op.
     """
 
     enabled: bool = False
+    event_blend: EventBlendConfig = field(default_factory=EventBlendConfig)
     time_jitter: TimeJitterConfig = field(default_factory=TimeJitterConfig)
     event_dropout: EventDropoutConfig = field(default_factory=EventDropoutConfig)
     event_insertion: EventInsertionConfig = field(default_factory=EventInsertionConfig)
@@ -240,6 +275,7 @@ class EventAugmentationConfig:
     apply_during_test: bool = False
 
     AUGMENTERS = (
+        "event_blend",
         "time_jitter",
         "event_dropout",
         "event_insertion",
@@ -289,6 +325,7 @@ class EventAugmentationConfig:
     @classmethod
     def from_dict(cls, data: dict, strict: bool = False) -> "EventAugmentationConfig":
         block_classes = {
+            "event_blend": EventBlendConfig,
             "time_jitter": TimeJitterConfig,
             "event_dropout": EventDropoutConfig,
             "event_insertion": EventInsertionConfig,
@@ -763,6 +800,7 @@ __all__ = [
     "TimingConfig",
     "StateRegularizationConfig",
     "TimeJitterConfig",
+    "EventBlendConfig",
     "EventDropoutConfig",
     "EventInsertionConfig",
     "GlobalTimeShiftConfig",

@@ -15,6 +15,7 @@ import pytest
 from v3.config import (
     ChannelDropoutConfig,
     EventAugmentationConfig,
+    EventBlendConfig,
     EventDropoutConfig,
     EventInsertionConfig,
     GlobalTimeShiftConfig,
@@ -25,7 +26,7 @@ from v3.config import (
     apply_override_mapping,
 )
 from v3.data import BatchIterator, SHDEventStore, Split, make_split
-from v3.event_augmentation import augment
+from v3.event_augmentation import augment, blend_events
 from v3.experiment import assert_eval_batches_unchanged
 
 
@@ -272,9 +273,11 @@ def test_defaults_are_all_off_and_serialise():
     assert cfg.augmentation.active() is False
     data = cfg.to_dict()
     aug = data["augmentation"]
-    for block in ("time_jitter", "event_dropout", "event_insertion",
+    for block in ("event_blend", "time_jitter", "event_dropout", "event_insertion",
                   "global_time_shift", "channel_dropout"):
         assert aug[block]["enabled"] is False
+    assert aug["event_blend"]["probability"] == pytest.approx(0.5)
+    assert aug["event_blend"]["keep_probability"] == pytest.approx(0.5)
     assert aug["apply_during_training"] is True
     assert aug["apply_during_validation"] is False
     assert aug["apply_during_test"] is False
@@ -306,6 +309,8 @@ def test_phase_active_flags():
         EventInsertionConfig(enabled=True, rate_hz=-1.0),
         GlobalTimeShiftConfig(enabled=True, max_ms=-1.0),
         ChannelDropoutConfig(enabled=True, probability=2.0),
+        EventBlendConfig(enabled=True, probability=-0.1),
+        EventBlendConfig(enabled=True, keep_probability=1.5),
     ],
 )
 def test_validate_rejects_out_of_range_values(block):
@@ -313,6 +318,7 @@ def test_validate_rejects_out_of_range_values(block):
     name = type(block).__name__
     field = {
         "TimeJitterConfig": "time_jitter",
+        "EventBlendConfig": "event_blend",
         "EventDropoutConfig": "event_dropout",
         "EventInsertionConfig": "event_insertion",
         "GlobalTimeShiftConfig": "global_time_shift",
@@ -336,6 +342,8 @@ def test_override_items_support_two_levels():
             "augmentation.enabled=true",
             "augmentation.time_jitter.enabled=true",
             "augmentation.time_jitter.std_ms=0.5",
+            "augmentation.event_blend.enabled=true",
+            "augmentation.event_blend.probability=0.25",
             "augmentation.event_dropout.probability=0.25",
             "timing.time_bin_ms=4",
             "epochs=3",
@@ -344,6 +352,9 @@ def test_override_items_support_two_levels():
     assert out.augmentation.enabled is True
     assert out.augmentation.time_jitter.enabled is True
     assert out.augmentation.time_jitter.std_ms == pytest.approx(0.5)
+    assert out.augmentation.event_blend.enabled is True
+    assert out.augmentation.event_blend.probability == pytest.approx(0.25)
+    assert out.augmentation.event_blend.keep_probability == pytest.approx(0.5)
     assert out.augmentation.event_dropout.probability == pytest.approx(0.25)
     assert out.timing.time_bin_ms == 4.0 and out.epochs == 3
     assert cfg.augmentation.enabled is False  # input untouched
@@ -499,3 +510,241 @@ def test_eval_batches_unchanged_guard_passes_and_fails(tmp_path):
     leaky.set_phase("train")
     with pytest.raises(AssertionError):
         assert_eval_batches_unchanged(leaky, val, cfg, phase="train")
+
+
+# ---------------------------------------------------------------------- #
+# M7 same-class event blend
+# ---------------------------------------------------------------------- #
+def _blend_cfg(probability: float = 1.0, keep_probability: float = 0.5,
+               enabled: bool = True) -> EventAugmentationConfig:
+    """Blend-only augmentation (every other op stays off)."""
+    return EventAugmentationConfig(
+        enabled=enabled,
+        event_blend=EventBlendConfig(
+            enabled=True, probability=probability, keep_probability=keep_probability
+        ),
+    )
+
+
+def _two_trains(n: int = 40) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Two same-class trains whose centres of mass are 0.2 s and 0.4 s."""
+    ts_a = np.linspace(0.15, 0.25, n)
+    ts_b = np.linspace(0.35, 0.45, n)
+    us_a = np.arange(n, dtype=np.int64) % 4          # channels 0..3
+    us_b = np.arange(n, dtype=np.int64) % 4 + 4      # channels 4..7
+    return ts_a, us_a, ts_b, us_b
+
+
+def test_blend_only_config_counts_as_active():
+    assert EventAugmentationConfig(enabled=True,
+                                   event_blend=EventBlendConfig(enabled=True)).active()
+    assert not EventAugmentationConfig().active()
+    assert not EventAugmentationConfig(enabled=True).active()
+
+
+def test_blend_disabled_with_a_partner_is_identical_to_no_partner():
+    ts_a, us_a, ts_b, us_b = _two_trains()
+    off = augment(ts_a, us_a, EventAugmentationConfig(), np.random.default_rng(0),
+                  window_s=1.0, n_inputs=8)
+    with_partner = augment(ts_a, us_a, EventAugmentationConfig(), np.random.default_rng(0),
+                           window_s=1.0, n_inputs=8, partner=(ts_b, us_b))
+    assert np.array_equal(off[0], with_partner[0])
+    assert np.array_equal(off[1], with_partner[1])
+
+
+def test_blend_probability_zero_is_identical_and_draws_nothing():
+    ts_a, us_a, ts_b, us_b = _two_trains()
+    ref = augment(ts_a, us_a, EventAugmentationConfig(), np.random.default_rng(0),
+                  window_s=1.0, n_inputs=8)
+    cfg = _blend_cfg(probability=0.0)
+    rng = np.random.default_rng(0)
+    out = augment(ts_a, us_a, cfg, rng, window_s=1.0, n_inputs=8, partner=(ts_b, us_b))
+    assert np.array_equal(ref[0], out[0]) and np.array_equal(ref[1], out[1])
+    # the enabled-but-zero block must not consume the shared RNG stream
+    assert rng.random() == np.random.default_rng(0).random()
+
+
+def test_blend_without_a_partner_is_a_no_op():
+    ts_a, us_a, _, _ = _two_trains()
+    ref = augment(ts_a, us_a, EventAugmentationConfig(), np.random.default_rng(0),
+                  window_s=1.0, n_inputs=8)
+    rng = np.random.default_rng(0)
+    out = augment(ts_a, us_a, _blend_cfg(), rng, window_s=1.0, n_inputs=8, partner=None)
+    assert np.array_equal(ref[0], out[0]) and np.array_equal(ref[1], out[1])
+    assert rng.random() == np.random.default_rng(0).random()
+
+
+def test_blend_aligns_centres_of_mass_on_the_midpoint():
+    ts_a, us_a, ts_b, us_b = _two_trains()
+    out_t, out_u = blend_events(ts_a, us_a, ts_b, us_b, np.random.default_rng(0),
+                                window_s=1.0, keep_probability=1.0)
+    assert out_t.size == ts_a.size + ts_b.size          # keep_probability = 1
+    moved_a = out_t[out_u < 4]
+    moved_b = out_t[out_u >= 4]
+    assert moved_a.mean() == pytest.approx(0.3)          # midpoint of 0.2 and 0.4
+    assert moved_b.mean() == pytest.approx(0.3)
+    # both trains move by the same half-gap, in opposite directions
+    assert moved_a.mean() - ts_a.mean() == pytest.approx(0.1)
+    assert moved_b.mean() - ts_b.mean() == pytest.approx(-0.1)
+    assert np.all(np.diff(out_t) >= 0.0)                 # time-ordered merge
+    assert np.array_equal(ts_a, np.linspace(0.15, 0.25, 40))  # inputs untouched
+
+
+def test_blend_expected_spike_count_for_a_fixed_seed():
+    ts_a, us_a, ts_b, us_b = _two_trains()
+    out_t, out_u = blend_events(ts_a, us_a, ts_b, us_b, np.random.default_rng(0),
+                                window_s=1.0, keep_probability=0.5)
+    # manual replay of the pinned draw order (a's mask first, then b's)
+    replay = np.random.default_rng(0)
+    keep_a = replay.random(ts_a.size) < 0.5
+    keep_b = replay.random(ts_b.size) < 0.5
+    expected = int(keep_a.sum() + keep_b.sum())
+    assert out_t.size == expected
+    assert out_u.size == expected
+    assert expected == 39  # 16 of 40 from a + 23 of 40 from b, seed 0
+    assert np.all(np.isin(out_u, np.concatenate([us_a, us_b])))
+    # COM alignment moves a by +0.1 s and b by -0.1 s; the window keeps them all
+    assert np.all(out_t >= 0.0) and np.all(out_t < 1.0)
+
+
+def test_blend_keeps_the_window_and_never_produces_negative_times():
+    ts_a, us_a, ts_b, us_b = _two_trains()
+    for seed in range(20):
+        out_t, out_u = blend_events(ts_a, us_a, ts_b, us_b,
+                                    np.random.default_rng(seed),
+                                    window_s=1.0, keep_probability=0.5)
+        assert out_t.size == out_u.size
+        assert np.all(out_t >= 0.0) and np.all(out_t < 1.0)
+    # a train whose earliest spike sits far below the midpoint shift goes
+    # negative and must be clipped (never binned as a negative channel)
+    ts_a = np.array([0.0, 0.0])                  # COM 0.0
+    ts_b = np.array([0.1, 0.95])                 # COM 0.525 -> shifted by -0.2625
+    out_t, _ = blend_events(ts_a, np.array([0, 1]), ts_b, np.array([2, 3]),
+                            np.random.default_rng(0), window_s=1.0,
+                            keep_probability=1.0)
+    assert out_t.size == 3                       # only 0.1 -> -0.1625 is dropped
+    assert np.all(out_t >= 0.0)
+
+
+def test_blend_keeps_about_half_of_each_source_on_average():
+    ts_a, us_a, ts_b, us_b = _two_trains(n=100)
+    counts = [
+        blend_events(ts_a, us_a, ts_b, us_b, np.random.default_rng(seed),
+                     window_s=10.0, keep_probability=0.5)[0].size
+        for seed in range(300)
+    ]
+    assert np.mean(counts) == pytest.approx(100.0, abs=4.0)   # 0.5 * 200 spikes
+
+
+def test_blend_rejects_mismatched_or_out_of_range_inputs():
+    ts = np.array([0.1, 0.2])
+    with pytest.raises(ValueError):
+        blend_events(ts, np.array([0]), ts, np.array([0, 1]),
+                     np.random.default_rng(0), window_s=1.0)
+    with pytest.raises(ValueError):
+        blend_events(ts, np.array([0, 1]), ts, np.array([0, 1]),
+                     np.random.default_rng(0), window_s=1.0, keep_probability=2.0)
+    # an out-of-range partner channel is rejected by augment(), not blended
+    cfg = _blend_cfg()
+    with pytest.raises(ValueError):
+        augment(ts, np.array([0, 1]), cfg, np.random.default_rng(0),
+                window_s=1.0, n_inputs=4, partner=(ts, np.array([0, 9])))
+
+
+def test_partner_pool_is_built_from_fit_indices_only(tmp_path, monkeypatch):
+    store, cfg = _toy_store(tmp_path, _blend_cfg(), n_samples=6)
+    labels = store.labels
+    assert list(labels) == [0, 1, 0, 1, 0, 1]
+    fit = np.array([0, 1, 2, 3])
+    store.build_partner_pool(fit)
+    assert store.partner_class_counts() == {
+        int(c): int((labels[fit] == c).sum()) for c in np.unique(labels[fit])
+    }
+    assert np.array_equal(store.partner_pool_indices, fit)
+    assert not np.intersect1d(store.partner_pool_indices, [4, 5]).size
+
+    seen: list[int] = []
+    original = store.sample_events
+
+    def spy(i):
+        seen.append(int(i))
+        return original(int(i))
+
+    monkeypatch.setattr(store, "sample_events", spy)
+    store.set_phase("train")
+    store.set_epoch(0)
+    for i in fit:
+        seen.clear()
+        for _ in range(25):
+            events = store._partner_events(int(i))
+            assert events is not None
+            assert seen and seen[-1] != int(i)              # never its own sample
+            assert labels[seen[-1]] == labels[i]            # same class
+            assert seen[-1] in set(fit.tolist())            # FIT only, never 4/5
+    # the pool is a structure built once, not a per-batch scan: rebuildable and
+    # stable, and it can only ever hold what train_variant handed to it
+    before = store.partner_pool_indices
+    store.build_partner_pool(fit)
+    assert np.array_equal(before, store.partner_pool_indices)
+
+
+def test_partner_selection_draws_nothing_when_off_or_at_probability_zero(tmp_path):
+    off_store, cfg = _toy_store(tmp_path, EventAugmentationConfig(), n_samples=6)
+    off_store.build_partner_pool([0, 1, 2, 3])
+    off_store.set_epoch(0)
+    untouched = np.random.default_rng(int(cfg.seed) * 1000 + 0).random()
+    assert off_store._partner_events(0) is None
+    assert off_store._partner_events(0) is None
+    assert off_store._aug_rng.random() == untouched
+
+    zero_cfg = _cfg(augmentation=_blend_cfg(probability=0.0))
+    zero = SHDEventStore(off_store.path, zero_cfg)
+    zero.build_partner_pool([0, 1, 2, 3])
+    zero.set_epoch(0)
+    untouched = np.random.default_rng(int(zero_cfg.seed) * 1000 + 0).random()
+    assert zero._partner_events(0) is None
+    assert zero._aug_rng.random() == untouched
+
+
+def test_blend_never_runs_for_val_or_test_but_does_in_training(tmp_path):
+    store, cfg = _toy_store(tmp_path, _blend_cfg(keep_probability=1.0), n_samples=6)
+    plain = SHDEventStore(store.path, _cfg())
+    store.build_partner_pool([0, 1, 2, 3])          # FIT only, as train_variant does
+    store.set_augmentation_indices([0, 1, 2, 3])
+    idx = np.array([2, 3])                          # FIT samples, class 0 and 1
+
+    store.set_phase("val")
+    assert np.array_equal(store.batch(idx), plain.batch(idx))
+    store.set_phase("test")
+    assert np.array_equal(store.batch(idx), plain.batch(idx))
+    store.set_phase("train")
+    assert not np.array_equal(store.batch(idx), plain.batch(idx))
+    # a VAL sample never leaves the unaugmented path, even in the training phase
+    store.set_phase("train")
+    assert np.array_equal(store.batch(np.array([4])), plain.batch(np.array([4])))
+
+
+def test_eval_guard_holds_with_blending_enabled(tmp_path):
+    store, cfg = _toy_store(tmp_path, _blend_cfg(keep_probability=1.0), n_samples=6)
+    store.build_partner_pool([0, 1, 2, 3])
+    store.set_augmentation_indices([0, 1, 2, 3])
+    val = _split(store, "val", [4])
+    assert_eval_batches_unchanged(store, val, cfg, phase="train")   # must not raise
+
+    leaky = SHDEventStore(store.path, cfg)
+    leaky.build_partner_pool([0, 1, 2, 3, 4])      # leaky pool, deliberately
+    leaky.set_augmentation_indices([0, 1, 2, 3, 4])
+    leaky.set_phase("train")
+    with pytest.raises(AssertionError):
+        assert_eval_batches_unchanged(leaky, val, cfg, phase="train")
+
+
+def test_stats_report_the_partner_pool(tmp_path):
+    store, _ = _toy_store(tmp_path, _blend_cfg(), n_samples=6)
+    assert store.stats(sample=2)["event_blend_partner_pool"] == {
+        "built": False, "classes": 0, "samples": 0
+    }
+    store.build_partner_pool([0, 1, 2, 3])
+    assert store.stats(sample=2)["event_blend_partner_pool"] == {
+        "built": True, "classes": 2, "samples": 4
+    }
