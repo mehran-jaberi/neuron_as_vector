@@ -167,7 +167,9 @@ class BinnedCache:
         bs = max(1, int(getattr(cfg, "batch_size", 128)))
         for start in range(0, shape[0], bs):
             idx = np.arange(start, min(start + bs, shape[0]), dtype=np.int64)
-            dense = store.batch(idx)                       # authoritative values
+            dense = store.batch(idx, include_tail=False)   # authoritative values,
+            # without the empty silence tail: the cache stores the stimulus
+            # window only, and SHDEventStore.batch appends the tail on read.
             if dt == np.uint8:
                 block = (dense > 0).astype(np.uint8)
             else:

@@ -72,6 +72,10 @@ class SHDEventStore:
         self.window_s = float(cfg.window_s)
         self.binary = bool(cfg.binary_input)
         self.cells = self.n_bins * self.n_inputs
+        # Optional silence tail: all-zero input bins appended after the stimulus
+        # in batch() (never stored in the caches), so the recurrent dynamics can
+        # settle before the spike-count readout.
+        self.tail_steps = int(cfg.tail_steps)
 
         with h5py.File(self.path, "r") as fh:
             self.labels = np.asarray(fh["labels"], dtype=np.int64)
@@ -303,33 +307,47 @@ class SHDEventStore:
         return self._bin_events(ts, us)
 
     # ------------------------------------------------------------------ #
-    def batch(self, indices: np.ndarray) -> np.ndarray:
-        """Dense float32 input batch ``(B, T, C)`` (counts, or 0/1 when binary)."""
-        if self.binned is not None:
-            if not any(self.augmentation_applies(int(i)) for i in indices):
-                # pre-binned cache: bit-identical values, built from this same path
-                return self.binned.batch(indices)
-            # augmentation became active after the dense cache was built: fall
-            # through to the on-the-fly path rather than reuse frozen data.
-        B = len(indices)
-        parts = []
-        for b, i in enumerate(indices):
-            if self.augmentation_applies(int(i)):
-                c = self._augmented_codes(int(i))
+    def batch(self, indices: np.ndarray, include_tail: bool = True) -> np.ndarray:
+        """Dense float32 input batch ``(B, T, C)`` (counts, or 0/1 when binary).
+
+        ``T`` is ``timing.total_steps``: when ``timing.silence_tail_ms`` is
+        non-zero, the last ``tail_steps`` bins are all-zero and the network keeps
+        running after the stimulus in every phase.  ``include_tail=False``
+        returns only the stimulus window (used to build the pre-binned cache, so
+        the cache stays un-augmented and valid for any tail length).
+        """
+        if self.binned is not None and not any(
+            self.augmentation_applies(int(i)) for i in indices
+        ):
+            # pre-binned cache: bit-identical values, built from this same path.
+            # (augmentation active after the dense cache was built falls through
+            # to the on-the-fly path rather than reuse frozen data)
+            out = self.binned.batch(indices)
+        else:
+            B = len(indices)
+            parts = []
+            for b, i in enumerate(indices):
+                if self.augmentation_applies(int(i)):
+                    c = self._augmented_codes(int(i))
+                else:
+                    c = self.sample_codes(int(i))
+                if c.size:
+                    parts.append(c.astype(np.int64) + b * self.cells)
+            if parts:
+                flat = np.concatenate(parts)
+                dense = np.bincount(flat, minlength=B * self.cells)
             else:
-                c = self.sample_codes(int(i))
-            if c.size:
-                parts.append(c.astype(np.int64) + b * self.cells)
-        if parts:
-            flat = np.concatenate(parts)
-            dense = np.bincount(flat, minlength=B * self.cells)
-        else:
-            dense = np.zeros(B * self.cells, dtype=np.int64)
-        out = dense.reshape(B, self.n_bins, self.n_inputs)
-        if self.binary:
-            out = (out > 0).astype(np.float32)
-        else:
-            out = out.astype(np.float32)
+                dense = np.zeros(B * self.cells, dtype=np.int64)
+            out = dense.reshape(B, self.n_bins, self.n_inputs)
+            if self.binary:
+                out = (out > 0).astype(np.float32)
+            else:
+                out = out.astype(np.float32)
+        if include_tail and self.tail_steps > 0:
+            zeros = np.zeros(
+                (out.shape[0], self.tail_steps, self.n_inputs), dtype=out.dtype
+            )
+            out = np.concatenate((out, zeros), axis=1)
         return out
 
     def labels_of(self, indices: np.ndarray) -> np.ndarray:

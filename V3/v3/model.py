@@ -911,8 +911,9 @@ class VectorNeuronPopulation(nn.Module):
         B, T, C = x.shape
         if C != self.n_inputs:
             raise ValueError(f"expected {self.n_inputs} input channels, got {C}")
-        if T > self.cfg.n_bins:
-            raise ValueError(f"expected at most {self.cfg.n_bins} timesteps, got {T}")
+        max_steps = int(self.cfg.total_steps)   # stimulus bins + optional silence tail
+        if T > max_steps:
+            raise ValueError(f"expected at most {max_steps} timesteps, got {T}")
         # learnable per-input-channel conduction delays, applied to the whole
         # sequence *before* it is split into segments (see ``delayed_input``)
         x = self.delayed_input(x)

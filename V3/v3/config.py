@@ -686,6 +686,16 @@ class TimingConfig:
     ``alpha = dt/tau`` changes with it: 2 ms -> ``alpha = 2/tau``,
     4 ms -> ``alpha = 4/tau``.
 
+    ``silence_tail_ms`` optionally appends that many milliseconds of *empty*
+    input (all-zero bins) after the stimulus, so the recurrent dynamics can
+    settle before the spike-count readout::
+
+        total_steps = num_time_steps + tail_steps
+
+    The tail must convert to a whole number of bins and is capped at 10 % of
+    ``sequence_duration_ms``.  The default ``0.0`` appends nothing, leaving the
+    tensor shape and every existing result bit-identical.
+
     Defaults are the **2 ms** discretization
     (1000 ms / 2 ms -> 500 steps, ``alpha = 0.1`` at ``tau = 20 ms``).  The
     historical 4 ms reference (250 steps, ``alpha = 0.2``) is still available by
@@ -694,10 +704,21 @@ class TimingConfig:
 
     sequence_duration_ms: float = 1000.0
     time_bin_ms: float = 2.0
+    silence_tail_ms: float = 0.0
 
     @property
     def num_time_steps(self) -> int:
         return int(round(float(self.sequence_duration_ms) / float(self.time_bin_ms)))
+
+    @property
+    def tail_steps(self) -> int:
+        """Whole all-zero bins appended after the stimulus (0 by default)."""
+        return int(round(float(self.silence_tail_ms) / float(self.time_bin_ms)))
+
+    @property
+    def total_steps(self) -> int:
+        """Number of dynamical steps actually run: stimulus bins + silence tail."""
+        return int(self.num_time_steps) + int(self.tail_steps)
 
     @property
     def simulation_dt_ms(self) -> float:
@@ -720,6 +741,23 @@ class TimingConfig:
             )
         if round(steps) < 1:
             raise ValueError("timing must yield at least one time step")
+        tail_ms = float(self.silence_tail_ms)
+        if not math.isfinite(tail_ms):
+            raise ValueError("timing.silence_tail_ms must be finite")
+        if tail_ms < 0.0:
+            raise ValueError("timing.silence_tail_ms must be >= 0")
+        tail_steps = tail_ms / float(self.time_bin_ms)
+        if abs(tail_steps - round(tail_steps)) > 1e-9:
+            raise ValueError(
+                "timing.silence_tail_ms / time_bin_ms must be an integer number of "
+                f"steps, got {self.silence_tail_ms}/{self.time_bin_ms} = {tail_steps}"
+            )
+        max_tail_ms = 0.10 * float(self.sequence_duration_ms)
+        if tail_ms > max_tail_ms + 1e-9:
+            raise ValueError(
+                "timing.silence_tail_ms must be <= 10 % of sequence_duration_ms "
+                f"({max_tail_ms:g} ms), got {tail_ms:g} ms"
+            )
 
     @classmethod
     def from_dict(cls, data: dict, strict: bool = False) -> "TimingConfig":
@@ -1007,6 +1045,16 @@ class V3Config:
     @property
     def num_time_steps(self) -> int:
         return self.n_bins
+
+    @property
+    def tail_steps(self) -> int:
+        """All-zero bins appended after the stimulus (0 when the tail is off)."""
+        return int(self.timing.tail_steps)
+
+    @property
+    def total_steps(self) -> int:
+        """Stimulus bins + silence tail: the T the model actually runs."""
+        return int(self.timing.total_steps)
 
     @property
     def dt_ms(self) -> float:
