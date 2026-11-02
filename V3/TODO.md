@@ -79,27 +79,47 @@ active interface; if a feature is implemented it works, if it is not it lives he
 
 ## Model
 
-- [ ] alternative vector dynamics (e.g. explicit vector membrane + adaptation
-      channels instead of a single leaky tanh state)
+- [x] alternative vector dynamics (e.g. explicit vector membrane + adaptation
+      channels instead of a single leaky tanh state) — **tested 2026-11-02**
+      (M1: adaptation channel added to the threshold, leaky tanh kept, branch
+      `feat/m1-adaptation`): 5-epoch TEST **81.85 % vs 76.15 % baseline
+      (+5.70 pp)**, the only feature with a screening gain that survived the
+      re-screen. Not yet confirmed at 20 epochs.
 - [ ] alternative neuron-interaction mechanisms
       - full per-neuron `D x D` recurrent operator (currently shared + rank-R)
       - attention/gating over the population signal instead of `c_i(t) * h(t)`
       - delay lines / axonal conduction delays between neurons
-- [ ] per-neuron emission matrices (currently one shared `W_emit`)
-- [ ] trainable `tau` (leak) per neuron or per coordinate
-- [ ] learnable initial state `z_i(0)` instead of zeros
-- [ ] >1 spiking mechanism (currently Heaviside + fast-sigmoid surrogate)
+- [x] per-neuron emission matrices (currently one shared `W_emit`) — **tested
+      2026-11-02, dead** (M5 rank-8 correction, branch `feat/m5-emission`):
+      5-epoch 75.80 % (−0.35 pp) for +520 k params
+- [x] trainable `tau` (leak) per neuron or per coordinate — **tested 2026-11-02,
+      no effect** (M2, `feat/m2-tau-z0`): the learned `alpha` stayed at 0.098
+      (init 0.1, per-neuron range 0.078–0.110) even after 20 epochs
+- [x] learnable initial state `z_i(0)` instead of zeros — **tested 2026-11-02,
+      adopted** (M2): 20-epoch TEST **85.20 % vs 82.51 % (+2.69 pp)**; the gain
+      comes from `z0` (mean |z0| 0.054), not from `alpha`
+- [ ] >1 spiking mechanism (currently Heaviside + fast-sigmoid surrogate) —
+      arctan tested (M6), diverged at `surrogate_alpha=1.0` in fp16 (see
+      `KNOWN_ISSUES.md`); boxcar / exponential / SLAYER still untested
 - [ ] state normalisation / homeostasis other than the firing-rate regulariser
 - [ ] multi-layer populations (V3 nests only one vector-neuron layer)
 
 ## Training
 
 - [ ] alternative surrogate gradients (boxcar, exponential, arctan, SLAYER-`alpha`)
+      — arctan tested 2026-11-02: diverged (197 Hz firing, AMP gradient-scale
+      floor, loss explosion) at `surrogate_alpha=1.0`; needs alpha < 1 / clipping
+      before it can be judged. The others are untested.
 - [ ] alternative optimisers (AdamW with decoupled decay, SGD+momentum, LAMB)
+      — AdamW (`weight_decay=0.01`) tested 2026-11-02, dead: 75.93 % (−0.22 pp)
 - [ ] per-group learning rates (state dynamics vs readout)
+      — readout LR ×3 tested 2026-11-02, dead: 75.97 % (−0.18 pp)
 - [ ] longer training schedules / early stopping on validation loss
-- [ ] data augmentation (time-shift, channel dropout, event jitter/sub-sampling),
+- [x] data augmentation (time-shift, channel dropout, event jitter/sub-sampling),
       which is how the published SHD numbers close the train/test speaker gap
+      — implemented 2026-11-01 (raw events, before binning) and screened
+      2026-11-01/02; dropout 0.10 is the only op that survived to 20 epochs
+      (+0.75 pp, not distinguishable) and the ops do not stack
 - [ ] truncated BPTT with overlap, or forward-mode/hebbian alternatives
 - [ ] `torch.compile` / fused per-step kernel (the Python timestep loop is the
       current throughput bottleneck: ~75 samples/s at N=64, D=1000, T=250)
@@ -114,29 +134,32 @@ binary tensor, and never on VAL or official TEST.
 raw SHD event stream → augmentation → 2-ms binning → 500 × 700 → V3
 ```
 
-- [ ] event-augmentation module (one reusable `augment(events, config, rng)` API,
+**Implemented 2026-11-01** (`V3/v3/event_augmentation.py`, `V3/v3/control.py`,
+38-cell notebook); all five ops measured, results in `INVESTIGATION.md`.
+
+- [x] event-augmentation module (one reusable `augment(events, config, rng)` API,
       e.g. `V3/v3/event_augmentation.py`) — no per-augmentation loaders, no
       duplicated binning, existing binning consumes the augmented events
-- [ ] **A. timestamp jitter**: `t_i' = t_i + ε_i`, `ε_i ~ N(0, σ_t²)`,
+- [x] **A. timestamp jitter**: `t_i' = t_i + ε_i`, `ε_i ~ N(0, σ_t²)`,
       `time_jitter_std_ms` configurable (start at 0.5), events leaving the
       1000 ms window follow the existing windowing policy, fresh realisation per
       training sample
-- [ ] **B. event dropout**: drop each raw event with
+- [x] **B. event dropout**: drop each raw event with
       `event_dropout_probability`, labels preserved, source data never mutated
-- [ ] **C. event insertion**: add artificial events with valid SHD channels
+- [x] **C. event insertion**: add artificial events with valid SHD channels
       inside the 1000 ms window, parameterised by an unambiguous insertion
       amount/probability
-- [ ] **D. global time shift**: `t_i' = t_i + Δ`, symmetric `Δ` bounded by
+- [x] **D. global time shift**: `t_i' = t_i + Δ`, symmetric `Δ` bounded by
       `global_time_shift_max_ms`, sequence duration unchanged
-- [ ] **E. channel dropout**: choose channels, remove all their events for that
+- [x] **E. channel dropout**: choose channels, remove all their events for that
       sample, then bin (channel identities, not the post-binning tensor)
-- [ ] training-only phase gating: FIT on, VAL off, TEST off — must not leak when
+- [x] training-only phase gating: FIT on, VAL off, TEST off — must not leak when
       the same dataset objects are reused for evaluation
-- [ ] config block + CLI/notebook wiring, disabled by default (`mode: none`
+- [x] config block + CLI/notebook wiring, disabled by default (`mode: none`
       equivalent must stay bit-identical to the unaugmented baseline)
-- [ ] tests: synthetic-event unit tests per augmenter, off-by-default
+- [x] tests: synthetic-event unit tests per augmenter, off-by-default
       bit-identical test, phase-gating test
-- [ ] control panel: temporary overrides equivalent to `--override` (epochs,
+- [x] control panel: temporary overrides equivalent to `--override` (epochs,
       timing, `N`, `D`, state regularization, augmentation, seed), constructing a
       transient config layer on top of the YAML default — not a second config system
 
@@ -148,7 +171,12 @@ raw SHD event stream → augmentation → 2-ms binning → 500 × 700 → V3
     - SGD + momentum
     - LAMB
 - [ ] more `N` values (N=16/32/128/256) to separate "vector state" from "more units"
-- [ ] more `D` values (D=1, 4, 16, 64, 256, 1000, 4096) - the size of the effect
+      — N=100 tested 2026-11-01: 5-epoch 79.64 %, 20-epoch + dropout 0.10
+      **88.12 %**; N=16/32/128/256 untested
+- [x] more `D` values (D=1, 4, 16, 64, 256, 1000, 4096) - the size of the effect
+      — 5-epoch sweep 2026-10-25: D=4 57.20 %, 16 63.74 %, 64 68.60 %,
+      256 77.61 %, 1000 76.15 % (D=4096 untested; D=2000/500 measured earlier
+      by the PI, no gain / worse)
 - [ ] multiple seeds per configuration (the single-seed result has no error bar)
 - [x] `tau_ms` / `dt_ms` / `bin_ms` sweep (currently T=500 x 2 ms fixed)
 - [ ] speaker-held-out validation (the current VAL split is stratified, not
@@ -156,6 +184,17 @@ raw SHD event stream → augmentation → 2-ms binning → 500 × 700 → V3
 - [ ] learning-curve / dataset-size scaling
 - [ ] leaderboard optimisation (this is a first working implementation, not a
       competitive SHD entry)
+
+### Final experiments (PI, 2026-11-02 — run these once the architecture is frozen)
+
+Longer schedules are deferred: every 20-epoch run reaches 99.9–100 % FIT
+accuracy, so the schedule is not the binding constraint (`KNOWN_ISSUES.md` #7).
+Revisit only if the frozen architecture underfits at 20 epochs.
+
+- [ ] longer training schedules / early stopping on validation loss (deferred)
+- [ ] `bf16` vs `fp32` vs `fp16` **accuracy** comparison at the frozen
+      architecture (accuracy, not throughput)
+- [ ] multi-seed error bars on the final architecture
 
 ## Performance
 
@@ -204,3 +243,22 @@ Done 2026-10-26 on the frozen 20-epoch checkpoint — see `ANALYSIS.md`.
 - [x] CI entry point that runs the quick configuration end-to-end
       (`.github/workflows/tests.yml`: `uv sync --locked --group dev` + pytest on
       CPU; not yet executed on GitHub — the repo has not been pushed)
+
+## Feature-branch ledger (2026-11-02)
+
+Six feature branches were cut from `43741d9`, screened at 5 epochs on the
+official TEST set (n=2264, SE ±0.87 pp), and re-screened after their bugs were
+fixed. Verdicts are on accuracy alone; "dead" means the branch is not merged and
+is kept only as history.
+
+| branch | feature | 5-ep first | 5-ep re-screen | verdict |
+|---|---|---|---|---|
+| `feat/m1-adaptation` | adaptive threshold (SFA), gain 0.1 | 75.49 % (gain 0) | **81.85 %** | **alive** — +5.70 pp, needs a 20-epoch run |
+| `feat/m2-tau-z0` | per-neuron alpha + learnable z0 | 76.86 % | — (20 ep instead) | **alive** — 20-epoch **85.20 %**, +2.69 pp; the gain is `z0` |
+| `feat/m3-reset` | multiplicative spike reset | 75.53 % (beta 0.5) | 75.44 % (beta 0.02) | **dead** — fixed but no gain |
+| `feat/m4-delays` | learnable input delays 0–20 ms | 76.15 % (zero-grad bug) | 78.14 % (fixed) | **dead** — +1.99 pp is inside twice the SE and the feature is 700 extra parameters; not pursued |
+| `feat/m5-emission` | per-neuron rank-8 emission | 75.80 % | — | **dead** — −0.35 pp for +520 k params |
+| `feat/m6-optimizer` | arctan surrogate / AdamW / readout LR | 20.67 / 75.93 / 75.97 % | — | **dead** — arctan diverged at alpha=1.0 (stability bug, not the surrogate); AdamW and readout-LR are neutral-to-worse |
+
+Baseline row for every comparison: `v3_vector_d1000`, 5 epochs, 1724/2264 =
+76.15 %, or 20 epochs, 1868/2264 = 82.51 %.

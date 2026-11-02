@@ -284,3 +284,50 @@ single ops**. Paired bootstrap: combo − dropout(0.10) = **−2.21 pp, 95 % CI
 Verdict: **the two weak ops do not stack.** Two individually positive 5-epoch
 deltas combine to zero; stronger evidence that the 5-epoch deltas were
 run-to-run fit noise rather than a mechanism. No commit yet in this round.
+
+### 2026-11-02 — feature branches: eight-arm screen, bug fixes, re-screen
+
+Six feature branches off `43741d9`, each implementing one TODO feature behind a
+flag that keeps the off path bit-identical. First screen ran the branches' own
+code at 5 epochs (N=64, D=1000, seed 0, TEST n=2264). Three of the arms were
+then found to be broken as implemented and fixed; the fixed arms were re-run.
+
+**First screen (5 epochs, TEST, baseline `v3_vector_d1000` 1724 = 76.15 %):**
+M1 adaptation 1709 = 75.49 %; M2 tau+z0 **1740 = 76.86 %**; M3 reset 1710 =
+75.53 %; M4 delays 1724 = 76.15 %; M5 emission 1716 = 75.80 %; M6 arctan
+468 = 20.67 %; M6 AdamW+wd 1719 = 75.93 %; M6 readout-LR ×3 1720 = 75.97 %.
+
+**Three diagnoses.** (a) M4 was a literal no-op: `clamp(delay, 0, max)` at an
+initialisation of exactly 0.0 has **zero gradient** — proven in isolation. Fixed
+by an unclamped sigmoid parameterisation with fractional (linear-interpolation)
+delays and init U[0.5, 10] ms — commit `7eeb0bd`. (b) M3 started at beta=0.5,
+which halves the whole state of a spiking neuron from step 0; the network never
+recovered (fit 83.4 %), and the learned beta never left 0.46–0.56. Fixed by a
+sigmoid parameterisation with `beta_init=0.02`, `beta_max=0.9` — commit
+`52c3495`. (c) M1's adaptation gain started at 0, so the adaptation current was
+~3 % of the threshold and inert; the trained weight was 0.008 (max 0.043) against
+theta ~0.29. Default moved to `gain_init=0.1` — commit `e2cf092`.
+
+**Re-screen of the fixed arms (5 epochs, TEST):**
+
+| arm | fit | val | test | Δ vs baseline |
+|---|---|---|---|---|
+| M1 adaptation, gain 0.1 | 91.29 | 89.34 | **1853 = 81.85 %** | **+5.70 pp** |
+| M3 reset, beta init 0.02 | — | — | 1708 = 75.44 % | −0.71 pp |
+| M4 delays, fixed | 96.62 | 93.50 | 1769 = 78.14 % | +1.99 pp |
+
+M1's train/val accuracy is *lower* than the baseline's (91.3/89.3 vs 96.2/93.0)
+while its TEST is 5.7 pp higher: adaptation slows fitting and regularises. M4's
+gain is ~2.3 SE — suggestive, not resolved, and it costs 700 parameters. M3 is
+dead even after the fix.
+
+**M2 at 20 epochs** (`v3_m2_tau_z0_ep20`, N=64, D=1000, 2,089,504 params):
+fit 100 %, val 96.45 %, TEST **1929/2264 = 85.20 %** (+2.69 pp vs 82.51 %).
+The learned `alpha` did **not** move (sigmoid(raw) = 0.098, range 0.078–0.110),
+so the gain is entirely the learnable initial state `z0` (mean |z0| = 0.054,
+max 0.29) — a learned per-neuron, per-coordinate offset. Caveats: single seed,
+and M2 was the best of six arms at 5 epochs, so selection is not controlled.
+
+**Verdicts** (accuracy only): M1 alive and the best screening gain; M2 alive and
+confirmed at 20 epochs via `z0`; M3 dead; M4 not pursued; M5 dead; M6 dead. The
+full branch ledger is in `V3/TODO.md`.
