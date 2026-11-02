@@ -134,15 +134,30 @@ class TwoStageConfig:
         inner = tanh(mix2 + drive)
         z    <- z + alpha * (tanh(mix + lam * inner) - z)
 
-    ``lam`` is a learned scalar initialised to ``lam_init`` (1.0).  ``w_down2``
-    is initialised **exactly like** ``w_down`` (``randn(D, R2) / sqrt(D)``, same
-    generator), and ``w_up2`` like ``w_up`` (``randn(R2, D) * 0.5 / sqrt(R2)``),
-    so the inner stage starts with the same mixing gain as the outer one: a zero
-    or scaled-down init would leave it -- and ``lam`` -- inert from step 0.
+    The gain is **not** a free scalar.  The optimised quantity is a raw scalar
+    ``lam_raw`` and the gain is::
+
+        lam = lam_min + (lam_max - lam_min) * sigmoid(lam_raw)
+
+    with ``0 < lam_min < lam_init < lam_max``.  ``lam_raw`` is warm-started at
+    ``logit((lam_init - lam_min) / (lam_max - lam_min))``, so the stage starts at
+    ``lam = lam_init`` (1.0 by default).  Since ``lam_min > 0`` and the sigmoid
+    lies in ``(0, 1)``, ``lam`` is always finite and inside
+    ``(lam_min, lam_max)``: training can scale the inner drive, but it can never
+    multiply it away (the previous free ``lam`` could reach 0 or turn negative
+    and silently switch the stage -- and the spikes -- off).
+
+    ``w_down2`` is initialised **exactly like** ``w_down``
+    (``randn(D, R2) / sqrt(D)``, same generator), and ``w_up2`` like ``w_up``
+    (``randn(R2, D) * 0.5 / sqrt(R2)``), so the inner stage starts with the same
+    mixing gain as the outer one: a zero or scaled-down init would leave it --
+    and ``lam`` -- inert from step 0.
     """
 
     enabled: bool = False
     rank: int = 64
+    lam_min: float = 0.1
+    lam_max: float = 2.0
     lam_init: float = 1.0
 
     @property
@@ -153,8 +168,13 @@ class TwoStageConfig:
     def validate(self) -> None:
         if int(self.rank) < 1:
             raise ValueError("two_stage.rank must be >= 1")
-        if not math.isfinite(float(self.lam_init)):
-            raise ValueError("two_stage.lam_init must be finite")
+        for name in ("lam_min", "lam_init", "lam_max"):
+            if not math.isfinite(float(getattr(self, name))):
+                raise ValueError(f"two_stage.{name} must be finite")
+        if float(self.lam_min) <= 0.0:
+            raise ValueError("two_stage.lam_min must be > 0")
+        if not float(self.lam_min) < float(self.lam_init) < float(self.lam_max):
+            raise ValueError("two_stage must satisfy lam_min < lam_init < lam_max")
 
     @classmethod
     def from_dict(cls, data: dict, strict: bool = False) -> "TwoStageConfig":
@@ -804,12 +824,13 @@ def parameter_groups(cfg: V3Config) -> dict:
         "w_cls": N * cfg.n_classes,
     }
     if cfg.two_stage.active:
-        # the second mixer is an independent rank-R2 pair plus the scalar lam;
+        # the second mixer is an independent rank-R2 pair plus the raw scalar
+        # lam_raw (the effective lam is a sigmoid of it, so still one parameter);
         # absent by default, so the baseline budget is unchanged.
         R2 = min(int(cfg.two_stage.rank), D)
         groups["w_down2"] = D * R2
         groups["w_up2"] = R2 * D
-        groups["lam"] = 1
+        groups["lam_raw"] = 1
     groups["total"] = sum(groups.values())
     return groups
 

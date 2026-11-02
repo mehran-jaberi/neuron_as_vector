@@ -47,7 +47,13 @@ a second ``tanh`` *before* the state update::
        inner   = tanh( m2_i(t) + d_i(t) )
        z_i(t+1) = (1 - alpha) z_i(t) + alpha * tanh( m_i(t) + lam * inner )
 
-``lam`` is a learned scalar initialised to 1.0.  This adds depth *inside* one
+``lam`` is not a free scalar.  The optimised quantity is a raw scalar
+``lam_raw`` and the gain is
+``lam = lam_min + (lam_max - lam_min) * sigmoid(lam_raw)``, warm-started at
+``lam = lam_init`` (1.0 by default).  With ``0 < lam_min < lam_init < lam_max``
+the gain always lies inside ``(lam_min, lam_max)``: finite and strictly positive
+for every finite ``lam_raw``, so training can scale the inner stage but can
+never switch its drive off.  This adds depth *inside* one
 timestep without cutting the state's connection to its own history: ``z_i(t)``
 is still the only recurrent variable, and the outer mixing ``m_i(t)`` and the
 drive ``d_i(t)`` are unchanged.  With ``enabled = False`` no parameter is
@@ -125,6 +131,19 @@ def surrogate_spike(u: torch.Tensor, beta: float = 4.0, gamma: float = 1.0) -> t
     return SurrogateSpike.apply(u, beta, gamma)
 
 
+def _lam_raw_init(lam_init: float, lam_min: float, lam_max: float) -> float:
+    """Raw logit whose sigmoid maps back to the warm-start ``lam_init``.
+
+    ``lam_init`` must lie strictly inside ``(lam_min, lam_max)``, which
+    ``TwoStageConfig.validate`` enforces; the ratio is still clamped away from
+    the open interval's endpoints so an extreme (but finite) setting cannot
+    produce an infinite raw parameter.
+    """
+    p = (float(lam_init) - float(lam_min)) / (float(lam_max) - float(lam_min))
+    p = min(max(p, 1e-6), 1.0 - 1e-6)
+    return math.log(p / (1.0 - p))
+
+
 # ---------------------------------------------------------------------- #
 class VectorNeuronPopulation(nn.Module):
     """``N`` neurons, each with a trainable ``D``-dimensional dynamical state."""
@@ -170,16 +189,23 @@ class VectorNeuronPopulation(nn.Module):
         # registry parameter budget).  ``w_down2`` uses the *same* scheme and
         # scale as ``w_down``, and ``w_up2`` the same as ``w_up``: a zero or
         # shrunken init would leave the inner stage -- and ``lam`` -- inert at
-        # step 0, the failure mode this feature has to avoid.
+        # step 0, the failure mode this feature has to avoid.  The gain itself
+        # is a sigmoid of ``lam_raw`` (never a free scalar), so it cannot be
+        # trained to 0 or below.
         ts = cfg.two_stage
         self.w_down2: nn.Parameter | None = None   # (D, R2) inner down-projection
         self.w_up2: nn.Parameter | None = None     # (R2, D) inner up-projection
-        self.lam: nn.Parameter | None = None       # scalar gain of the inner stage
+        self.lam_raw: nn.Parameter | None = None   # scalar logit of the inner-stage gain
         if ts.active:
             R2 = int(min(int(ts.rank), D))
             self.w_down2 = nn.Parameter(rnd(D, R2, scale=1.0 / math.sqrt(D)))
             self.w_up2 = nn.Parameter(rnd(R2, D, scale=0.5 / math.sqrt(R2)))
-            self.lam = nn.Parameter(torch.tensor(float(ts.lam_init), dtype=torch.float32))
+            self.lam_raw = nn.Parameter(
+                torch.tensor(
+                    _lam_raw_init(ts.lam_init, ts.lam_min, ts.lam_max),
+                    dtype=torch.float32,
+                )
+            )
 
         # expose the analytic flag so the class itself never hard-codes D > 1
         self.is_scalar_baseline = D == 1
@@ -238,19 +264,35 @@ class VectorNeuronPopulation(nn.Module):
         )
 
     # ------------------------------------------------------------------ #
+    def effective_lam(self) -> torch.Tensor:
+        """Effective inner-stage gain in fp32: ``lam_min + span * sigmoid(raw)``.
+
+        Bounded by construction to ``(lam_min, lam_max)`` (up to fp32 saturation
+        exactly at the endpoints for ``|lam_raw|`` in the hundreds), hence
+        finite and strictly positive: no gradient can switch the stage off.
+        Only defined when ``two_stage.enabled`` is true.
+        """
+        if self.lam_raw is None:
+            raise RuntimeError("two_stage is disabled: effective_lam() is undefined")
+        ts = self.cfg.two_stage
+        lo, hi = float(ts.lam_min), float(ts.lam_max)
+        return lo + (hi - lo) * torch.sigmoid(self.lam_raw.float())
+
     def two_stage_weights(self):
         """Casted ``(w_down2, w_up2, lam)`` of the second stage, or ``None``.
 
+        ``lam`` is the *effective* gain
+        (:meth:`effective_lam`, cast to the state dtype); ``lam_raw`` itself is
+        never returned, so the update line sees a single bounded scalar.
         ``None`` whenever ``two_stage.enabled`` is false, in which case the
         timestep update runs the baseline single-mixer expression untouched.
         Kept as a method (not part of :meth:`_weights`) so the baseline weight
         tuple and its unpacking are unchanged.
         """
-        w_down2, w_up2, lam = self.w_down2, self.w_up2, self.lam
-        if w_down2 is None or w_up2 is None or lam is None:
+        if self.w_down2 is None or self.w_up2 is None or self.lam_raw is None:
             return None
         dt = self.state_dtype
-        return w_down2.to(dt), w_up2.to(dt), lam.to(dt)
+        return self.w_down2.to(dt), self.w_up2.to(dt), self.effective_lam().to(dt)
 
     # ------------------------------------------------------------------ #
     def _segment(
@@ -292,7 +334,8 @@ class VectorNeuronPopulation(nn.Module):
                 z = z + alpha * (torch.tanh(mix + drive) - z)
             else:
                 # second, independent rank-R2 mixer + tanh, at the same state;
-                # `drive` is shared and `lam` (init 1.0) gates the inner stage.
+                # `drive` is shared and `lam` (bounded sigmoid gain, init 1.0)
+                # gates the inner stage.
                 mix2 = (z @ w_down2) @ w_up2
                 inner = torch.tanh(mix2 + drive)
                 z = z + alpha * (torch.tanh(mix + lam * inner) - z)
