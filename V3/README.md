@@ -12,8 +12,7 @@
 > **Current experimental reference.** $N=64$, $D=1000$, 2,025,440 parameters,
 > **2 ms** discretization ($T=500$, $\alpha=0.1$), 20 epochs: **82.51%**
 > (1868/2264), recorded in the executed `V3_SHD_experiment.ipynb` and in the
-> registry run `2026-10-02_14-31-15`. The previous 4 ms reference ($T=250$,
-> $\alpha=0.2$) was 79.81% (1807/2264). Imprecision screening is compared against
+> registry run `2026-10-02_14-31-15`. Imprecision screening is compared against
 > this 82.51% reference; see [§11](#11-controlled-state-imprecision--the-run-registry).
 
 This folder is an independent experiment. It is **not** an extension of V2 and
@@ -208,9 +207,8 @@ chunked gradient checkpointing (`grad_checkpoint_chunks`), which stores the stat
 only at chunk boundaries. Measured peak over a full epoch at the **default 2 ms**
 discretization, `N=64, D=1000, T=500, batch=128`: **2284 MiB allocated /
 2328 MiB reserved**, ≈ 3.5 s per batch (the full 20-epoch training run took
-4243.5 s). The earlier 4 ms reference (`T=250`) measured 1108 MiB allocated /
-1148 MiB reserved and ≈ 2.2 s per batch; halving the time step doubles `T` and
-roughly doubles both time and memory per epoch.
+4243.5 s). Halving the time step doubles `T` and roughly doubles both time and
+memory per epoch.
 
 Two traps, both measured on the 6 GiB RTX 3060 Laptop:
 
@@ -576,13 +574,9 @@ VECTOR  D=1000  N=64    2,025,440 params   test  1868/2264 =  82.51%
 
 Verified from the executed `V3_SHD_experiment.ipynb` (the stored test evaluation
 cells) and the registry run `2026-10-02_14-31-15`. This is the number every
-imprecision screening run is compared against. The previous 4 ms reference
-(250 steps, alpha 0.2, same 20 epochs) measured **79.81%** (1807/2264); older
-measured points (all single-seed): $D=1000$ at 3 epochs (4 ms) = 71.78%; scalar
-control $D=1$ at 3 epochs = 26.55% and at 20 epochs (2 ms) = 49.43%; $N=128$, $D=1000$
-(4 ms) = 79.24%; $N=64$, $D=2000$ (4 ms) = 77.96%. Doubling $N$ (64→128) or $D$
-(1000→2000) did not improve on the reference, whereas halving the time step
-(4 ms → 2 ms) did (+2.70 points).
+imprecision screening run is compared against. The size-matched scalar control
+($D=1$, $N=64$, 6,335 parameters) reaches 49.43% at 20 epochs under the same
+protocol, which is the comparison that matters for the width claim.
 
 ## 13. Temporal resolution and data order
 

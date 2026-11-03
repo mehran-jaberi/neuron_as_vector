@@ -12,9 +12,7 @@ Those three directories are ignored by the repository's root `.gitignore` (the
 repository's convention), so the numbers are reproduced in full here and in the
 notebook itself.
 
-The **default temporal discretization is now 2 ms** (500 steps, $\alpha = 0.1$).
-The previous 4 ms reference (250 steps, $\alpha = 0.2$) is retained for comparison
-(see the note at the end of §1).
+The **default temporal discretization is 2 ms** (500 steps, $\alpha = 0.1$).
 
 **Configuration** (`configs/v3_default.yaml`, `seed = 0`, **one seed — no error bar**):
 
@@ -59,11 +57,9 @@ Reference points: a plain recurrent SHD baseline is usually quoted around 71%
 the repository's own V2 LIF model (N=256, T=1400 ms, 2 ms bins, 20 epochs)
 measured **59.98%** on the same test file
 (`archive/v2/artifacts/checkpoints/sweep_l2_0.pt`,
-`archive/v2/artifacts/results/lif_baseline_selection.json`).  The previous V3 reference — the same
-$N=64$, $D=1000$ population at the **4 ms** discretization ($T=250$, α = 0.2),
-20 epochs — measured **79.81%** (1807/2264). The 2 ms run is **+2.70 percentage
-points** above that, i.e. halving the time step and the leak `alpha` improved the
-benchmark rather than merely changing its resolution.
+`archive/v2/artifacts/results/lif_baseline_selection.json`). The scalar
+($D=1$) control at the same 20-epoch budget reaches 49.43% (1119/2264); that
+contrast is the claim, and the temporal-resolution comparison is not part of it.
 
 ## 2. Training
 

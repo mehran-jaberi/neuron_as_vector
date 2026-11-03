@@ -431,4 +431,10 @@ mean state 1917 = 84.67 %, final state 625 = 27.61 %, counts+mean 1920 =
 84.81 %, Δ(mean − counts) = −3.14 pp CI [−4.46, −1.90]. Geometry: population
 participation ratio 7.49 of 100,000 dims; per-neuron median 4.90 (P10–P90
 3.02–6.31). Freeze/fingerprint/knockout on this checkpoint: see
-`V3/results/analysis/ablation_freeze_final.json`.
+`V3/results/analysis/ablation_freeze_final.json`; the knockout sweep was still
+running when this entry was written.
+
+**4 ms doc-only claim removed** (PI order #8): the 79.81 % / 1807 figure is gone
+from `V3/README.md` §1 and §12 and from `V3/RESULTS.md` §1; the 4 ms
+discretization remains documented only as a configuration option in the timing
+table. No run was made for it, and none is claimed.
