@@ -93,8 +93,9 @@ The final-model run is almost stationary over the last epochs (88.74 / 87.94 /
 |---|---|---|---|
 | scalar neuron, size-matched | $D=1$, $N=64$, 6,335 params | 1119 = 49.43 % | state width matters (untuned control, see below) |
 | scalar neuron, capacity-matched | $D=1$, $N=1411$, 2,025,488 params | 750 = 33.13 % (5 ep) | capacity alone cannot substitute for width |
-| scalar $D=1$, $N=100$ | 5 epochs | *running* | — |
-| scalar $D=1$ + broadcast emission width $E$ | `--variant broadcast` | *running* | separates *state* width from *transmission* width |
+| scalar $D=1$, $N=100$ | 5 epochs, 13,103 params | 813 = 35.91 % | a scalar state stays a scalar state at larger $N$ |
+| broadcast emission width $E=1000$, $N=100$ | 5 epochs, `--variant broadcast`, 812,300 params | 1481 = 65.42 % | state width and *transmission* width matter separately |
+| vector $D=1000$, $N=100$ reference | 5 epochs, 2,140,100 params | 1803 = 79.64 % | the family the broadcast control is compared against |
 | V2 LIF reference | $N=256$, T=1400 ms | 1798/2998 = 59.98 % (doc-claim) | not our baseline; context only |
 
 At matched parameter count the gap is +36.9 pp (73 k params: scalar 31.71 %
@@ -104,6 +105,15 @@ $D=1000$ 76.15 %), both at 5 epochs — `screening`, baseline 76.15 %.
 The scalar controls are **untuned, size-matched ablations**, not competitive
 baselines (a tuned recurrent LIF reaches ~71 % on SHD); the repository does not
 claim a literature-baseline improvement from the scalar gap.
+
+The broadcast control is the sharpest of the three: it keeps the scalar state
+$z_i\in\mathbb{R}$ that gives $D=1$ its failure, but transmits through an
+$E=1000$-wide shared projection instead of a scalar, so *state* width and
+*transmission* width are separated. At $N=100$, 5 epochs: scalar 35.91 % →
+broadcast (812 k params) 65.42 % → full vector (2.14 M params) 79.64 %. A
+1000-wide transmission recovers 29.5 of the 43.7 pp gap with 38 % of the
+parameters; the remaining 14.2 pp is what the width of the *state* itself buys
+over 5 epochs. All three are `screening` (5 epochs, single seed).
 
 ## 5. What the width is doing (mechanism)
 
@@ -129,7 +139,32 @@ Measured on the frozen 20-epoch baseline checkpoint ($N=64$, $D=1000$):
   information per neuron (0.084–0.742 bits, 57/64 effective, none silent) is
   uncorrelated with causal necessity (Spearman +0.20).
 
-These four analyses are being re-run on the final $N=100$ checkpoint.
+These four analyses are being re-run on the final $N=100$ checkpoint; so far:
+
+- **Probe** (same protocol, 150 epochs to make the counts arm converge; the
+  protocol default of 30 epochs left the counts probe 2 pp below the readout on
+  this checkpoint and failed its own alignment gate): counts 1988 = 87.81 %
+  (readout 1994 = 88.07 %), mean state (100 000 dims) 1917 = 84.67 %, final
+  state 625 = 27.61 %, counts+mean 1920 = 84.81 %. Δ(mean − counts) =
+  **−3.14 pp, 95 % CI [−4.46, −1.90]**. The qualitative conclusion is unchanged
+  and stronger: the state carries no information beyond the spike counts, and
+  what is decodable is the temporal mean.
+- **Effective dimension** (final checkpoint): population participation ratio
+  **7.49** of 100,000 dims; per neuron median **4.90** of 1,000 (P10–P90
+  3.02–6.31), 9 components to 90 %. Almost identical to the $N=64$ baseline
+  (6.64; 4.21), i.e. the final model does not use a wider subspace — it uses the
+  same low-dimensional one more accurately.
+- **Freeze-dynamics ablations** (final checkpoint, only $w_{\text{cls}}$ refit):
+  trained dynamics 1941 = 85.73 %; untrained network of the same architecture
+  1025 = 45.27 % (−40.5 pp); trained weights with recurrence and emission
+  removed 1538 = 67.93 % (−17.8 pp). As at $N=64$, the learned dynamics carry
+  the accuracy, not the readout capacity.
+- **Per-neuron information** (final checkpoint, FIT): mutual information with
+  the class label median **0.502 bits** (min 0.167, max 0.910), total 50.8 bits,
+  **91 of 100 neurons effective**, none below 0.05 bits; median rate 17.96 Hz.
+  Split-half reliability 0.988, FIT-vs-TEST rank correlation 0.857 — the
+  fingerprint is a stable property of the model, not an artifact of the split.
+  The information is distributed almost uniformly across neurons.
 
 ## 6. Splits, statistics, selection
 
@@ -143,14 +178,24 @@ These four analyses are being re-run on the final $N=100$ checkpoint.
   clear ~2 SE to be taken seriously.
 - Model selection was done on **5-epoch TEST accuracy** (disclosed), so the
   quoted 88 % carries an unquantified winner's-curse penalty. Single seed.
+- **Speaker-held-out split** (opt-in, `speaker_holdout.speakers=6,7,8`, 5 epochs,
+  same $N=64$/$D=1000$ config): FIT 5900 samples from the other nine speakers,
+  VAL = all 816 samples of the three held-out speakers, TEST unchanged.
+  FIT 97.30 % / held-out VAL 64.61 % / TEST 1680 = 74.20 %. Against the
+  speaker-overlapping split at the same budget (FIT 97.30→95.00, VAL 93.01,
+  TEST 76.15) the honest VAL is 28 pp lower and TEST 1.95 pp lower — partly a
+  harder validation, partly 1440 fewer training samples. The 88 % headline
+  should be read with this gap in mind: a VAL that shares speakers with FIT
+  overstates generalisation by a large margin.
 
 ## 7. What is not claimed
 
 Not claimed, and why (`KNOWN_ISSUES.md`): no multi-seed error bar; no N=100
 all-off baseline (a 30-epoch run at 88 % cannot be split between width, dropout
 and the other blocks); scalar comparator untuned; VAL is speaker-overlapping;
-block set chosen on TEST at 5 epochs. A tuned scalar baseline and a
-broadcast-fixed scalar control are in progress.
+block set chosen on TEST at 5 epochs. The scalar and broadcast controls are
+complete and reported above; the speaker-held-out split exists and its numbers
+are in §6.
 
 ## 8. Reproducing
 

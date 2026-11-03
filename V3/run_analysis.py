@@ -966,13 +966,21 @@ def _run_logistic_feature_set(
     n_classes: int,
     device: torch.device,
     standardize: bool,
+    lr: float = LOGISTIC_LR,
+    epochs: int = LOGISTIC_EPOCHS,
 ) -> tuple[dict, np.ndarray]:
     """Load features, fit on FIT with L2 selected on VAL, score TEST once."""
     tic = time.perf_counter()
     x_fit = load_split_features(paths["fit"], sources, device)
     x_val = load_split_features(paths["val"], sources, device)
     state = fit_logistic_probe(
-        x_fit, labels["fit"], x_val, labels["val"], standardize=standardize
+        x_fit,
+        labels["fit"],
+        x_val,
+        labels["val"],
+        standardize=standardize,
+        lr=lr,
+        epochs=epochs,
     )
     del x_fit, x_val
     x_test = load_split_features(paths["test"], sources, device)
@@ -1025,13 +1033,16 @@ def run_probe_logistic(args: argparse.Namespace) -> dict:
         flush=True,
     )
 
+    probe_lr = float(getattr(args, "lr", LOGISTIC_LR))
+    probe_epochs = int(getattr(args, "epochs", LOGISTIC_EPOCHS))
     results: dict[str, dict] = {}
     preds: dict[str, np.ndarray] = {}
     gate: dict = {}
     for feat in LOGISTIC_FEATURE_ORDER:
         sources = FEATURE_SETS[feat]
         entry, pred = _run_logistic_feature_set(
-            paths, feat, sources, labels, n_classes, device, standardize=True
+            paths, feat, sources, labels, n_classes, device, standardize=True,
+            lr=probe_lr, epochs=probe_epochs,
         )
         results[feat] = entry
         preds[feat] = pred
@@ -1075,7 +1086,7 @@ def run_probe_logistic(args: argparse.Namespace) -> dict:
     for feat in ("mean_state", "final_state"):
         raw, _ = _run_logistic_feature_set(
             paths, feat, FEATURE_SETS[feat], labels, n_classes, device,
-            standardize=False,
+            standardize=False, lr=probe_lr, epochs=probe_epochs,
         )
         standardization[feat] = {"standardized": results[feat], "raw": raw}
         print(
@@ -1325,6 +1336,15 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--bootstrap", type=int, default=1000,
                     help="paired bootstrap resamples for the mean-state vs counts delta")
     pr.add_argument("--folds", type=int, default=5, help="CV folds inside the fit split (ridge)")
+    pr.add_argument(
+        "--epochs", type=int, default=LOGISTIC_EPOCHS,
+        help=f"probe training epochs (protocol default {LOGISTIC_EPOCHS}); raise it "
+        "only when the counts gate fails, and report the deviation",
+    )
+    pr.add_argument(
+        "--lr", type=float, default=LOGISTIC_LR,
+        help=f"probe learning rate (protocol default {LOGISTIC_LR})",
+    )
     pr.set_defaults(func=run_probe)
 
     g = sub.add_parser("geometry", help="PCA / effective dimensionality")

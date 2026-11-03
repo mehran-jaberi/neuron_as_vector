@@ -395,3 +395,40 @@ Honest caveats, unchanged by the number: single seed; block set and dropout
 chosen on 5-epoch TEST accuracy (selection penalty unquantified); no N=100
 30-epoch all-off baseline; VAL is speaker-overlapping and is not a
 generalisation estimate. `KNOWN_ISSUES.md` #1 and #6 stand.
+
+## 2026-11-03 — controls, honest validation, mechanism on the final model
+
+PI work order (turn 81): drop the all-off baseline (no claim), run the scalar
+$D=1$ and broadcast-fixed scalar controls (5 epochs), list multi-seed as a
+limitation, add a speaker-held-out split (5 epochs), re-run mechanism on the
+final $N=100$ checkpoint, delete the 4 ms claim, split the docs into a software
+README and a scientific write-up.
+
+**Controls** (all `screening`, 5 epochs, seed 0, official TEST n=2264, N=100):
+
+| arm | params | fit | val | TEST | Δ vs vector |
+|---|---|---|---|---|---|
+| scalar $D=1$ (`v3_ctrl_scalar_d1_n100_ep5`) | 13,103 | 32.49 % | 31.99 % | 813 = 35.91 % | −43.7 pp |
+| broadcast $E=1000$ (`v3_ctrl_broadcast_e1000_ep5`) | 812,300 | 95.23 % | 88.24 % | 1481 = 65.42 % | −14.2 pp |
+| vector $D=1000$ reference (`v3_n100_baseline_ep5`) | 2,140,100 | 97.48 % | 95.96 % | 1803 = 79.64 % | — |
+
+A 1000-wide transmission recovers 29.5 of the 43.7 pp scalar gap with 38 % of
+the parameters; what remains is the width of the *state* itself.
+
+**Speaker-held-out split** (`ctrl/speaker-holdout`, commit `48e3cfd`; run
+`v3_speaker_holdout_ep5`, N=64/D=1000, 5 ep, holdout speakers 6,7,8): FIT 5900
+samples from the other nine speakers → FIT 97.30 %, held-out VAL 64.61 %, TEST
+1680 = 74.20 %. The speaker-overlapping split at the same budget gives VAL 93.01
+and TEST 76.15 %, so VAL overstates generalisation by ~28 pp and TEST by ~2 pp
+(partly fewer training samples). The fix also found and repaired a real bug on
+`ctrl/broadcast-scalar` (`6db561a`): the population vector was summed over the
+batch axis instead of the neuron axis (`(s*z).sum(1) @ P.t()`).
+
+**Mechanism on the final checkpoint** (`v3_n100_spec_ep30_ep30.pt`, capture
+reproduces 1994/2264): logistic probe, 150 epochs (30-epoch default failed the
+counts alignment gate on this checkpoint — disclosed) — counts 1988 = 87.81 %,
+mean state 1917 = 84.67 %, final state 625 = 27.61 %, counts+mean 1920 =
+84.81 %, Δ(mean − counts) = −3.14 pp CI [−4.46, −1.90]. Geometry: population
+participation ratio 7.49 of 100,000 dims; per-neuron median 4.90 (P10–P90
+3.02–6.31). Freeze/fingerprint/knockout on this checkpoint: see
+`V3/results/analysis/ablation_freeze_final.json`.

@@ -345,11 +345,15 @@ def run_freeze(args: argparse.Namespace) -> dict:
 
     path = Path(args.checkpoint)
     cfg, payload = load_payload(path)
+    cap_tag = str(getattr(args, "capture_tag", "") or "")
+    cap_prefix = f"capture_{cap_tag}" if cap_tag else "capture"
+    suffix = f"_{cap_tag}" if cap_tag else ""
+    reference_correct = int(getattr(args, "reference_correct", REFERENCE_CORRECT))
     out = {
         "protocol": {
             "checkpoint": str(path),
-            "reference": {"correct": REFERENCE_CORRECT, "total": REFERENCE_TOTAL,
-                          "accuracy": REFERENCE_CORRECT / REFERENCE_TOTAL},
+            "reference": {"correct": reference_correct, "total": REFERENCE_TOTAL,
+                          "accuracy": reference_correct / REFERENCE_TOTAL},
             "readout": {
                 "loss": "cross_entropy",
                 "optimizer": "adam",
@@ -377,7 +381,7 @@ def run_freeze(args: argparse.Namespace) -> dict:
     if "a1" in arms:
         cached = {}
         for split in CAPTURE_SPLITS:
-            with np.load(ANALYSIS_DIR / f"capture_{split}.npz") as d:
+            with np.load(ANALYSIS_DIR / f"{cap_prefix}_{split}.npz") as d:
                 cached[split] = (d["counts"].astype(np.float32), d["labels"].astype(np.int64))
         gate_w = payload["state_dict"]["w_cls"].float().numpy()
         gate = readout_accuracy(cached["test"][0], cached["test"][1], gate_w)
@@ -385,10 +389,10 @@ def run_freeze(args: argparse.Namespace) -> dict:
             f"[A1] cached-counts alignment gate: checkpoint w_cls "
             f"{gate['correct']}/{gate['total']} = {gate['accuracy'] * 100:.2f}%"
         )
-        if gate["correct"] != REFERENCE_CORRECT:
+        if gate["correct"] != reference_correct:
             raise RuntimeError(
                 "cached capture does not reproduce the reference readout "
-                f"({gate['correct']} != {REFERENCE_CORRECT}); re-run `run_analysis.py capture`"
+                f"({gate['correct']} != {reference_correct}); re-run `run_analysis.py capture`"
             )
         tic = time.perf_counter()
         model_result = fit_readout(
@@ -397,7 +401,7 @@ def run_freeze(args: argparse.Namespace) -> dict:
             cached["test"][0], cached["test"][1],
         )
         wall = time.perf_counter() - tic
-        np.savez_compressed(ANALYSIS_DIR / "ablation_readout_a1.npz", w=model_result["w"])
+        np.savez_compressed(ANALYSIS_DIR / f"ablation_readout_a1{suffix}.npz", w=model_result["w"])
         out["arms"]["A1"] = _arm_summary(
             model_result,
             capture_seconds={"fit": 0.0, "val": 0.0, "test": 0.0, "source": "cached capture"},
@@ -444,7 +448,7 @@ def run_freeze(args: argparse.Namespace) -> dict:
                                         batch_size=int(args.batch_size))
             secs[split] = cap[split]["seconds"]
             np.savez_compressed(
-                ANALYSIS_DIR / f"ablation_counts_a2_{split}.npz",
+                ANALYSIS_DIR / f"ablation_counts_a2{suffix}_{split}.npz",
                 counts=cap[split]["counts"], labels=cap[split]["labels"],
                 indices=cap[split]["indices"],
             )
@@ -455,7 +459,7 @@ def run_freeze(args: argparse.Namespace) -> dict:
             cap["val"]["counts"], cap["val"]["labels"],
             cap["test"]["counts"], cap["test"]["labels"],
         )
-        np.savez_compressed(ANALYSIS_DIR / "ablation_readout_a2.npz", w=result["w"])
+        np.savez_compressed(ANALYSIS_DIR / f"ablation_readout_a2{suffix}.npz", w=result["w"])
         rates = {
             "fit_median_hz": float(np.median(cap["fit"]["rates_hz"])),
             "fit_min_hz": float(np.min(cap["fit"]["rates_hz"])),
@@ -494,7 +498,7 @@ def run_freeze(args: argparse.Namespace) -> dict:
                                         batch_size=int(args.batch_size))
             secs[split] = cap[split]["seconds"]
             np.savez_compressed(
-                ANALYSIS_DIR / f"ablation_counts_a3_{split}.npz",
+                ANALYSIS_DIR / f"ablation_counts_a3{suffix}_{split}.npz",
                 counts=cap[split]["counts"], labels=cap[split]["labels"],
                 indices=cap[split]["indices"],
             )
@@ -505,7 +509,7 @@ def run_freeze(args: argparse.Namespace) -> dict:
             cap["val"]["counts"], cap["val"]["labels"],
             cap["test"]["counts"], cap["test"]["labels"],
         )
-        np.savez_compressed(ANALYSIS_DIR / "ablation_readout_a3.npz", w=result["w"])
+        np.savez_compressed(ANALYSIS_DIR / f"ablation_readout_a3{suffix}.npz", w=result["w"])
         rates = {
             "fit_median_hz": float(np.median(cap["fit"]["rates_hz"])),
             "fit_min_hz": float(np.min(cap["fit"]["rates_hz"])),
@@ -523,8 +527,8 @@ def run_freeze(args: argparse.Namespace) -> dict:
             f"(gap {gap_pp(result['test_correct'], result['test_total']):+.2f} pp)"
         )
 
-    merged = _merge_arms(ANALYSIS_DIR / "ablation_freeze.json", out)
-    with open(ANALYSIS_DIR / "ablation_freeze.json", "w", encoding="utf-8") as fh:
+    merged = _merge_arms(ANALYSIS_DIR / f"ablation_freeze{suffix}.json", out)
+    with open(ANALYSIS_DIR / f"ablation_freeze{suffix}.json", "w", encoding="utf-8") as fh:
         json.dump(merged, fh, indent=2)
     print(f"\nwrote {ANALYSIS_DIR / 'ablation_freeze.json'}")
     return out
@@ -653,11 +657,14 @@ def fingerprint_summary(
 
 def run_fingerprints(args: argparse.Namespace) -> dict:
     """B1: per-neuron mutual information and mean rate (CPU)."""
-    cfg, _ = load_payload(VECTOR_CHECKPOINT)
-    with np.load(ANALYSIS_DIR / "capture_fit.npz") as d:
+    cap_tag = str(getattr(args, "capture_tag", "") or "")
+    cap_prefix = f"capture_{cap_tag}" if cap_tag else "capture"
+    suffix = f"_{cap_tag}" if cap_tag else ""
+    cfg, _ = load_payload(getattr(args, "checkpoint", VECTOR_CHECKPOINT))
+    with np.load(ANALYSIS_DIR / f"{cap_prefix}_fit.npz") as d:
         counts_fit = d["counts"].astype(np.float32)
         labels_fit = d["labels"].astype(np.int64)
-    with np.load(ANALYSIS_DIR / "capture_test.npz") as d:
+    with np.load(ANALYSIS_DIR / f"{cap_prefix}_test.npz") as d:
         counts_test = d["counts"].astype(np.float32)
         labels_test = d["labels"].astype(np.int64)
 
@@ -695,11 +702,11 @@ def run_fingerprints(args: argparse.Namespace) -> dict:
         "rate_hz_test": rate_test.tolist(),
     }
     np.savez_compressed(
-        ANALYSIS_DIR / "ablation_fingerprints.npz",
+        ANALYSIS_DIR / f"ablation_fingerprints{suffix}.npz",
         mi_bits_fit=mi_fit, mi_bits_test=mi_test,
         rate_hz_fit=rate_fit, rate_hz_test=rate_test,
     )
-    with open(ANALYSIS_DIR / "ablation_fingerprints.json", "w", encoding="utf-8") as fh:
+    with open(ANALYSIS_DIR / f"ablation_fingerprints{suffix}.json", "w", encoding="utf-8") as fh:
         json.dump(out, fh, indent=2)
 
     s = out["fit"]
@@ -717,7 +724,7 @@ def run_fingerprints(args: argparse.Namespace) -> dict:
               f"rate {row['rate_hz']:.1f} Hz, MI(test) {row['mi_test_bits']:.3f}")
     print(f"    split-half rho {out['split_half_spearman']:.3f}; "
           f"FIT-vs-TEST rho {out['mi_fit_vs_test_spearman']:.3f}")
-    print(f"wrote {ANALYSIS_DIR / 'ablation_fingerprints.json'} ({seconds:.1f} s CPU)")
+    print(f"wrote {ANALYSIS_DIR / f'ablation_fingerprints{suffix}.json'} ({seconds:.1f} s CPU)")
     return out
 
 
@@ -773,6 +780,8 @@ def run_knockout(args: argparse.Namespace) -> dict:
     """B2: silence each neuron in turn on official TEST."""
     path = Path(args.checkpoint)
     cfg, payload = load_payload(path)
+    cap_tag = str(getattr(args, "capture_tag", "") or "")
+    suffix = f"_{cap_tag}" if cap_tag else ""
     device = resolve_device(cfg)
     if str(args.device) not in ("", "auto", "None"):
         device = torch.device(args.device)
@@ -868,7 +877,7 @@ def run_knockout(args: argparse.Namespace) -> dict:
               f"{100 * correct / len(split):.2f}% (drop {cumulative[-1]['drop_pp']:.2f} pp)")
 
     # correlation with B1 (FIT-ranked MI)
-    fp_path = ANALYSIS_DIR / "ablation_fingerprints.npz"
+    fp_path = ANALYSIS_DIR / f"ablation_fingerprints{suffix}.npz"
     correlation = {"available": False}
     if fp_path.exists():
         with np.load(fp_path) as d:
@@ -937,6 +946,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     f = sub.add_parser("freeze", help="A1/A2/A3: fit only the readout on frozen dynamics")
     f.add_argument("--checkpoint", default=str(VECTOR_CHECKPOINT))
+    f.add_argument("--capture-tag", default="",
+                   help="use capture_<tag>_*.npz and write ablation_*_<tag> files")
+    f.add_argument("--reference-correct", type=int, default=REFERENCE_CORRECT,
+                   help="expected checkpoint readout on TEST (alignment gate)")
     f.add_argument("--arms", default="a1,a2,a3")
     f.add_argument("--device", default="auto")
     f.add_argument("--batch-size", type=int, default=128)
@@ -944,10 +957,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     fp = sub.add_parser("fingerprints", help="B1: per-neuron class information + rate")
     fp.add_argument("--mi-bins", type=int, default=MI_BINS)
+    fp.add_argument("--capture-tag", default="",
+                    help="use capture_<tag>_*.npz and write ablation_fingerprints_<tag>.json")
+    fp.add_argument("--checkpoint", default=str(VECTOR_CHECKPOINT))
     fp.set_defaults(func=run_fingerprints)
 
     k = sub.add_parser("knockout", help="B2: silence each neuron in turn on TEST")
     k.add_argument("--checkpoint", default=str(VECTOR_CHECKPOINT))
+    k.add_argument("--capture-tag", default="",
+                   help="read ablation_fingerprints_<tag>.npz for the MI correlation")
     k.add_argument("--device", default="auto")
     k.add_argument("--batch-size", type=int, default=128)
     k.set_defaults(func=run_knockout)
