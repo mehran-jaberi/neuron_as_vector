@@ -438,3 +438,29 @@ running when this entry was written.
 from `V3/README.md` §1 and §12 and from `V3/RESULTS.md` §1; the 4 ms
 discretization remains documented only as a configuration option in the timing
 table. No run was made for it, and none is claimed.
+
+### 2026-11-03 — knockout on the final checkpoint; v3.1 diagonal emission
+
+**Knockout** (final `N=100` checkpoint, 100 passes, one neuron silenced with
+`theta_i -= 1e9`, 80.9 s/eval, 139.7 min GPU, 743 MB peak;
+`V3/results/analysis/ablation_knockout.json`): mean drop **0.30 ± 0.63 pp**,
+max **+2.69 pp** (neuron 77), min **−1.10 pp**, **13/100** neurons above 1 pp,
+**32/100** deletions improve TEST. Cumulative top-$k$: **2.69 / 5.26 / 9.23 /
+14.44 / 21.07 / 38.47 / 83.48 pp** for $k=1,2,4,8,16,32,100$. Spearman(MI, drop)
+**+0.263**, Spearman(rate, drop) +0.376. Same conclusion as $N=64$, flatter per
+neuron: no critical unit, smooth redundancy curve, class information barely
+predicts causal necessity.
+
+**v3.1 diagonal emission** (branch `v3.1`, worktree `wt-v3.1`, commit
+`fd02e07`, not merged): `emission.mode=full|diagonal`, default `full`.
+Parameters at $N=64$, $D=1000$: 2,025,440 → **1,026,440**. Verified: `full`
+mode bit-identical to `main` (param count, non-emission digest, logits maxdiff
+0.0); diagonal path reproduces full path exactly when the matrix is diagonal
+(maxdiff 0.0, fp32) — an earlier 9.97 fp16 mismatch was a defect in the Lead's
+test (off-diagonal entries left in the full matrix), not in the branch.
+Measured 5 epochs, same protocol: `v3_v31_diag_ep5` **1748 = 77.21 %** (fit
+94.20 %, val 91.18 %) vs baseline 1724 = 76.15 % — Δ +1.06 pp, inside the
+±0.87 pp noise band (`screening`, single seed). Treated as a
+parameter-efficiency improvement of the same model, not a new model; no 20-epoch
+confirm exists.
+

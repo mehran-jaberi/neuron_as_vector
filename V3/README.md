@@ -561,6 +561,27 @@ the leak — the learned `alpha` stayed at 0.098); `input_delays` 1769 = 78.14% 
 5 epochs and **1837 = 81.14%** at 20 epochs (−1.37). Numbers carry the
 `confirmed` (20 epochs) / `screening` (5 epochs) tag of rule 6.
 
+### Parameter efficiency: diagonal emission (branch `v3.1`, engineering only)
+
+`emission.mode=diagonal` replaces the shared `D x D` emission with one learned
+gain per coordinate: `h = ((s*z).sum(1) * pop_scale) * g`, `g in R^D`. It keeps
+the emitted object in `R^D` — the spike still carries a vector — and only
+removes the mixing, so this is a software/parameter improvement of the same
+model, not a new model.
+
+| mode | parameters (N=64, D=1000) | 5-epoch TEST |
+|---|---|---|
+| `full` (default) | 2,025,440 | 1724 = 76.15% |
+| `diagonal` | **1,026,440** | **1748 = 77.21%** |
+
+Half the parameters were that one matrix, and the 5-epoch number is inside the
+±0.87 pp noise band (`screening`, single seed). The default stays `full`
+because every headline run used it. Verification: `full` mode is bit-identical
+to the pre-change code (all non-emission tensors, logits maxdiff 0.0), and with
+a genuinely diagonal emission matrix the diagonal path reproduces the full path
+exactly (maxdiff 0.0 in fp32). The branch is `v3.1` (`wt-v3.1`), not merged into
+`main`.
+
 ## 12. Current experimental reference
 
 ```

@@ -115,6 +115,25 @@ broadcast (812 k params) 65.42 % → full vector (2.14 M params) 79.64 %. A
 parameters; the remaining 14.2 pp is what the width of the *state* itself buys
 over 5 epochs. All three are `screening` (5 epochs, single seed).
 
+### 4.1 Parameter efficiency, not a new model
+
+The $D\times D$ emission matrix costs $D^2$ parameters and is near-identity at
+initialisation. On branch `v3.1`, `emission.mode=diagonal` replaces it with one
+learned gain per coordinate ($h = \bar s\cdot z \cdot g$, $g\in\mathbb{R}^D$):
+at $N=64$, $D=1000$ the model drops from **2,025,440 to 1,026,440
+parameters** — half of it was that one matrix. This is an engineering variant of
+the same model, not an additional model: the spike still carries an
+$\mathbb{R}^D$ vector and the hypothesis is untouched.
+
+Verified: `full` mode is bit-identical to the code before the change
+(parameter count, every non-emission tensor, logits maxdiff 0.0), and with a
+genuinely diagonal emission matrix the diagonal path reproduces the full path
+exactly (maxdiff 0.0 in fp32). Measured at 5 epochs, $N=64$, same protocol:
+diagonal **1748 = 77.21 %** vs the baseline **1724 = 76.15 %** (`screening`,
+single seed, Δ +1.06 pp, inside the ±0.87 pp binomial noise band). The dense mix
+is not load-bearing at this budget; it stays in the headline model because the
+headline runs were made with it.
+
 ## 5. What the width is doing (mechanism)
 
 Measured on the frozen 20-epoch baseline checkpoint ($N=64$, $D=1000$):
@@ -139,7 +158,7 @@ Measured on the frozen 20-epoch baseline checkpoint ($N=64$, $D=1000$):
   information per neuron (0.084–0.742 bits, 57/64 effective, none silent) is
   uncorrelated with causal necessity (Spearman +0.20).
 
-These four analyses are being re-run on the final $N=100$ checkpoint; so far:
+Re-run on the final $N=100$ checkpoint:
 
 - **Probe** (same protocol, 150 epochs to make the counts arm converge; the
   protocol default of 30 epochs left the counts probe 2 pp below the readout on
@@ -165,6 +184,15 @@ These four analyses are being re-run on the final $N=100$ checkpoint; so far:
   Split-half reliability 0.988, FIT-vs-TEST rank correlation 0.857 — the
   fingerprint is a stable property of the model, not an artifact of the split.
   The information is distributed almost uniformly across neurons.
+- **Knockout map** (final checkpoint, one neuron silenced per pass with
+  $\theta_i \mathrel{-}= 10^9$, 100 passes): mean drop **0.30 ± 0.63 pp**
+  (max **+2.69 pp**, neuron 77; min **−1.10 pp**; **13 of 100** neurons cost
+  more than 1 pp; **32 deletions improve** TEST). Cumulative top-$k$:
+  **2.69 / 5.26 / 9.23 / 14.44 / 21.07 / 38.47 / 83.48 pp** for
+  $k=1,2,4,8,16,32,100$. Spearman(MI, drop) = **+0.26** (rate vs drop +0.38).
+  Flatter than $N=64$ but the same conclusion: no critical unit, removal cost
+  grows smoothly with $k$, and class information barely predicts causal
+  necessity — the code is distributed and redundant.
 
 ## 6. Splits, statistics, selection
 

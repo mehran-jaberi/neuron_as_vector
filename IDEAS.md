@@ -72,7 +72,14 @@ so the "spikes carry vectors, not scalars" hypothesis is untouched; they only re
 parameters and constrain *how* coordinates mix in the broadcast.
 
 **PI status (2026-10-27):** "yes we can make it diagonal technically" — feasibility
-acknowledged. **Not decided, not scheduled, no run exists.**
+acknowledged. **2026-11-03:** implemented as an engineering variant on branch
+`v3.1` (`emission.mode=full|diagonal`, default `full`, commit `fd02e07`);
+verified bit-identical in `full` mode and exactly equivalent to a diagonal
+emission matrix in fp32; measured 5 epochs, `N=64`, `D=1000`: **diagonal
+1748 = 77.21 %** vs baseline **1724 = 76.15 %** at **1,026,440 vs 2,025,440
+parameters** (`screening`, single seed). Framed as a parameter-efficiency
+improvement of the same model, not a new model; the dense mode stays the
+headline because the headline runs used it.
 
 **Open questions.** Is the `D×D` mixing part of the hypothesis or an implementation
 convenience? If it is not part of the hypothesis, is it defensible to keep it in the
