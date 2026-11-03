@@ -14,6 +14,8 @@ strike them through with a date and the closing evidence.
 | 6 | **selection on the official TEST set** | variants chosen by TEST accuracy at 5 epochs | winner's-curse inflation of the quoted number (n=2264, ±0.84 pp SE) | disclose in every table (done); a proper held-out selection split would close it |
 | 7 | **training schedule experiments are meaningless while FIT saturates** (2026-11-02) | 20-epoch runs reach 99.9–100 % train accuracy (baseline, M1, M2) | longer schedules cannot buy anything when the training set is already memorised; the 20-epoch budget is *not* the binding constraint | only after the final architecture underfits at 20 epochs: run longer schedules then, and treat schedule as a tuning knob, not a lever |
 
+| 8 | **final-model block set chosen on 5-epoch TEST** (2026-11-03) | `v3_n100_spec_ep30` = 1994/2264 = **88.07 %** (best epoch 2009 = 88.74 %) | the nine enabled blocks were the arms that looked best at 5 epochs (plus the two that were merged for infrastructure reasons), so the 88 % is a winner's-curse number; M8 and M12 scored exactly +0.13 and 0.00 pp at 5 epochs and are still on | an ablation of the final set at 30 epochs (drop-one / add-one), or a selection split never used for choosing |
+
 ## Notes
 
 - Items 2–6 were already disclosed in `V3/README.md` / `INVESTIGATION.md`; they stay listed

@@ -263,3 +263,49 @@ each is a real trap for this architecture.
 # identical results through the CLI (same code path):
 .venv\Scripts\python.exe V3\run_experiment.py --variant both
 ```
+
+## 9. The final model (2026-11-03)
+
+Everything merged from the feature branches, switched on together, N=100.
+Run `v3_n100_spec_ep30` — registry row in `V3/results/runs.csv`, artifacts under
+`V3/results/v3_n100_spec_ep30/` (`history.csv` has fit / val / TEST for every epoch).
+
+| | value |
+|---|---|
+| neurons / state dim | **N = 100, D = 1000** |
+| epochs / batch | 30 / 96 |
+| trainable parameters | 3,069,201 |
+| enabled blocks | `adaptation` (M1), `state_dynamics` with `trainable_alpha` + `learnable_z0` (M2), `input_delays` (M4), `augmentation.event_blend` (M7), `adlif` (M8), `input_delay_line` copies=2 (M10), `surrogate = slayer` alpha=2.0 (M11a), `two_stage` (M12), `timing.silence_tail_ms = 100` (M13), `augmentation.event_dropout` p = 0.10 |
+| TEST, final epoch | **1994 / 2264 = 88.07 %** |
+| TEST, best epoch | **2009 / 2264 = 88.74 %** (epoch 28) |
+| fit / val, final epoch | 99.78 % / 97.67 % |
+| epoch time | ~505 s (epoch 1: 616 s incl. warm-up) |
+| weight selection | final-epoch weights (`which="final"`), seed 0 |
+
+The per-epoch TEST column in `history.csv` is the useful artifact here: the run
+plateaus around epoch 15 and oscillates in the 87–89 % band, so the last epoch
+is not a knife-edge selection (epochs 28–30: 88.74 / 87.94 / 88.07 %).
+
+**5-epoch screen of the merged blocks** (N=64, D=1000, seed 0, TEST 2264; the
+untouched baseline is 1724 = 76.15 %). Every arm is `screening`, not a result:
+
+| arm | commit | TEST | Δ pp |
+|---|---|---|---|
+| M7 blend | `2fe8a33` | 1750 = 77.30 % | +1.15 |
+| M8 adLIF | `2efc398` | 1727 = 76.28 % | +0.13 |
+| M10 delay line (concat, K=2) | `6cd8149` | 1768 = 78.09 % | +1.94 |
+| M11a SLAYER (alpha 2.0) | `73db604` | 1791 = 79.11 % | +2.96 |
+| M11b attention | `73db604` | 1755 = 77.52 % | +1.37 |
+| M12 two-stage | `b9c88de` | 1724 = 76.15 % | 0.00 |
+| M13 silence tail | `c4adaf5` | 1770 = 78.18 % | +2.03 |
+| all merged blocks at once (N=64, 5 ep) | `main` | 1783 = 78.75 % | +2.60 |
+
+Two other 30-epoch N=100 runs bracket this one: `v3_n100_aug_dropout_ep20`
+(20 epochs, event dropout only) **1995 = 88.12 %**, and `v3_n100_all_ep30`
+(30 epochs, the five raw-event augmentations + M2 only) **1899 = 83.88 %** —
+i.e. mixing all five augmentations without the dynamics changes *hurt* by 4 pp.
+
+**What this number is not.** Single seed; the block set and the 0.10 dropout
+were chosen on 5-epoch TEST accuracy (winner's curse, ±0.84 pp SE at n=2264), so
+the quoted 88 % carries a selection penalty that is not quantified; there is no
+N=100 all-off baseline at 30 epochs. See `KNOWN_ISSUES.md` #1 and #6.

@@ -359,3 +359,39 @@ in `w_ad`, `raw_alpha`, `z0` and `input_delay_raw`). The new
 What the merge does *not* claim: no combination of the three has been trained
 yet, and two of the three (M1, M4) lost their 5-epoch gain at 20 epochs on their
 own. The merged `main` is infrastructure, not a result.
+
+### 2026-11-03 — six branches merged, and the final model
+
+All six remaining branches were merged into `main`, each one commit, every block
+default-off and independent: `feat/m7-blend` → `2fe8a33`, `feat/m8-adlif` →
+`2efc398`, `feat/m10-delayline` → `6cd8149`, `feat/m11-slayer-attention` →
+`73db604`, `feat/m12-twostage` → `b9c88de`, `feat/m13-tail` → `c4adaf5`.
+`fef307a` added optional per-epoch TEST scoring and the durable
+`checkpoints/archive_20plus/` copy for runs of 20+ epochs. One follow-up fix,
+`1b38168`, sizes the attention logits to `total_steps` so attention and the
+silence tail can be on together (they could not before). 402 tests green.
+
+5-epoch screen of the merged arms (N=64, D=1000, TEST 2264, baseline 1724 = 76.15
+%, provenance `screening`): M7 1750 = 77.30 (+1.15), M8 1727 = 76.28 (+0.13),
+M10 1768 = 78.09 (+1.94), M11a SLAYER 1791 = 79.11 (+2.96), M11b attention 1755
+= 77.52 (+1.37), M12 1724 = 76.15 (0.00), M13 1770 = 78.18 (+2.03). All merged
+blocks together at N=64, 5 epochs: **1783 = 78.75 %** (fit 88.58, val 87.75),
+so the stack is not self-sabotaging at the screening level.
+
+Two N=100 30-epoch runs followed:
+
+| run | config | fit | val | TEST |
+|---|---|---|---|---|
+| `v3_n100_aug_dropout_ep20` | 20 ep, dropout 0.10 only | 100 % | 97.06 % | **1995 = 88.12 %** |
+| `v3_n100_all_ep30` | 30 ep, five raw-event augmentations + M2 | 98.86 % | 96.94 % | 1899 = 83.88 % |
+| `v3_n100_spec_ep30` | 30 ep, dropout + blend + M1/M2/M4/M8/M10/M11a/M12/M13 | 99.78 % | 97.67 % | **1994 = 88.07 %** (best 2009 = 88.74 % @28) |
+
+The five-augmentation mix cost 4 pp versus dropout alone, so "more augmentation"
+is not a free lever. The final model (PI decision: "let's consider this our
+final model") is `v3_n100_spec_ep30`: 3,069,201 parameters, batch 96, ~505 s per
+epoch, per-epoch TEST in `V3/results/v3_n100_spec_ep30/history.csv`.
+
+Honest caveats, unchanged by the number: single seed; block set and dropout
+chosen on 5-epoch TEST accuracy (selection penalty unquantified); no N=100
+30-epoch all-off baseline; VAL is speaker-overlapping and is not a
+generalisation estimate. `KNOWN_ISSUES.md` #1 and #6 stand.

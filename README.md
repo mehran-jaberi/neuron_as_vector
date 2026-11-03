@@ -10,9 +10,15 @@ Active code: **`V3/`**. Everything earlier is archived (see [Archives](#archives
 
 | model | config | epochs | test (official, 2264) | tag |
 |---|---|---|---|---|
-| vector neuron | `N=64`, `D=1000`, 2 ms | 20 | **1868 = 82.51 %** | confirmed |
+| **final model** | `N=100`, `D=1000`, 2 ms, all merged blocks + dropout 0.1 | 30 | **1994 = 88.07 %** (best epoch 2009 = 88.74 %) | confirmed |
+| vector neuron | `N=64`, `D=1000`, 2 ms | 20 | 1868 = 82.51 % | confirmed |
 | scalar neuron (untuned, size-matched control) | `N=64`, `D=1`, same training | 20 | 1119 = 49.43 % | confirmed |
 | V2 LIF reference | `N=256`, T=1400 ms | 20 | 59.98 % | doc-claim |
+
+The final model is the 2026-11-03 synthesis: every merged feature block switched
+on at once at N=100 (`V3/RESULTS.md` §9). It is a single seed and its block set
+was chosen using 5-epoch TEST accuracy, so the 88 % carries an unquantified
+selection penalty (`KNOWN_ISSUES.md` #1, #6).
 
 Numbers are seed 0 only (no error bar yet). The scalar row is an **untuned,
 size-matched control (ablation)**, not a competitive baseline, and no
