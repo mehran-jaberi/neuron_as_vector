@@ -33,3 +33,6 @@ V3/cache/
 
 # Application materials (personal, generated locally — not part of the science repo)
 Jaberinezhad_*.docx
+
+# Manuscript drafts (PI-owned working text, not part of the code repository)
+manuscript/
