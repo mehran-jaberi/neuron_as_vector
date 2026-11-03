@@ -313,7 +313,24 @@ class VectorNeuronPopulation(nn.Module):
         self.w_in = nn.Parameter(rnd(C_in, D, scale=float(cfg.input_gain) / math.sqrt(C_in)))  # shared input basis
         self.w_down = nn.Parameter(rnd(D, R, scale=1.0 / math.sqrt(D)))    # shared rank-R mixing
         self.w_up = nn.Parameter(rnd(R, D, scale=0.5 / math.sqrt(R)))      # (init mixing gain ~0.5)
-        if cfg.emit_identity_init:
+        # ---- emission parameterisation (default: shared D x D matrix) --------
+        # The hypothesis needs the spike to carry a vector in R^D, not that the
+        # coordinates of that vector be mixed by a dense matrix.  "diagonal"
+        # replaces the shared D x D map by one learned gain per coordinate: h(t)
+        # keeps its shape and its meaning, and the model loses 999,000 of the
+        # 1,000,000 emission parameters at D = 1000.  Nothing else -- gate,
+        # recurrence, state update -- changes.
+        self.emit_diagonal = bool(cfg.emission.mode == "diagonal")
+        if self.emit_diagonal:
+            # Diagonal analogue of the `I + 0.02*noise` full-matrix init: a unit
+            # gain is the identity map, so the emitted vector starts as an
+            # unmixed copy of the population vector (and stays trainable).
+            # The full-mode draw is still consumed and discarded, so every
+            # *other* tensor keeps the exact draw it has in full mode at the
+            # same seed: the two modes then differ only in the emission map.
+            rnd(D, D, scale=0.02)
+            self.w_emit_diag = nn.Parameter(torch.ones(D, dtype=torch.float32))
+        elif cfg.emit_identity_init:
             self.w_emit = nn.Parameter(torch.eye(D, dtype=torch.float32) + rnd(D, D, scale=0.02))
         else:
             self.w_emit = nn.Parameter(rnd(D, D, scale=1.0 / math.sqrt(D)))
@@ -718,11 +735,15 @@ class VectorNeuronPopulation(nn.Module):
         """
         dt = self.state_dtype
         w_ad = None if self.w_ad is None else self.w_ad.to(dt)
+        # emission: full D x D matrix, or the per-coordinate gain vector when
+        # `emission.mode == "diagonal"`.  Either way one tensor, cast to the
+        # state dtype exactly like the other weights.
+        emit = self.w_emit_diag if self.emit_diagonal else self.w_emit
         return (
             self.w_in.to(dt),
             self.w_down.to(dt),
             self.w_up.to(dt),
-            self.w_emit.to(dt),
+            emit.to(dt),
             self.w_rec.to(dt),
             self.gate.to(dt),
             self.bias.to(dt),
@@ -825,7 +846,12 @@ class VectorNeuronPopulation(nn.Module):
             spikes.append(s)
             if adapt:
                 b = rho * b + s                                        # decaying spike trace
-            h = ((s.unsqueeze(-1) * z).sum(1) * self.pop_scale) @ w_emit    # (B, D)
+            if self.emit_diagonal:
+                # diagonal emission: one learned gain per coordinate, no mixing
+                # across coordinates; otherwise the historical D x D matrix.
+                h = ((s.unsqueeze(-1) * z).sum(1) * self.pop_scale) * w_emit    # (B, D)
+            else:
+                h = ((s.unsqueeze(-1) * z).sum(1) * self.pop_scale) @ w_emit    # (B, D)
             c = s @ w_rec                                              # (B, N)
             mix = (z @ w_down) @ w_up                                   # (B, N, D)
             drive = gate * a_chunk[:, k].unsqueeze(1) + c.unsqueeze(-1) * h.unsqueeze(1) + bias

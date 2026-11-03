@@ -72,7 +72,8 @@ so the "spikes carry vectors, not scalars" hypothesis is untouched; they only re
 parameters and constrain *how* coordinates mix in the broadcast.
 
 **PI status (2026-10-27):** "yes we can make it diagonal technically" — feasibility
-acknowledged. **Not decided, not scheduled, no run exists.**
+acknowledged. **Implemented on branch `v3.1` as `emission.mode=diagonal`
+(`EmissionConfig` in `V3/v3/config.py`, default `full`); unmeasured — no run exists.**
 
 **Open questions.** Is the `D×D` mixing part of the hypothesis or an implementation
 convenience? If it is not part of the hypothesis, is it defensible to keep it in the

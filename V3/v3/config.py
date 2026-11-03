@@ -43,6 +43,11 @@ SURROGATE_KINDS = ("fast_sigmoid", "slayer")
 #: (M11b) and keeps the same classifier weights.
 READOUTS = ("sum", "mean")
 
+#: Emission parameterisations (the ``h(t)`` map, IDEAS.md "Thread 2").
+#: ``full`` is the historical shared ``D x D`` matrix; ``diagonal`` replaces it
+#: with one learned gain per coordinate (no coordinate mixing).
+EMISSION_MODES = ("full", "diagonal")
+
 
 @dataclass
 class StateRegularizationConfig:
@@ -404,6 +409,44 @@ class TwoStageConfig:
     @classmethod
     def from_dict(cls, data: dict, strict: bool = False) -> "TwoStageConfig":
         return _block_from_dict(cls, data, strict, "two_stage")
+
+
+@dataclass
+class EmissionConfig:
+    """How the spiked population vector is mapped back into ``R^D`` (the ``h(t)`` map).
+
+    The hypothesis only needs a spike to carry a *vector* in ``R^D``; it does not
+    need the coordinates of that vector to be mixed by a dense matrix.  This
+    block is therefore a **parameterisation study**, not a new hypothesis: it
+    selects how the emitted population vector is formed and leaves the state
+    update, the gate and the recurrence untouched.
+
+    ``mode = "full"`` (default) is the historical shared ``D x D`` matrix::
+
+        h = ((sum_i s_i * z_i) * pop_scale) @ w_emit        w_emit in R^{D x D}
+
+    ``mode = "diagonal"`` replaces ``w_emit`` by one gain per coordinate::
+
+        h = ((sum_i s_i * z_i) * pop_scale) * w_emit_diag   w_emit_diag in R^D
+
+    Each coordinate is rescaled independently and no coordinate mixes into
+    another.  The gain is initialised to exactly ``1.0`` -- the diagonal
+    analogue of the ``I + 0.02*noise`` full-matrix init, i.e. the map starts as
+    the identity.  At ``D = 1000`` this removes 999,000 of the 1,000,000
+    emission parameters; nothing else about the model changes.
+    """
+
+    mode: str = "full"
+
+    def validate(self) -> None:
+        if self.mode not in EMISSION_MODES:
+            raise ValueError(
+                f"emission.mode must be one of {EMISSION_MODES}, got {self.mode!r}"
+            )
+
+    @classmethod
+    def from_dict(cls, data: dict, strict: bool = False) -> "EmissionConfig":
+        return _block_from_dict(cls, data, strict, "emission")
 
 
 @dataclass
@@ -987,6 +1030,12 @@ class V3Config:
     # are created only when enabled, so the baseline model is unchanged.
     two_stage: TwoStageConfig = field(default_factory=TwoStageConfig)
 
+    # ---- emission parameterisation (default: full D x D) ------------------
+    # "full" is the historical shared D x D matrix (1,000,000 parameters at
+    # D=1000); "diagonal" is one gain per coordinate (1,000).  Parameterisation
+    # study only: with "full" no parameter and no computation changes.
+    emission: EmissionConfig = field(default_factory=EmissionConfig)
+
     # ---- raw-event augmentation (disabled by default) ---------------------
     # Applied to the raw (time, channel) events *before* the 2-ms binning; the
     # binned tensor is never perturbed.  All defaults are off, so the default
@@ -1126,6 +1175,7 @@ class V3Config:
         self.state_dynamics.validate()
         self.adlif.validate()
         self.two_stage.validate()
+        self.emission.validate()
         self.augmentation.validate()
         self.adaptation.validate()
         self.input_delays.validate()
@@ -1196,6 +1246,8 @@ class V3Config:
                 v = AdlifConfig.from_dict(v, strict=strict)
             elif k == "two_stage" and isinstance(v, dict):
                 v = TwoStageConfig.from_dict(v, strict=strict)
+            elif k == "emission" and isinstance(v, dict):
+                v = EmissionConfig.from_dict(v, strict=strict)
             elif k == "augmentation" and isinstance(v, dict):
                 v = EventAugmentationConfig.from_dict(v, strict=strict)
             elif k == "adaptation" and isinstance(v, dict):
@@ -1240,6 +1292,7 @@ NESTED_BLOCKS: dict[str, type] = {
     "state_dynamics": StateDynamicsConfig,
     "adlif": AdlifConfig,
     "two_stage": TwoStageConfig,
+    "emission": EmissionConfig,
     "augmentation": EventAugmentationConfig,
     "adaptation": AdaptationConfig,
     "input_delays": InputDelayConfig,
@@ -1374,12 +1427,13 @@ def describe(cfg: V3Config) -> str:
         f", delay_line={dl.mode}x{dl.copies}@{dl.stride_ms:g}ms" if dl.enabled else ""
     )
     readout = "temporal_attention" if cfg.attention.enabled else cfg.readout
+    emit = f", emission={cfg.emission.mode}" if cfg.emission.mode != "full" else ""
     return (
         f"V3Config(tag={cfg.tag!r}, N={cfg.n_neurons}, D={cfg.state_dim}, "
         f"T={cfg.num_time_steps}x{cfg.time_bin_ms:g}ms={cfg.sequence_duration_ms:g}ms, "
         f"batch={cfg.batch_size}, epochs={cfg.epochs}, lr={cfg.learning_rate:g}, "
         f"device={cfg.device}, dtype={cfg.dtype}, surrogate={cfg.surrogate}, "
-        f"readout={readout}, state_reg={reg.mode}{delay})"
+        f"readout={readout}, state_reg={reg.mode}{delay}{emit})"
     )
 
 
@@ -1391,7 +1445,8 @@ def parameter_groups(cfg: V3Config) -> dict:
         "w_in": cfg.effective_input_channels * D,
         "w_down": D * R,
         "w_up": R * D,
-        "w_emit": D * D,
+        # D*D for the full shared emission matrix, D for the per-coordinate gain
+        "w_emit": D if cfg.emission.mode == "diagonal" else D * D,
         "w_rec": N * N,
         "gate": N * D,
         "bias": N * D,
@@ -1434,6 +1489,7 @@ __all__ = [
     "AdlifConfig",
     "AttentionConfig",
     "TwoStageConfig",
+    "EmissionConfig",
     "TimeJitterConfig",
     "EventBlendConfig",
     "EventDropoutConfig",
@@ -1444,6 +1500,7 @@ __all__ = [
     "InputDelayLineConfig",
     "SURROGATE_KINDS",
     "READOUTS",
+    "EMISSION_MODES",
     "NESTED_BLOCKS",
     "apply_override_items",
     "apply_override_mapping",
