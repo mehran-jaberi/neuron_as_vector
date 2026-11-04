@@ -157,7 +157,10 @@ Identical training for every row (seed 0, 2 ms, 5 epochs), all registered in
 | vector | 64 | 1000 | 2,025,440 | 1724/2264 = 76.15 % | screening |
 
 The scalar family is flat from 6,335 to 2,025,488 parameters, so the 20-epoch
-49.43 % measures an untuned control, not scalar capacity. The vector family rises
+49.43 % measures an untuned control, not scalar capacity. Thirty epochs with a
+thousand scalar neurons (`v3_emerg_n1000_d1_ep30_scalar_d1`, 1,024,703
+parameters, **confirmed**) reaches only 987/2264 = 43.60 %, fit 49.56 %, val
+42.65 % — 44.5 pp below the vector model. The vector family rises
 steeply with `D` at matching parameter counts (`D=4`, 9,056 parameters → 57.20 %).
 These 5-epoch rows were compared/selected using official TEST accuracy (n = 2264,
 binomial SE ±0.84 pp, by PI decision because speaker-overlapping `VAL` saturated

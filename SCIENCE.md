@@ -94,6 +94,7 @@ The final-model run is almost stationary over the last epochs (88.74 / 87.94 /
 | scalar neuron, size-matched | $D=1$, $N=64$, 6,335 params | 1119 = 49.43 % | state width matters (untuned control, see below) |
 | scalar neuron, capacity-matched | $D=1$, $N=1411$, 2,025,488 params | 750 = 33.13 % (5 ep) | capacity alone cannot substitute for width |
 | scalar $D=1$, $N=100$ | 5 epochs, 13,103 params | 813 = 35.91 % | a scalar state stays a scalar state at larger $N$ |
+| scalar $D=1$, $N=1000$ | 30 epochs, 1,024,703 params | 987 = 43.60 % (fit 49.56 %) | more neurons *and* more epochs do not rescue a scalar state |
 | broadcast emission width $E=1000$, $N=100$ | 5 epochs, `--variant broadcast`, 812,300 params | 1481 = 65.42 % | state width and *transmission* width matter separately |
 | vector $D=1000$, $N=100$ reference | 5 epochs, 2,140,100 params | 1803 = 79.64 % | the family the broadcast control is compared against |
 | V2 LIF reference | $N=256$, T=1400 ms | 1798/2998 = 59.98 % (doc-claim) | not our baseline; context only |
@@ -101,6 +102,11 @@ The final-model run is almost stationary over the last epochs (88.74 / 87.94 /
 At matched parameter count the gap is +36.9 pp (73 k params: scalar 31.71 %
 vs vector $D=64$ 68.60 %) and +43.0 pp (2 M params: scalar 33.13 % vs vector
 $D=1000$ 76.15 %), both at 5 epochs — `screening`, baseline 76.15 %.
+
+Thirty epochs with a thousand scalar neurons reaches only 43.60 % (987/2264,
+`v3_emerg_n1000_d1_ep30_scalar_d1`), 44.5 pp below the vector model, and its
+training accuracy is 49.56 %: the scalar model cannot even fit the training
+speakers.
 
 The scalar controls are **untuned, size-matched ablations**, not competitive
 baselines (a tuned recurrent LIF reaches ~71 % on SHD); the repository does not

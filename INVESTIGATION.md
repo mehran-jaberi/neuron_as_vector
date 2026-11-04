@@ -464,3 +464,27 @@ Measured 5 epochs, same protocol: `v3_v31_diag_ep5` **1748 = 77.21 %** (fit
 parameter-efficiency improvement of the same model, not a new model; no 20-epoch
 confirm exists.
 
+## 2026-11-04 — emergency scalar control at N=1000 (30 epochs)
+
+Run `v3_emerg_n1000_d1_ep30_scalar_d1` (`--variant scalar --override
+n_neurons=1000 --override epochs=30`, batch 128, binned cache on). 1,024,703
+parameters, 66 s/epoch, 1.12 s/batch, 33 min total.
+
+| metric | value |
+|---|---|
+| TEST | **987/2264 = 43.60 %** |
+| fit (final epoch) | 49.56 % |
+| val | 42.65 % |
+| spikes/sample | ~2,870 |
+
+Best scalar result on record, but +8 pp over the 5-epoch N=1411 arm and 44.5 pp
+below the vector model; fit 49.56 % means the scalar model does not fit the
+training speakers, so the deficit is representational rather than an
+optimization-horizon artefact. Recorded as a `confirmed` (30-epoch) control in
+SCIENCE §4 and RESULTS.md.
+
+Incident: the first attempt trained all 30 epochs and died at the TEST store
+construction with `AttributeError: '_aug_forced_off'` — `SHDEventStore.__init__`
+built the binned cache before initialising the augmentation-gating fields. Fixed
+in `V3/v3/data.py` (commit `0a13aa9`, gating block moved above the cache build)
+and the run relaunched.
