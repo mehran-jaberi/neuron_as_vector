@@ -103,15 +103,11 @@ class SHDEventStore:
         # bookkeeping filled in by stats()
         self.n_events_raw = 0
         self.n_events_kept = 0
-        # optional pre-binned dense cache (performance only; values identical).
-        # Off by default: the on-the-fly path below stays the reference.
-        self.binned: object | None = None
-        if bool(getattr(cfg, "binned_cache", False)) and not self.augmentation.active():
-            from .binned_cache import BinnedCache
-
-            self.binned = BinnedCache.open_or_build(self)
         # augmentation gating: phase is the store-wide switch, the optional index
         # mask keeps a FIT store from augmenting the VAL samples it also serves.
+        # NOTE: initialise this BEFORE the binned cache below? No: the cache
+        # builder calls batch() -> augmentation_applies(), which reads
+        # _aug_forced_off, so the gating fields must exist first.
         self.phase = "val"  # safe default: no augmentation outside training
         self.epoch = 0
         self._aug_rng: np.random.Generator | None = None
@@ -121,6 +117,13 @@ class SHDEventStore:
         # build_partner_pool(); empty means "no partner available", which is what
         # the VAL/TEST stores always have.
         self._partner_pool: dict[int, np.ndarray] = {}
+        # optional pre-binned dense cache (performance only; values identical).
+        # Off by default: the on-the-fly path below stays the reference.
+        self.binned: object | None = None
+        if bool(getattr(cfg, "binned_cache", False)) and not self.augmentation.active():
+            from .binned_cache import BinnedCache
+
+            self.binned = BinnedCache.open_or_build(self)
 
     # ------------------------------------------------------------------ #
     def _file(self) -> h5py.File:
