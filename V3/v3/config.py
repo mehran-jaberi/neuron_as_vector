@@ -212,11 +212,21 @@ class InputCurrentConfig:
 
     enabled: bool = False
     init_std: float = 0.1   # w_in_current entries ~ N(0, init_std^2)
+    # Design A': give the state a learned resting vector instead of exactly zero,
+    # so the value of a learned internal state can be measured at all.  With a
+    # scalar input current (design A) nothing else pushes ``z`` away from the
+    # origin -- ``mix``, ``h`` and ``bias`` are all proportional to ``z`` -- and
+    # ``z == 0`` is a stable fixed point, so the state would stay identically
+    # zero for every trial (verified by probe: |z| = 0.0 at all 500 steps).
+    bias_init_std: float = 0.0  # resting state vector bias ~ N(0, bias_init_std^2)
 
     def validate(self) -> None:
         std = float(self.init_std)
         if not math.isfinite(std) or std <= 0.0:
             raise ValueError("input_current.init_std must be a positive finite number")
+        bstd = float(self.bias_init_std)
+        if not math.isfinite(bstd) or bstd < 0.0:
+            raise ValueError("input_current.bias_init_std must be a non-negative finite number")
 
     @classmethod
     def from_dict(cls, data: dict, strict: bool = False) -> "InputCurrentConfig":

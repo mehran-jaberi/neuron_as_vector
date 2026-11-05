@@ -144,3 +144,39 @@ def test_override_via_string_form():
     )
     assert cfg.input_current.enabled is True
     assert cfg.input_current.init_std == pytest.approx(0.2)
+
+
+def test_bias_init_std_defaults_to_zero_and_keeps_bias_at_zero():
+    cfg = V3Config()
+    cfg.n_neurons, cfg.state_dim = 4, 8
+    cfg.input_current.enabled = True
+    model = _model(cfg)
+    assert model.input_current is True
+    assert torch.count_nonzero(model.bias) == 0
+    assert torch.count_nonzero(model.z0 if False else model.bias) == 0
+
+
+def test_bias_init_std_breaks_the_zero_state_fixed_point():
+    cfg = V3Config()
+    cfg.n_neurons, cfg.state_dim = 4, 8
+    cfg.input_current.enabled = True
+    cfg.input_current.bias_init_std = 0.5
+    model = _model(cfg)
+    assert torch.count_nonzero(model.bias) > 0
+    assert float(model.bias.std()) > 0.1
+    model.eval()
+    with torch.no_grad():
+        model.calibrate_threshold(_x(batch=2, steps=20))
+        _, _, z, _ = model(_x(batch=2, steps=20), return_states=True)
+    assert float(z.abs().mean()) > 1e-3
+
+
+def test_bias_init_std_must_be_non_negative():
+    cfg = V3Config()
+    cfg.input_current.enabled = True
+    cfg.input_current.bias_init_std = -1.0
+    with pytest.raises(ValueError, match="bias_init_std"):
+        cfg.validate()
+    cfg.input_current.bias_init_std = float("inf")
+    with pytest.raises(ValueError, match="bias_init_std"):
+        cfg.validate()

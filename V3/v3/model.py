@@ -351,7 +351,14 @@ class VectorNeuronPopulation(nn.Module):
         self.gate = None if self.input_current else nn.Parameter(
             torch.ones(N, D, dtype=torch.float32) + rnd(N, D, scale=0.05)
         )
-        self.bias = nn.Parameter(torch.zeros(N, D, dtype=torch.float32))
+        # Design A' (scalar input current only): a non-zero resting-state draw
+        # breaks the stable fixed point at z = 0 that otherwise leaves the whole
+        # D-dimensional state inert.  Default 0.0 keeps every other path
+        # bit-identical, including the baseline and design A itself.
+        if self.input_current and float(cfg.input_current.bias_init_std) > 0.0:
+            self.bias = nn.Parameter(rnd(N, D, scale=float(cfg.input_current.bias_init_std)))
+        else:
+            self.bias = nn.Parameter(torch.zeros(N, D, dtype=torch.float32))
         self.w_out = nn.Parameter(rnd(N, D, scale=1.0 / math.sqrt(D)))
         self.theta = nn.Parameter(torch.zeros(N, dtype=torch.float32))
         # zero-initialised classifier: the initial logits are exactly 0, i.e. the
