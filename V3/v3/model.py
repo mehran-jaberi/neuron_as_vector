@@ -68,6 +68,24 @@ Readout (spike counts, 20 SHD classes)::
 
        logits = ( sum_t s(t) ) W_cls                  in R^20
 
+Learning-matrix emission and R2 readout (``V3Config.learning_matrix``)
+-----------------------------------------------------------------------
+With the block enabled the model has neither an emission map nor a count
+classifier.  The pooled population state is not projected into a learned latent
+space -- it *is* the row of the learning matrix, and the classifier reads that
+matrix over time::
+
+       L_t          = pooled_t = (1/sqrt(N)) sum_j s_j(t) z_j(t)   in R^D
+       logits[b, k] = sum_t a[t, k] < L_t[b, :], v[:, k] >        in R^K
+
+``v`` is ``(D, K)``, drawn ``N(0, 1/sqrt(D))``; ``a`` is ``(T, K)``, initialised
+uniformly at ``1/T`` over the timesteps actually executed.  ``W_emit`` and
+``W_cls`` are not registered in this mode; the state update, recurrence,
+threshold and adaptation are untouched, and the returned tuple is unchanged:
+the spike counts are still formed, they simply do not reach the logits.  With
+``enabled=False`` (the default) both are registered as before, no extra RNG draw
+is consumed and the forward pass is bit-identical.
+
 Learnable input delays
 ----------------------
 With ``cfg.input_delays.enabled`` every input channel ``c`` owns one delay
@@ -296,6 +314,12 @@ class VectorNeuronPopulation(nn.Module):
         K = int(cfg.n_classes)
         self.n_neurons, self.state_dim, self.n_inputs, self.mix_rank, self.n_classes = N, D, C, R, K
         self.state_dtype = cfg.torch_dtype
+        # Learning-matrix emission (R2): when on, ``h_t`` is the pooled state
+        # itself and the classifier reads the matrix over time, so neither the
+        # emission map nor the count classifier is registered (see
+        # LearningMatrixConfig).
+        lm = cfg.learning_matrix
+        self.learning_matrix_enabled = bool(lm.enabled)
 
         g = torch.Generator().manual_seed(int(cfg.seed) + 12345)
 
@@ -313,10 +337,17 @@ class VectorNeuronPopulation(nn.Module):
         self.w_in = nn.Parameter(rnd(C_in, D, scale=float(cfg.input_gain) / math.sqrt(C_in)))  # shared input basis
         self.w_down = nn.Parameter(rnd(D, R, scale=1.0 / math.sqrt(D)))    # shared rank-R mixing
         self.w_up = nn.Parameter(rnd(R, D, scale=0.5 / math.sqrt(R)))      # (init mixing gain ~0.5)
+        # The emission tensor is *drawn* in both modes -- one call, one generator
+        # draw -- so an enabled build shares every init draw with the baseline
+        # build; only the registration is skipped, because R2 has no emission
+        # map (h_t := pooled_t).
         if cfg.emit_identity_init:
-            self.w_emit = nn.Parameter(torch.eye(D, dtype=torch.float32) + rnd(D, D, scale=0.02))
+            emit_init = torch.eye(D, dtype=torch.float32) + rnd(D, D, scale=0.02)
         else:
-            self.w_emit = nn.Parameter(rnd(D, D, scale=1.0 / math.sqrt(D)))
+            emit_init = rnd(D, D, scale=1.0 / math.sqrt(D))
+        self.w_emit: nn.Parameter | None = (
+            None if lm.enabled else nn.Parameter(emit_init)
+        )
         self.w_rec = nn.Parameter(rnd(N, N, scale=1.0 / math.sqrt(N)))
         self.gate = nn.Parameter(torch.ones(N, D, dtype=torch.float32) + rnd(N, D, scale=0.05))
         self.bias = nn.Parameter(torch.zeros(N, D, dtype=torch.float32))
@@ -325,8 +356,11 @@ class VectorNeuronPopulation(nn.Module):
         # zero-initialised classifier: the initial logits are exactly 0, i.e. the
         # initial cross-entropy is ln(20).  With a spike-count readout the logit
         # scale grows with the firing rate, so a random readout init would start
-        # far from the loss basin.
-        self.w_cls = nn.Parameter(torch.zeros(N, K, dtype=torch.float32))
+        # far from the loss basin.  Absent in R2, where the matrix readout has
+        # its own (zero-free) initialisation, see below.
+        self.w_cls: nn.Parameter | None = (
+            None if lm.enabled else nn.Parameter(torch.zeros(N, K, dtype=torch.float32))
+        )
 
         # Spike-frequency adaptation (off by default): one scalar adaptive gain
         # per neuron, read against a decaying spike-count trace.  When the
@@ -429,6 +463,23 @@ class VectorNeuronPopulation(nn.Module):
                     _lam_raw_init(ts.lam_init, ts.lam_min, ts.lam_max),
                     dtype=torch.float32,
                 )
+            )
+
+        # ---- learning-matrix emission (R2, off by default) -------------------
+        # No emission map and no count classifier: ``h_t := pooled_t`` is the
+        # learning-matrix row L_t, and the classifier reads the matrix over time,
+        # ``logits[b, k] = sum_t a[t, k] * (L_t[b] @ v[:, k])``.  Both matrices
+        # are created only when the block is enabled, so the disabled model keeps
+        # exactly the baseline parameter set, state_dict and init stream.  They
+        # are drawn *last*, after every baseline draw, so an enabled build also
+        # leaves all shared parameters at their baseline values.
+        self.v_matrix: nn.Parameter | None = None  # (D, K) learning-matrix basis
+        self.a_time: nn.Parameter | None = None    # (T, K) per-bin, per-class weights
+        if lm.enabled:
+            self.v_matrix = nn.Parameter(rnd(D, K, scale=1.0 / math.sqrt(D)))
+            T_steps = int(cfg.total_steps)
+            self.a_time = nn.Parameter(
+                torch.full((T_steps, K), 1.0 / T_steps, dtype=torch.float32)
             )
 
         # expose the analytic flag so the class itself never hard-codes D > 1
@@ -714,21 +765,26 @@ class VectorNeuronPopulation(nn.Module):
 
         Master weights stay fp32 so the optimizer keeps full precision; the
         computation itself is genuinely fp16.  ``w_ad`` is ``None`` when
-        spike-frequency adaptation is disabled (nothing registered then).
+        spike-frequency adaptation is disabled (nothing registered then);
+        ``w_emit`` / ``w_cls`` are ``None`` in the learning-matrix mode, where
+        neither the emission map nor the count classifier exists.
         """
         dt = self.state_dtype
         w_ad = None if self.w_ad is None else self.w_ad.to(dt)
+        # absent (None) in the learning-matrix mode: nothing was registered
+        w_emit = None if self.w_emit is None else self.w_emit.to(dt)
+        w_cls = None if self.w_cls is None else self.w_cls.to(dt)
         return (
             self.w_in.to(dt),
             self.w_down.to(dt),
             self.w_up.to(dt),
-            self.w_emit.to(dt),
+            w_emit,
             self.w_rec.to(dt),
             self.gate.to(dt),
             self.bias.to(dt),
             self.w_out.to(dt),
             self.theta.to(dt),
-            self.w_cls.to(dt),
+            w_cls,
             w_ad,
         )
 
@@ -772,6 +828,7 @@ class VectorNeuronPopulation(nn.Module):
         u_fast: torch.Tensor | None = None,
         u_slow: torch.Tensor | None = None,
         state_sum: torch.Tensor | None = None,
+        lm_a: torch.Tensor | None = None,
     ):
         """Run one chunk of timesteps with every optional mechanism.
 
@@ -784,6 +841,12 @@ class VectorNeuronPopulation(nn.Module):
         spike-generation potential; the adLIF currents are subtracted from the
         pre-activation inside the tanh.  With both features off the computation is
         bit-identical to the baseline.
+
+        ``lm_a`` is the ``(chunk, K)`` slice of the learning-matrix time weights
+        ``a``.  When it is given (R2 mode) a seventh value, this chunk's fp32
+        ``(B, K)`` matrix-readout partial, is appended to the tuple; the readout
+        rows are folded as the chunk runs, so ``(B, T, D)`` is never formed.  The
+        baseline call omits the argument and keeps the six-value result.
         """
         w_in, w_down, w_up, w_emit, w_rec, gate, bias, w_out, theta, _, w_ad = self._weights()
         dt = self.state_dtype
@@ -812,6 +875,13 @@ class VectorNeuronPopulation(nn.Module):
             w_down2, w_up2, lam = two_stage
 
         spikes, pots = [], []
+        # R2: fp32 (B, K) partial of sum_t a[t] (L_t @ v), accumulated in this
+        # chunk; None on the baseline path (then ``w_emit`` is not None).
+        lm_part = None
+        if lm_a is not None:
+            lm_part = torch.zeros(
+                z.shape[0], self.n_classes, device=z.device, dtype=torch.float32
+            )
         for k in range(a_chunk.shape[1]):
             if state_sum is not None:
                 state_sum += z                                        # fp32 running sum
@@ -825,7 +895,14 @@ class VectorNeuronPopulation(nn.Module):
             spikes.append(s)
             if adapt:
                 b = rho * b + s                                        # decaying spike trace
-            h = ((s.unsqueeze(-1) * z).sum(1) * self.pop_scale) @ w_emit    # (B, D)
+            h = (s.unsqueeze(-1) * z).sum(1) * self.pop_scale          # (B, D) pooled
+            if w_emit is not None:
+                h = h @ w_emit                                         # (B, D) emitted
+            if lm_part is not None:
+                # R2: L_t := h_t is the pooled state itself (no emission map), so
+                # this bin contributes ``a[t] (x) v`` to the running logits.  fp32
+                # like the count classifier; (B, T, D) is never materialised.
+                lm_part = lm_part + (h.float() @ self.v_matrix) * lm_a[:, k].float()
             c = s @ w_rec                                              # (B, N)
             mix = (z @ w_down) @ w_up                                   # (B, N, D)
             drive = gate * a_chunk[:, k].unsqueeze(1) + c.unsqueeze(-1) * h.unsqueeze(1) + bias
@@ -859,7 +936,7 @@ class VectorNeuronPopulation(nn.Module):
             # so its effect genuinely propagates through the dynamics.
             if self.cfg.state_regularization.mode != "none":
                 z = regularize_state(z, self.cfg.state_regularization, self._reg_phase())
-        return (
+        out = (
             z,
             torch.stack(spikes, dim=1),
             torch.stack(pots, dim=1),
@@ -867,6 +944,9 @@ class VectorNeuronPopulation(nn.Module):
             u_fast,
             u_slow,
         )
+        if lm_part is not None:
+            out = out + (lm_part,)     # R2: this chunk's fp32 (B, K) readout partial
+        return out
 
     def _segment(self, z: torch.Tensor, a_chunk: torch.Tensor,
                  b: torch.Tensor | None = None,
@@ -909,6 +989,12 @@ class VectorNeuronPopulation(nn.Module):
         ``cfg.adaptation.enabled`` changes no return value: the ``(B, N)``
         adaptation trace is internal state, zero at the first timestep and
         carried across the time segments exactly like ``z``.
+
+        ``cfg.learning_matrix.enabled`` likewise changes no return value.  The
+        logits then come from the learning-matrix readout (the per-chunk
+        ``(B, K)`` partials are summed here) instead of ``counts @ W_cls``;
+        ``spikes`` -- and every rate/statistic derived from them -- are
+        unchanged.
         """
         B, T, C = x.shape
         if C != self.n_inputs:
@@ -954,6 +1040,14 @@ class VectorNeuronPopulation(nn.Module):
             else None
         )
         spikes, pots = [], []
+        # Learning-matrix readout (R2): fp32 (B, K) accumulator of the per-chunk
+        # partials.  The (B, T, D) matrix is never materialised -- each segment
+        # folds its own readout rows against ``v_matrix`` / ``a_time`` as it runs.
+        lm_logits = (
+            torch.zeros(B, self.n_classes, device=x.device, dtype=torch.float32)
+            if self.learning_matrix_enabled
+            else None
+        )
         if self.adlif_enabled:
             # per-batch reset of the adaptation currents, like `z` above
             u_fast, u_slow = self.init_adaptation(B, x.device)
@@ -968,23 +1062,43 @@ class VectorNeuronPopulation(nn.Module):
             uf_arg = u_fast if u_fast is not None else empty
             us_arg = u_slow if u_slow is not None else empty
             a_chunk = a[:, t0 : t0 + step]
+            # R2: the time weights of *this* chunk (None on the baseline path, so
+            # the baseline call keeps its six positional arguments)
+            lm_chunk = self.a_time[t0 : t0 + step] if lm_logits is not None else None
             if use_ckpt:
                 # fixed arity, tensors only -- see VectorNeuronPopulation._segment_any
-                z, s, p, b, u_fast, u_slow = checkpoint(
-                    self._segment_any, z, a_chunk, b_arg, uf_arg, us_arg,
-                    use_reentrant=False,
-                )
+                if lm_chunk is None:
+                    seg = checkpoint(
+                        self._segment_any, z, a_chunk, b_arg, uf_arg, us_arg,
+                        use_reentrant=False,
+                    )
+                else:
+                    seg = checkpoint(
+                        self._segment_any, z, a_chunk, b_arg, uf_arg, us_arg,
+                        lm_a=lm_chunk, use_reentrant=False,
+                    )
+            elif lm_chunk is None:
+                seg = self._segment_any(z, a_chunk, b_arg, uf_arg, us_arg, state_sum)
             else:
-                z, s, p, b, u_fast, u_slow = self._segment_any(
-                    z, a_chunk, b_arg, uf_arg, us_arg, state_sum
+                seg = self._segment_any(
+                    z, a_chunk, b_arg, uf_arg, us_arg, state_sum, lm_chunk
                 )
+            z, s, p, b, u_fast, u_slow = seg[:6]
+            if lm_logits is not None:
+                lm_logits = lm_logits + seg[6]
             spikes.append(s)
             if return_potentials:
                 pots.append(p)
         spikes = torch.cat(spikes, dim=1)                              # (B, T, N)
 
         counts = self.readout_counts(spikes)                           # (B, N) fp32
-        logits = counts @ self.w_cls.float()                           # (B, K) fp32
+        if lm_logits is not None:
+            # R2: the classifier reads the accumulated (B, K) matrix projection;
+            # the spike counts are still formed, exactly as before, but do not
+            # reach the logits -- there is no count classifier in this mode.
+            logits = lm_logits
+        else:
+            logits = counts @ self.w_cls.float()                       # (B, K) fp32
         out = [logits, spikes]
         if return_potentials:
             out.append(torch.cat(pots, dim=1))
