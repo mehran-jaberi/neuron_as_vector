@@ -902,7 +902,7 @@ class VectorNeuronPopulation(nn.Module):
                 # R2: L_t := h_t is the pooled state itself (no emission map), so
                 # this bin contributes ``a[t] (x) v`` to the running logits.  fp32
                 # like the count classifier; (B, T, D) is never materialised.
-                lm_part = lm_part + (h.float() @ self.v_matrix) * lm_a[:, k].float()
+                lm_part = lm_part + (h.float() @ self.v_matrix) * lm_a[k].float()
             c = s @ w_rec                                              # (B, N)
             mix = (z @ w_down) @ w_up                                   # (B, N, D)
             drive = gate * a_chunk[:, k].unsqueeze(1) + c.unsqueeze(-1) * h.unsqueeze(1) + bias
