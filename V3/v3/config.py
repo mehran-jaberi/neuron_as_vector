@@ -188,6 +188,42 @@ class AdaptationConfig:
 
 
 @dataclass
+class InputCurrentConfig:
+    """Scalar input current into the spike-generation potential (design A).
+
+    Instead of lifting the ``C``-channel binary frame into the ``D``-dimensional
+    state space with one shared ``C x D`` matrix, every neuron owns a ``C``-vector
+    ``v_i`` and receives a **scalar** current per bin::
+
+        a_i(t)   = <x(t), v_i>                       # (B, N), one number per neuron
+        pot_i(t) = <z_i(t), w_out_i> + theta_i + a_i(t) - w_ad_i b_i(t)
+
+    The input therefore never touches the vector state directly: it can only
+    change firing probability, and everything the D-dimensional state does has
+    to happen through the emitted population vector and the mixers.  The shared
+    projection drops from ``C*D`` parameters (700,000 at C=700, D=1000) to
+    ``N*C`` (70,000 at N=100), and ``gate`` -- one input gain per neuron per
+    coordinate -- disappears with it (another ``N*D`` parameters).
+
+    Off by default: the baseline path is bit-identical and its parameter set is
+    unchanged.  Mutually exclusive with ``input_delay_line``, which stacks
+    channel copies for the shared projection that no longer exists.
+    """
+
+    enabled: bool = False
+    init_std: float = 0.1   # w_in_current entries ~ N(0, init_std^2)
+
+    def validate(self) -> None:
+        std = float(self.init_std)
+        if not math.isfinite(std) or std <= 0.0:
+            raise ValueError("input_current.init_std must be a positive finite number")
+
+    @classmethod
+    def from_dict(cls, data: dict, strict: bool = False) -> "InputCurrentConfig":
+        return _block_from_dict(cls, data, strict, "input_current")
+
+
+@dataclass
 class StateDynamicsConfig:
     """Optional trainable state dynamics: per-neuron leak and initial state.
 
@@ -1050,6 +1086,10 @@ class V3Config:
     # state.  Off by default and nothing is registered when off, so the
     # baseline forward pass and parameter set are unchanged.
     adaptation: AdaptationConfig = field(default_factory=AdaptationConfig)
+    # ---- scalar input current instead of the shared input projection --------
+    # One C-vector per neuron, dotted with the binary frame, added to the
+    # spike-generation potential; see InputCurrentConfig.  Off by default.
+    input_current: InputCurrentConfig = field(default_factory=InputCurrentConfig)
     # ---- input delay line on the binned input (disabled by default) --------
     # K time-shifted copies of the *already-binned* (B, T, C) input, applied
     # once per batch before the checkpointed temporal loop.  Off by default:
@@ -1183,6 +1223,13 @@ class V3Config:
             bin_ms=self.bin_ms, sequence_duration_ms=self.sequence_duration_ms
         )
         self.attention.validate()
+        self.input_current.validate()
+        if self.input_current.enabled and self.input_delay_line.enabled:
+            raise ValueError(
+                "input_current and input_delay_line are mutually exclusive: the "
+                "delay line stacks channel copies for the shared input projection, "
+                "which input_current removes"
+            )
 
     # ------------------------------------------------------------------ #
     def to_dict(self) -> dict:
@@ -1258,6 +1305,8 @@ class V3Config:
                 v = InputDelayLineConfig.from_dict(v, strict=strict)
             elif k == "attention" and isinstance(v, dict):
                 v = AttentionConfig.from_dict(v, strict=strict)
+            elif k == "input_current" and isinstance(v, dict):
+                v = InputCurrentConfig.from_dict(v, strict=strict)
             elif k == "timing" and isinstance(v, dict):
                 v = TimingConfig.from_dict(v, strict=strict)
             kwargs[k] = v
@@ -1298,6 +1347,7 @@ NESTED_BLOCKS: dict[str, type] = {
     "input_delays": InputDelayConfig,
     "input_delay_line": InputDelayLineConfig,
     "attention": AttentionConfig,
+    "input_current": InputCurrentConfig,
 }
 
 
@@ -1442,18 +1492,20 @@ def parameter_groups(cfg: V3Config) -> dict:
     N, D, C, R = cfg.n_neurons, cfg.state_dim, cfg.n_inputs, min(cfg.mix_rank, cfg.state_dim)
     groups = {
         # C, or K*C when the delay line stacks shifted copies along the channel axis
-        "w_in": cfg.effective_input_channels * D,
+        "w_in": 0 if cfg.input_current.enabled else cfg.effective_input_channels * D,
+        "w_in_current": N * C if cfg.input_current.enabled else 0,
         "w_down": D * R,
         "w_up": R * D,
         # D*D for the full shared emission matrix, D for the per-coordinate gain
         "w_emit": D if cfg.emission.mode == "diagonal" else D * D,
         "w_rec": N * N,
-        "gate": N * D,
         "bias": N * D,
         "w_out": N * D,
         "theta": N,
         "w_cls": N * cfg.n_classes,
     }
+    if not cfg.input_current.enabled:
+        groups["gate"] = N * D
     if cfg.adaptation.enabled and cfg.adaptation.learnable_gain:
         groups["w_ad"] = N
     if cfg.input_delays.enabled:

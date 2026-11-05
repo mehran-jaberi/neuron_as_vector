@@ -443,11 +443,11 @@ def test_off_path_never_runs_the_adlif_currents():
     seen = {"n": 0}
     original = model._segment_any
 
-    def counting(z, a, b=None, u_fast=None, u_slow=None, state_sum=None):
+    def counting(z, a, b=None, u_fast=None, u_slow=None, state_sum=None, cur=None, **kwargs):
         assert u_fast is not None and u_fast.numel() == 0
         assert u_slow is not None and u_slow.numel() == 0
         seen["n"] += 1
-        return original(z, a, b, u_fast, u_slow, state_sum)
+        return original(z, a, b, u_fast, u_slow, state_sum, cur, **kwargs)
 
     model._segment_any = counting
     with torch.no_grad():
@@ -459,10 +459,10 @@ def test_off_path_never_runs_the_adlif_currents():
     live = {"fast": 0, "slow": 0}
     base = enabled._segment_any
 
-    def watching(z, a, b=None, u_fast=None, u_slow=None, state_sum=None):
+    def watching(z, a, b=None, u_fast=None, u_slow=None, state_sum=None, cur=None):
         live["fast"] += int(u_fast is not None and u_fast.numel() > 0)
         live["slow"] += int(u_slow is not None and u_slow.numel() > 0)
-        return base(z, a, b, u_fast, u_slow, state_sum)
+        return base(z, a, b, u_fast, u_slow, state_sum, cur)
 
     enabled._segment_any = watching
     with torch.no_grad():

@@ -210,9 +210,9 @@ def test_forward_projection_consumes_the_delayed_input(mode):
     chunks = []
     original = model._segment_any
 
-    def spy(z, a_chunk, b=None, u_fast=None, u_slow=None, state_sum=None):
+    def spy(z, a_chunk, b=None, u_fast=None, u_slow=None, state_sum=None, cur=None, **kwargs):
         chunks.append(a_chunk)
-        return original(z, a_chunk, b, u_fast, u_slow, state_sum)
+        return original(z, a_chunk, b, u_fast, u_slow, state_sum, cur, **kwargs)
 
     model._segment_any = spy
     with torch.no_grad():

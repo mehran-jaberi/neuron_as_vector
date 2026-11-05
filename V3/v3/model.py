@@ -310,7 +310,20 @@ class VectorNeuronPopulation(nn.Module):
         # the RNG draw are unchanged (bit-identical init).
         C_in = int(cfg.input_delay_line.input_channels(C))
         self.input_channels = C_in
-        self.w_in = nn.Parameter(rnd(C_in, D, scale=float(cfg.input_gain) / math.sqrt(C_in)))  # shared input basis
+        # scalar input current (design A): every neuron owns one C-vector and
+        # receives <x(t), v_i> into its spike-generation potential.  No shared
+        # projection and no per-coordinate input gate are registered then, so the
+        # parameter set genuinely shrinks (C*D + N*D -> N*C) instead of carrying
+        # dead weights.
+        self.input_current = bool(cfg.input_current.enabled)
+        if self.input_current:
+            self.w_in = None
+            self.w_in_current = nn.Parameter(
+                rnd(N, C, scale=float(cfg.input_current.init_std))
+            )
+        else:
+            self.w_in = nn.Parameter(rnd(C_in, D, scale=float(cfg.input_gain) / math.sqrt(C_in)))  # shared input basis
+            self.w_in_current = None
         self.w_down = nn.Parameter(rnd(D, R, scale=1.0 / math.sqrt(D)))    # shared rank-R mixing
         self.w_up = nn.Parameter(rnd(R, D, scale=0.5 / math.sqrt(R)))      # (init mixing gain ~0.5)
         # ---- emission parameterisation (default: shared D x D matrix) --------
@@ -335,7 +348,9 @@ class VectorNeuronPopulation(nn.Module):
         else:
             self.w_emit = nn.Parameter(rnd(D, D, scale=1.0 / math.sqrt(D)))
         self.w_rec = nn.Parameter(rnd(N, N, scale=1.0 / math.sqrt(N)))
-        self.gate = nn.Parameter(torch.ones(N, D, dtype=torch.float32) + rnd(N, D, scale=0.05))
+        self.gate = None if self.input_current else nn.Parameter(
+            torch.ones(N, D, dtype=torch.float32) + rnd(N, D, scale=0.05)
+        )
         self.bias = nn.Parameter(torch.zeros(N, D, dtype=torch.float32))
         self.w_out = nn.Parameter(rnd(N, D, scale=1.0 / math.sqrt(D)))
         self.theta = nn.Parameter(torch.zeros(N, dtype=torch.float32))
@@ -740,12 +755,12 @@ class VectorNeuronPopulation(nn.Module):
         # state dtype exactly like the other weights.
         emit = self.w_emit_diag if self.emit_diagonal else self.w_emit
         return (
-            self.w_in.to(dt),
+            None if self.w_in is None else self.w_in.to(dt),
             self.w_down.to(dt),
             self.w_up.to(dt),
             emit.to(dt),
             self.w_rec.to(dt),
-            self.gate.to(dt),
+            None if self.gate is None else self.gate.to(dt),
             self.bias.to(dt),
             self.w_out.to(dt),
             self.theta.to(dt),
@@ -793,6 +808,7 @@ class VectorNeuronPopulation(nn.Module):
         u_fast: torch.Tensor | None = None,
         u_slow: torch.Tensor | None = None,
         state_sum: torch.Tensor | None = None,
+        input_current: torch.Tensor | None = None,
     ):
         """Run one chunk of timesteps with every optional mechanism.
 
@@ -833,12 +849,18 @@ class VectorNeuronPopulation(nn.Module):
             w_down2, w_up2, lam = two_stage
 
         spikes, pots = [], []
-        for k in range(a_chunk.shape[1]):
+        # timesteps come from the shared input projection, or from the scalar
+        # current when the projection is absent (design A)
+        steps = a_chunk.shape[1] if a_chunk.numel() else input_current.shape[1]
+        for k in range(steps):
             if state_sum is not None:
                 state_sum += z                                        # fp32 running sum
             pot = (z * w_out).sum(-1) + theta                          # (B, N) fp16
             if adapt:
                 pot = pot - w_ad * b                                   # adaptation current
+            if input_current is not None and input_current.numel():
+                # design A: one scalar current per neuron, added to the potential
+                pot = pot + input_current[:, k].to(dt)
             pots.append(pot)
             s = surrogate_spike(
                 pot, beta, gamma, kind=surrogate_kind, alpha=surrogate_alpha
@@ -854,7 +876,10 @@ class VectorNeuronPopulation(nn.Module):
                 h = ((s.unsqueeze(-1) * z).sum(1) * self.pop_scale) @ w_emit    # (B, D)
             c = s @ w_rec                                              # (B, N)
             mix = (z @ w_down) @ w_up                                   # (B, N, D)
-            drive = gate * a_chunk[:, k].unsqueeze(1) + c.unsqueeze(-1) * h.unsqueeze(1) + bias
+            if gate is not None:
+                drive = gate * a_chunk[:, k].unsqueeze(1) + c.unsqueeze(-1) * h.unsqueeze(1) + bias
+            else:
+                drive = c.unsqueeze(-1) * h.unsqueeze(1) + bias
             pre = mix + drive
             if use_fast:
                 pre = pre - (g_fast.view(1, -1, 1) * u_fast.unsqueeze(-1)).to(dt)
@@ -946,7 +971,7 @@ class VectorNeuronPopulation(nn.Module):
         # sequence *before* it is split into segments (see ``delayed_input``)
         x = self.delayed_input(x)
         dt = self.state_dtype
-        w_in = self.w_in.to(dt)
+        w_in = None if self.w_in is None else self.w_in.to(dt)
 
         # Input delay line (M10): K shifted copies of the already-binned input,
         # applied once per batch *before* the checkpointed temporal loop.  The
@@ -956,8 +981,16 @@ class VectorNeuronPopulation(nn.Module):
             x, self.cfg.input_delay_line, bin_ms=self.cfg.bin_ms, dtype=dt
         )
 
-        # shared input projection: one big matmul over the whole sequence
-        a = (x.reshape(B * T, -1).to(dt) @ w_in).reshape(B, T, self.state_dim)
+        # shared input projection: one big matmul over the whole sequence.
+        # With the scalar input current there is no such projection; every neuron
+        # instead gets <x(t), v_i>, computed for the whole sequence at once.
+        if self.input_current:
+            cur = (x.reshape(B * T, self.n_inputs).to(dt) @ self.w_in_current.to(dt).t())
+            cur = cur.reshape(B, T, self.n_neurons)
+            a = None
+        else:
+            cur = None
+            a = (x.reshape(B * T, -1).to(dt) @ w_in).reshape(B, T, self.state_dim)
 
         z = self.init_state(B, x.device)
         adapt = bool(self.cfg.adaptation.enabled)
@@ -993,16 +1026,18 @@ class VectorNeuronPopulation(nn.Module):
             b_arg = b if b is not None else empty
             uf_arg = u_fast if u_fast is not None else empty
             us_arg = u_slow if u_slow is not None else empty
-            a_chunk = a[:, t0 : t0 + step]
+            empty_chunk = torch.zeros(0, device=x.device, dtype=dt)
+            a_chunk = a[:, t0 : t0 + step] if a is not None else empty_chunk
+            cur_chunk = cur[:, t0 : t0 + step] if cur is not None else empty_chunk
             if use_ckpt:
                 # fixed arity, tensors only -- see VectorNeuronPopulation._segment_any
                 z, s, p, b, u_fast, u_slow = checkpoint(
                     self._segment_any, z, a_chunk, b_arg, uf_arg, us_arg,
-                    use_reentrant=False,
+                    None, cur_chunk, use_reentrant=False,
                 )
             else:
                 z, s, p, b, u_fast, u_slow = self._segment_any(
-                    z, a_chunk, b_arg, uf_arg, us_arg, state_sum
+                    z, a_chunk, b_arg, uf_arg, us_arg, state_sum, cur_chunk
                 )
             spikes.append(s)
             if return_potentials:
