@@ -762,6 +762,58 @@ class AttentionConfig:
 
 
 @dataclass
+class LearningMatrixConfig:
+    """Learning-matrix emission with a time-resolved R2 readout (off by default).
+
+    The baseline readout *is* an emission map plus a count classifier::
+
+        pooled_t = (1/sqrt(N)) sum_j s_j(t) z_j(t)          (B, D)
+        h_t      = pooled_t W_emit^T                        (B, D)
+        logits   = ( sum_t s_t ) W_cls                      (B, K)
+
+    so the classifier only ever sees *how many* spikes each neuron fired, not
+    what the population state was when it fired.  With this block enabled the
+    model has no emission map and no count classifier: the pooled population
+    state is not projected into a learned latent space, it **is** the row of the
+    learning matrix::
+
+        L_t          = pooled_t                             (B, D) == h_t
+        logits[b, k] = sum_t a[t, k] * (L_t[b,:] @ v[:, k])
+
+    ``v`` is ``(D, K)`` drawn ``N(0, 1/sqrt(D))`` and ``a`` is ``(T, K)``
+    initialised to ``1/T`` (uniform over the timesteps that are actually
+    executed), so the initial logits are ``1/T`` times the sum of the per-bin
+    projections.  Both are read out in fp32, like the count classifier.  The
+    state update, recurrence, threshold and adaptation are untouched, and the
+    forward output tuple is unchanged: ``counts`` is still formed as before, it
+    simply does not reach the logits.
+
+    ``enabled=False`` (the default) registers no parameter, consumes no extra
+    RNG draw and leaves the forward pass bit-identical: ``W_emit`` and ``W_cls``
+    exist exactly as before.  When enabled, both are absent from the model and
+    the budget is ``D*K`` (``v_matrix``) plus ``T*K`` (``a_time``) instead.
+
+    ``readout`` names the readout form; only ``"r2"`` is implemented.
+    """
+
+    enabled: bool = False
+    readout: str = "r2"
+
+    READOUT_KINDS = ("r2",)
+
+    def validate(self) -> None:
+        if self.readout not in self.READOUT_KINDS:
+            raise ValueError(
+                f"learning_matrix.readout must be one of {self.READOUT_KINDS}, "
+                f"got {self.readout!r}"
+            )
+
+    @classmethod
+    def from_dict(cls, data: dict, strict: bool = False) -> "LearningMatrixConfig":
+        return _block_from_dict(cls, data, strict, "learning_matrix")
+
+
+@dataclass
 class TimingConfig:
     """Temporal discretization of the SHD experiment.
 
@@ -1113,6 +1165,15 @@ class V3Config:
     # a plain count sum; see AttentionConfig.  The default (off) path is
     # bit-identical and adds no parameters.
     attention: AttentionConfig = field(default_factory=AttentionConfig)
+    # ---- learning-matrix emission + R2 readout (disabled by default) ------
+    # No emission map and no count classifier: h_t := pooled_t is the matrix
+    # row L_t and the classifier reads the matrix over time with its own
+    # (D, K) basis and (T, K) bin weights; see LearningMatrixConfig.  Off by
+    # default, so the baseline parameter set, init stream and forward pass are
+    # unchanged.
+    learning_matrix: LearningMatrixConfig = field(
+        default_factory=LearningMatrixConfig
+    )
 
     # ---- io --------------------------------------------------------------
     out_dir: str = "results"        # resolved relative to V3/ when not absolute
@@ -1240,6 +1301,7 @@ class V3Config:
                 "delay line stacks channel copies for the shared input projection, "
                 "which input_current removes"
             )
+        self.learning_matrix.validate()
 
     # ------------------------------------------------------------------ #
     def to_dict(self) -> dict:
@@ -1317,6 +1379,8 @@ class V3Config:
                 v = AttentionConfig.from_dict(v, strict=strict)
             elif k == "input_current" and isinstance(v, dict):
                 v = InputCurrentConfig.from_dict(v, strict=strict)
+            elif k == "learning_matrix" and isinstance(v, dict):
+                v = LearningMatrixConfig.from_dict(v, strict=strict)
             elif k == "timing" and isinstance(v, dict):
                 v = TimingConfig.from_dict(v, strict=strict)
             kwargs[k] = v
@@ -1358,6 +1422,7 @@ NESTED_BLOCKS: dict[str, type] = {
     "input_delay_line": InputDelayLineConfig,
     "attention": AttentionConfig,
     "input_current": InputCurrentConfig,
+    "learning_matrix": LearningMatrixConfig,
 }
 
 
@@ -1488,6 +1553,9 @@ def describe(cfg: V3Config) -> str:
     )
     readout = "temporal_attention" if cfg.attention.enabled else cfg.readout
     emit = f", emission={cfg.emission.mode}" if cfg.emission.mode != "full" else ""
+    if cfg.learning_matrix.enabled:
+        # no emission map and no count classifier: the pooled state is the matrix
+        readout = f"learning_matrix:{cfg.learning_matrix.readout}"
     return (
         f"V3Config(tag={cfg.tag!r}, N={cfg.n_neurons}, D={cfg.state_dim}, "
         f"T={cfg.num_time_steps}x{cfg.time_bin_ms:g}ms={cfg.sequence_duration_ms:g}ms, "
@@ -1537,6 +1605,14 @@ def parameter_groups(cfg: V3Config) -> dict:
         groups["w_down2"] = D * R2
         groups["w_up2"] = R2 * D
         groups["lam_raw"] = 1
+    if cfg.learning_matrix.enabled:
+        # R2: neither the emission map nor the count classifier exists; the
+        # classifier reads the pooled state through the (D, K) matrix basis and
+        # the (T, K) per-bin time weights instead.
+        groups.pop("w_emit")
+        groups.pop("w_cls")
+        groups["v_matrix"] = D * cfg.n_classes
+        groups["a_time"] = cfg.total_steps * cfg.n_classes
     groups["total"] = sum(groups.values())
     return groups
 
@@ -1550,6 +1626,7 @@ __all__ = [
     "InputDelayConfig",
     "AdlifConfig",
     "AttentionConfig",
+    "LearningMatrixConfig",
     "TwoStageConfig",
     "EmissionConfig",
     "TimeJitterConfig",
