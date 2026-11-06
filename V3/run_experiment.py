@@ -27,6 +27,16 @@ import sys
 import time
 from pathlib import Path
 
+# --- light path: ``--help-overrides`` must work with a plain interpreter, so it
+# runs before numpy/torch and the experiment modules are imported.
+if __name__ == "__main__" and "--help-overrides" in sys.argv[1:]:
+    _here = Path(__file__).resolve().parent
+    sys.path.insert(0, str(_here))
+    from v3.config import format_override_help
+
+    print(format_override_help())
+    raise SystemExit(0)
+
 import numpy as np
 import torch
 

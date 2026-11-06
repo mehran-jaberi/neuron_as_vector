@@ -22,7 +22,6 @@ import math
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-import yaml
 
 V3_ROOT = Path(__file__).resolve().parent.parent
 REPO_ROOT = V3_ROOT.parent
@@ -1388,6 +1387,10 @@ class V3Config:
 
     @classmethod
     def from_yaml(cls, path: str | Path, strict: bool = True) -> "V3Config":
+        # imported lazily so that the config schema (and --help-overrides) can be
+        # read by an interpreter without the training dependencies installed
+        import yaml
+
         with open(path, "r", encoding="utf-8") as fh:
             data = yaml.safe_load(fh) or {}
         return cls.from_dict(data, strict=strict)
