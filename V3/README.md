@@ -152,10 +152,51 @@ $$
 The spike still carries a $D$-vector and $\mathbf h(t) \in \mathbb R^D$; the gate,
 recurrence and state dynamics are untouched. This is a **parameterisation/constraint
 study, not a new hypothesis**: it removes 999,000 parameters (2,025,440 → 1,026,440 at
-$N = 64$, $D = 1000$) and asks what constraining the emission to coordinate-wise
-scaling costs. It is implemented but unmeasured. Switch it with
+$N = 64$, $D = 1000$). Measured at 5 epochs, $N=64$: 1748 = 77.21 % against the
+1724 = 76.15 % baseline, i.e. inside the ±0.87 pp noise band — the dense mix is
+not load-bearing (`RESULTS.md` §4.1). Switch it with
 `--override emission.mode=diagonal`. The two modes have different parameter sets, so
 their checkpoints are not interchangeable under the default strict `load_state_dict`.
+
+### Scalar input current: `input_current.enabled`
+
+Design A replaces the shared $700\times1000$ projection and the per-neuron gate
+with **one scalar current per neuron**, $a_{i,t}=\langle\mathbf x(t),\mathbf g_i\rangle$,
+$\mathbf g_i\in\mathbb R^{700}$ (70,000 parameters), added to the spike
+potential $o_i(t)$:
+
+$$
+o_i(t) = \langle \mathbf z_i(t), \mathbf w^{out}_i\rangle + \theta_i + a_{i,t}
+$$
+
+The vector state then never sees the input; its only drive is its own bias and
+the recurrent population signal. Two requirements:
+
+- `input_current.bias_init_std` must be **> 0** (e.g. `0.5`). With `bias = 0`
+  and $z_0 = 0$ every forcing term is proportional to $\mathbf z$, so the state
+  has a globally stable fixed point at zero and the model degenerates into a
+  threshold-only classifier ($|\mathbf z| = 0$ for all 500 steps, chance
+  accuracy).
+- It is **mutually exclusive with `input_delay_line`** (the delay line widens
+  the input from $C$ to $KC$; the current needs the original $C$). Validation
+  rejects the pair.
+
+Measured (`RESULTS.md` §9.1): A′ at $N=100$ with diagonal emission, 20 epochs,
+raw input — **1937 = 85.56 %** with 411,100 parameters.
+
+### The other mechanism switches
+
+`adaptation` (M1), `state_dynamics` (`trainable_alpha`, `learnable_z0`, M2),
+`input_delays` (M4), `adlif` (M8), `two_stage` (M12), `attention` (M11b),
+`timing.silence_tail_ms` (M13), `surrogate` (`slayer`), `optimizer`,
+`augmentation.event_blend` (M7) and the five raw-event operations all live in
+the same config; `--help-overrides` prints every key with its default.
+
+**Dead weight.** `adlif.enabled` combined with `two_stage.enabled` is inert:
+the adLIF currents subtract from `pre`, and the two-stage update rebuilds the
+state from `mix` and the inner `tanh` without reading `pre`, so
+`adlif_gain_fast`/`_slow` get `grad = None` (200 parameters that never train in
+the final $N=100$ model). See `TODO.md` §Dead weight.
 
 ---
 
@@ -607,25 +648,37 @@ Half the parameters were that one matrix, and the 5-epoch number is inside the
 because every headline run used it. Verification: `full` mode is bit-identical
 to the pre-change code (all non-emission tensors, logits maxdiff 0.0), and with
 a genuinely diagonal emission matrix the diagonal path reproduces the full path
-exactly (maxdiff 0.0 in fp32). The branch is `v3.1` (`wt-v3.1`), not merged into
-`main`.
+exactly (maxdiff 0.0 in fp32). Merged into `main` as `7848247` (branch `v3.1`).
 
 ## 12. Current experimental reference
 
+The **headline** is the final merged model (`RESULTS.md` §9):
+
 ```
-N = 64    D = 1000    epochs = 20    params = 2,025,440
-timing: 1000 ms / 2 ms  ->  T = 500, alpha = 0.1
+N = 100   D = 1000   epochs = 30   params = 3,069,201   batch = 96
+timing: 1000 ms / 2 ms -> T = 500 + 50 tail bins, alpha = 0.1
 ```
 
 ```
+VECTOR  all blocks  3,069,201 params   TEST 1994/2264 = 88.07%   (epoch 28: 2009 = 88.74%)
+```
+
+The historical reference that the screening runs were compared against is the
+plain 20-epoch vector model:
+
+```
+N = 64    D = 1000    epochs = 20    params = 2,025,440
 VECTOR  D=1000  N=64    2,025,440 params   test  1868/2264 =  82.51%
 ```
 
-Verified from the executed `V3_SHD_experiment.ipynb` (the stored test evaluation
-cells) and the registry run `2026-10-02_14-31-15`. This is the number every
-imprecision screening run is compared against. The size-matched scalar control
-($D=1$, $N=64$, 6,335 parameters) reaches 49.43% at 20 epochs under the same
-protocol, which is the comparison that matters for the width claim.
+The size-matched scalar control ($D=1$, $N=64$, 6,335 parameters) reaches
+49.43% at 20 epochs and the capacity-matched scalar ($N=1411$) 33.13% at 5
+epochs, which is the comparison that matters for the width claim.
+
+The lean scalar-current variant (design A′, `RESULTS.md` §9.1) is
+`--override input_current.enabled=true --override input_current.bias_init_std=0.5
+--override emission.mode=diagonal`: 411,100 parameters, 1937 = 85.56 % at
+N=100, 20 epochs, no augmentation.
 
 ## 13. Temporal resolution and data order
 

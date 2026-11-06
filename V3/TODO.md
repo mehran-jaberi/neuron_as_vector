@@ -291,3 +291,16 @@ hash, cross-checked against a checkout of `e01aaba`); all three features at once
 train (forward + backward finite, every new parameter group non-zero gradient);
 new `V3/tests/test_feature_combinations.py` pins down "each alone, any pair, all
 three" so a later merge cannot silently break the combination.
+
+## Dead weight (do not "fix" silently)
+
+- `adlif.enabled` + `two_stage.enabled`: the adLIF currents subtract from
+  `pre`, but the two-stage update rebuilds the state from `mix` and the inner
+  `tanh`, never reading `pre`. `adlif_gain_fast` / `adlif_gain_slow` therefore
+  get `grad = None` — 200 parameters that never train in the final N=100 model.
+  Making adLIF real changes the model and needs its own 20-epoch confirmation.
+- `input_delay_line` cannot be combined with `input_current` (the line widens
+  the input from C to KC; the scalar current needs C). Validation rejects the
+  pair; it is not silently ignored.
+- `feat/pade-tanh` stays unmerged (CUDA device-not-ready in the checkpointed
+  recompute); the fused loop already provides the speed-up it was meant to buy.

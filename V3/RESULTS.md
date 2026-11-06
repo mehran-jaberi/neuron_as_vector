@@ -308,3 +308,28 @@ i.e. mixing all five augmentations without the dynamics changes *hurt* by 4 pp.
 were chosen on 5-epoch TEST accuracy (winner's curse, ±0.84 pp SE at n=2264), so
 the quoted 88 % carries a selection penalty that is not quantified; there is no
 N=100 all-off baseline at 30 epochs. See `KNOWN_ISSUES.md` #1 and #6.
+
+**Dead weight in this configuration.** `adlif.enabled` is on but contributes
+nothing: the adLIF currents are subtracted from `pre`, and the two-stage update
+path (`two_stage.enabled`) never reads `pre`, so `adlif_gain_fast`/`_slow` get
+`grad = None` — 200 parameters that never train. `input_delay_line` and the
+scalar input current are mutually exclusive (the delay line widens the input
+from C to KC; the current needs C), rejected by validation.
+
+### 9.1 Scalar input current variant (design A′)
+
+One scalar current per neuron into the spike potential, no shared `W_in` and no
+gate: $a_{i,t}=\langle x_t,g_i\rangle$, $g_i\in\mathbb{R}^{700}$, plus a learned
+resting vector (`input_current.bias_init_std=0.5`) because with `bias=0` the
+state has a globally stable fixed point at zero and the model degenerates to a
+threshold-only classifier (|z| = 0 for all 500 steps, chance accuracy).
+
+| run | config | params | TEST | provenance |
+|---|---|---|---|---|
+| `v3_inputcur_bias_diag_ep5` | N=64, diagonal emission, 5 ep | 307,240 | 1350 = 59.63 % | screening |
+| `v3_inputcur_bias_diag_n100_ep20` | N=100, diagonal emission, 20 ep, no augmentation | 411,100 | **1937 = 85.56 %** (fit 96.39, val 91.79) | confirmed |
+
+A′ is 7.5× smaller than the 3.07 M final model and lands 2.5 pp lower **without
+any augmentation** — not a clean comparison, but enough to say the vector state
+does not need the input projected into it. The two branches stay separate
+(`feat/input-current` was merged, the variant is selected by flags).

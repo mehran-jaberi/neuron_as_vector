@@ -70,6 +70,25 @@ The final model switches on every merged mechanism at once, at $N=100$:
 $N=100$, $D=1000$, 30 epochs, batch 96, Adam $10^{-3}$ cosine, 3,069,201
 parameters.
 
+**Dead weight in this configuration.** Two mechanisms are switched on but
+cannot contribute:
+
+- **adLIF is inert under the two-stage update.** The adLIF currents subtract
+  from `pre`, the pre-activation used by the single-stage update; with
+  `two_stage.enabled` the state is reconstructed from `mix` and the inner
+  `tanh` stage instead, so `pre` is not read. The 200 adLIF parameters exist
+  and never receive a gradient (`grad = None` under the final config). Keeping
+  the flag on keeps the parameter set comparable, not the mechanism.
+- **`input_delay_line` cannot coexist with the scalar input current.** It
+  widens the input from $C$ to $KC$ channels, while the scalar current needs
+  the original $C=700$; the configuration validation rejects the pair rather
+  than silently ignoring one.
+
+The final model from §2 predates the scalar-current variant: it still uses the
+shared $700\times1000$ `w_in` projection. §4.2 reports the scalar-current
+variant separately.
+
+
 ## 3. Headline numbers
 
 All TEST numbers: official SHD test file, 2264 samples, frozen weights, seed 0.
@@ -139,6 +158,30 @@ diagonal **1748 = 77.21 %** vs the baseline **1724 = 76.15 %** (`screening`,
 single seed, Δ +1.06 pp, inside the ±0.87 pp binomial noise band). The dense mix
 is not load-bearing at this budget; it stays in the headline model because the
 headline runs were made with it.
+
+### 4.2 Scalar input current (design A′)
+
+The headline model injects the input as a 1000-vector (`x W_in`, 700 k
+parameters) and a per-neuron gate. A leaner design puts **one scalar current per
+neuron into the spike potential** instead, $a_{i,t}=\langle x_t, g_i\rangle$ with
+$g_i\in\mathbb{R}^{700}$ (70 k parameters), so the vector state never sees the
+input directly and the drive into the state is purely recurrent.
+
+Design A as first written is **structurally dead**: with `bias = 0` and
+$z_0 = 0$ every state-forcing term is proportional to $z$, so $|z|$ stays exactly
+0 for all 500 steps (11 Hz by threshold alone, per-sample count sd 1.47) and the
+model collapses to chance. A small learned resting vector
+(`input_current.bias_init_std = 0.5`) breaks the fixed point; that is A′.
+
+| variant | params | epochs | TEST | note |
+|---|---|---|---|---|
+| A′, $N=64$, diagonal emission | 307,240 | 5 | 1350 = 59.63 % | screening; 16 pp under the same architecture with a real input→state path |
+| A′, $N=100$, diagonal emission, raw | 411,100 | 20 | **1937 = 85.56 %** | no augmentation; 2.5 pp under the 3.07 M-parameter final model |
+
+A′ reaches 85.56 % with **7.5× fewer parameters** than the headline model, but
+it has no augmentation and a different input path, so the two numbers are not a
+clean comparison; the relevant statement is that the vector state does not need
+the input to be projected into it in order to work.
 
 ## 5. What the width is doing (mechanism)
 
