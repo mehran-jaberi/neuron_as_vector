@@ -876,7 +876,8 @@ class VectorNeuronPopulation(nn.Module):
         two adLIF currents of M8.  The M1 adaptation current is subtracted from the
         spike-generation potential; the adLIF currents are subtracted from the
         pre-activation inside the tanh.  With both features off the computation is
-        bit-identical to the baseline.
+        bit-identical to the baseline.  The equation is run with matmuls and
+        fused in-place updates: identical math, only the summation order differs.
 
         ``lm_a`` is the ``(chunk, K)`` slice of the learning-matrix time weights
         ``a``.  When it is given (R2 mode) a seventh value, this chunk's fp32
@@ -914,6 +915,14 @@ class VectorNeuronPopulation(nn.Module):
         # timesteps come from the shared input projection, or from the scalar
         # current when the projection is absent (design A)
         steps = a_chunk.shape[1] if a_chunk.numel() else input_current.shape[1]
+        B, N, D = z.shape
+        # ``pot`` only needs the per-neuron diagonal of ``z @ w_out.T``.  The GEMM
+        # writes B*N*N numbers, i.e. less traffic than the (B, N, D) product of the
+        # elementwise form while N <= D.  The scalar baseline (D == 1, N == 1000)
+        # would need a huge B*N*N block for a one-element reduction, so it keeps the
+        # elementwise form; the equation is the same either way.
+        gemm_pot = D >= N
+        w_out_t = w_out.t() if gemm_pot else None
         # R2: fp32 (B, K) partial of sum_t a[t] (L_t @ v), accumulated in this
         # chunk; None on the baseline path (then the emitted vector is used).
         lm_part = None
@@ -924,9 +933,17 @@ class VectorNeuronPopulation(nn.Module):
         for k in range(steps):
             if state_sum is not None:
                 state_sum += z                                        # fp32 running sum
-            pot = (z * w_out).sum(-1) + theta                          # (B, N) fp16
+            if gemm_pot:
+                # rows of ``z.reshape(B*N, D)`` are (b, n) pairs, so entry
+                # [b, n1, n2] of the GEMM is <z[b, n1], w_out[n2]> and the
+                # potential is its diagonal n1 == n2: one matmul instead of a
+                # full (B, N, D) multiply plus reduction.
+                pot = torch.mm(z.reshape(B * N, D), w_out_t).view(B, N, N)
+                pot = pot.diagonal(dim1=1, dim2=2) + theta             # (B, N) fp16
+            else:
+                pot = (z * w_out).sum(-1) + theta                      # (B, N) fp16
             if adapt:
-                pot = pot - w_ad * b                                   # adaptation current
+                pot.addcmul_(w_ad, b, value=-1.0)                      # adaptation current
             if input_current is not None and input_current.numel():
                 # design A: one scalar current per neuron, added to the potential
                 pot = pot + input_current[:, k].to(dt)
@@ -937,15 +954,17 @@ class VectorNeuronPopulation(nn.Module):
             spikes.append(s)
             if adapt:
                 b = rho * b + s                                        # decaying spike trace
-            pooled = (s.unsqueeze(-1) * z).sum(1) * self.pop_scale      # (B, D)
+            # population signal: (B, 1, N) @ (B, N, D) -> (B, D), summing over the
+            # neurons as a matmul instead of materialising the (B, N, D) product
+            pooled = torch.bmm(s.unsqueeze(1), z).squeeze(1) * self.pop_scale
             if w_emit is None:
                 # R2: L_t := pooled state itself; no emission map exists
                 h = pooled
             elif self.emit_diagonal:
                 # diagonal emission: one learned gain per coordinate, no mixing
-                h = pooled * w_emit                                     # (B, D)
+                h = pooled * w_emit
             else:
-                h = pooled @ w_emit                                     # (B, D)
+                h = pooled @ w_emit                                    # (B, D)
             if lm_part is not None:
                 # this bin contributes a[t] (L_t @ v) to the running logits; fp32
                 # like the count classifier, and (B, T, D) is never materialised
@@ -953,28 +972,40 @@ class VectorNeuronPopulation(nn.Module):
             c = s @ w_rec                                              # (B, N)
             mix = (z @ w_down) @ w_up                                   # (B, N, D)
             if gate is not None:
-                drive = gate * a_chunk[:, k].unsqueeze(1) + c.unsqueeze(-1) * h.unsqueeze(1) + bias
+                # drive = gate*a + c*h + bias, accumulated into one fresh tensor
+                drive = gate * a_chunk[:, k].unsqueeze(1)
+                drive.addcmul_(c.unsqueeze(-1), h.unsqueeze(1))
+                drive.add_(bias)
             else:
-                drive = c.unsqueeze(-1) * h.unsqueeze(1) + bias
-            pre = mix + drive
-            if use_fast:
-                pre = pre - (g_fast.view(1, -1, 1) * u_fast.unsqueeze(-1)).to(dt)
-            if use_slow:
-                pre = pre - (g_slow.view(1, -1, 1) * u_slow.unsqueeze(-1)).to(dt)
-            if two_stage is None:
-                new_z = torch.tanh(pre)
-            else:
+                # design A: no shared projection, so only the scalar current (in
+                # ``pot``) and the bias seed the state; the recurrent term stays.
+                drive = c.unsqueeze(-1) * h.unsqueeze(1)
+                drive.add_(bias)
+            pre = drive                                                # aliased, no copy
+            if two_stage is not None:
                 # second, independent rank-R2 mixer + tanh, at the same state;
                 # `drive` is shared and `lam` (bounded sigmoid gain, init 1.0)
                 # gates the inner stage.  The adLIF currents act on `pre` only,
-                # so the inner stage sees the bare mix + drive, as on its branch.
+                # so the inner stage sees the bare mix + drive, evaluated before
+                # the mixer is folded into ``pre`` (which aliases ``drive``).
                 mix2 = (z @ w_down2) @ w_up2
                 inner = torch.tanh(mix2 + drive)
-                new_z = torch.tanh(mix + lam * inner)
-            if alpha_i is None:
-                z = z + alpha * (new_z - z)
+            pre.add_(mix)                                              # pre = mix + drive
+            if use_fast:
+                pre.sub_((g_fast.view(1, -1, 1) * u_fast.unsqueeze(-1)).to(dt))
+            if use_slow:
+                pre.sub_((g_slow.view(1, -1, 1) * u_slow.unsqueeze(-1)).to(dt))
+            if two_stage is None:
+                new_z = torch.tanh(pre)
             else:
-                z = z + alpha_i * (new_z - z)
+                new_z = torch.tanh(mix + lam * inner)
+            # z <- z + alpha*(tanh(pre) - z) in one kernel.  The tanh output is
+            # never written in place (its backward saves it), and the per-neuron
+            # leak uses addcmul for the same reason.
+            if alpha_i is None:
+                z = torch.lerp(z, new_z, alpha)
+            else:
+                z = torch.addcmul(z, new_z - z, alpha_i)
             z = z.to(dt)
             if adlif:
                 if use_fast:
