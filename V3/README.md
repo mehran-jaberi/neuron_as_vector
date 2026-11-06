@@ -137,6 +137,26 @@ Both are ordinary keys in `configs/v3_default.yaml`; nothing in the model, data
 loader or notebook hard-codes them. Setting `state_dim: 1` gives the scalar
 control population *through the identical code path*.
 
+### Emission parameterisation: `emission.mode`
+
+`emission.mode: full` (default) keeps the historical shared $D\times D$ matrix
+$W_{emit}$ (1,000,000 parameters at $D = 1000$). `emission.mode: diagonal`
+replaces it by a per-coordinate trainable gain $\mathbf g \in \mathbb R^D$
+(1,000 parameters, initialised to exactly $\mathbf 1$ — the diagonal analogue of
+the $I + 0.02\cdot\text{noise}$ init):
+
+$$
+\mathbf h(t) = \frac{1}{\sqrt N}\Big(\sum_j s_j(t)\,\mathbf z_j(t)\Big) \odot \mathbf g
+$$
+
+The spike still carries a $D$-vector and $\mathbf h(t) \in \mathbb R^D$; the gate,
+recurrence and state dynamics are untouched. This is a **parameterisation/constraint
+study, not a new hypothesis**: it removes 999,000 parameters (2,025,440 → 1,026,440 at
+$N = 64$, $D = 1000$) and asks what constraining the emission to coordinate-wise
+scaling costs. It is implemented but unmeasured. Switch it with
+`--override emission.mode=diagonal`. The two modes have different parameter sets, so
+their checkpoints are not interchangeable under the default strict `load_state_dict`.
+
 ---
 
 ## 3. SHD setup
