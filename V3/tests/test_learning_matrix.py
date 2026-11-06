@@ -237,8 +237,9 @@ def test_logits_are_the_hand_computed_matrix_readout():
         ref_logits, ref_spikes, ref_z, matrix = _r2_reference(model, x)
     assert logits.shape == (B, K)
     assert matrix.abs().sum() > 0
-    # the state update is untouched: the same trajectory, bit for bit
-    assert torch.equal(z_final, ref_z)
+    # the state update is untouched: the same trajectory, up to fp32 summation
+    # order (the fast loop uses matmuls), spikes and readout stay exact
+    torch.testing.assert_close(z_final, ref_z, rtol=1e-5, atol=1e-6)
     assert torch.equal(spikes, ref_spikes)
     # the readout is exactly the hand-computed sum over the learning matrix,
     # i.e. h_t is the pooled state and no emission map sits in between
