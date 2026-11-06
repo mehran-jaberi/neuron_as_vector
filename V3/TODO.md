@@ -202,6 +202,21 @@ Measured 2026-10-26 (see `PERF.md`): one FIT epoch (N=64, D=1000, T=500, 2 ms,
 batch 128) is **196.72 s** warm, GPU utilisation **94.6 %**, host binning
 **8.44 s = 4 %** — the "~30 % of the epoch" premise below was false.
 
+- [x] fused step kernels (branch `perf/loop-kernels`, merged 2026-11-06): the
+      `pot`/`h` matmuls go through `mm`/`bmm`, the drive/drive-add/tanh/leak are
+      fused in place. Measured **4.04 -> 3.18 s/step (1.27x)** at N=100, D=1000,
+      B=96; spikes and logits identical, the state agrees to ~1 ulp. The four
+      `torch.equal` parity tests were relaxed to `assert_close(1e-5)` for the
+      state only (spikes/logits still exact) — fp32 summation order, not maths.
+- [ ] **Padé tanh (candidate C): parked as a dead end.** Implemented on branch
+      `feat/pade-tanh` (`184de5d`, rebased `904bc30`) with `activation.kind`,
+      tests and docs. A single training step aborts inside the checkpointed
+      recompute with `RuntimeError: CUDA driver error: device not ready`; it
+      reproduces with fp32 state, with one chunk and with the upcast removed,
+      runs under `CUDA_LAUNCH_BLOCKING=1` and in an isolated probe, and the tanh
+      path trains normally on the same GPU. Not merged; the speed argument is
+      already answered by the fused loop above.
+
 - [x] host-side binning overlap / pre-binned cache — landed opt-in
       (`--override binned_cache=true`, default off): 190.52 s (−3.2 %), tensors
       bit-identical, 2.66 GiB under `V3/cache/` (git-ignored). `DataLoader`
