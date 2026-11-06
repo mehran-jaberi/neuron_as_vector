@@ -34,7 +34,13 @@ V3_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(V3_ROOT))
 
 from v3 import plots  # noqa: E402
-from v3.config import TimingConfig, V3Config, apply_override_items, describe  # noqa: E402
+from v3.config import (  # noqa: E402
+    TimingConfig,
+    V3Config,
+    apply_override_items,
+    describe,
+    format_override_help,
+)
 from v3.experiment import (  # noqa: E402
     load_checkpoint_payload,
     resolve_device,
@@ -169,7 +175,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--test-best-val", action="store_true",
                     help="also evaluate the best-validation checkpoint on the test set")
     ap.add_argument("--no-progress", action="store_true")
+    ap.add_argument(
+        "--help-overrides", action="store_true",
+        help="print every --override key (with its default value) and exit",
+    )
     args = ap.parse_args(argv)
+
+    if args.help_overrides:
+        print(format_override_help())
+        return 0
 
     resume_payload = None
     if args.resume:

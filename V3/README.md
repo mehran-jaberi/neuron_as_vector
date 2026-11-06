@@ -543,6 +543,14 @@ The runner accepts dotted overrides, so no YAML edits are needed between runs:
   --override state_regularization.mode=quantization --override state_regularization.quantize_bits=8
 ```
 
+To see every key the override grammar accepts (with its current value and type),
+ask the runner instead of the documentation — the list is generated from the
+config dataclasses, so it cannot go stale:
+
+```powershell
+.venv\Scripts\python.exe V3\run_experiment.py --help-overrides
+```
+
 Suggested screening values: `noise_std` ∈ {0.001, 0.005, 0.01, 0.02, 0.05};
 `quantize_bits` ∈ {16, 12, 8, 6, 4}. Nothing launches a grid automatically — each
 command runs exactly one configuration and records exactly one row. The measured

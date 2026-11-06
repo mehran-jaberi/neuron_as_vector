@@ -1544,6 +1544,63 @@ def apply_override_items(cfg: V3Config, items: list[str]) -> "V3Config":
     return apply_override_mapping(cfg, parsed)
 
 
+def override_paths(
+    cfg: V3Config | None = None,
+) -> list[tuple[str, str, object]]:
+    """Every key the ``--override key=value`` grammar accepts, as leaves.
+
+    Returns ``(path, type_name, current_value)`` for every scalar field of the
+    configuration, walking nested blocks to any depth (e.g.
+    ``augmentation.event_dropout.probability``).  The list is what
+    :func:`format_override_help` prints and what ``--help-overrides`` shows.
+    """
+    root = cfg if cfg is not None else V3Config()
+    out: list[tuple[str, str, object]] = []
+
+    def walk(obj: object, prefix: str) -> None:
+        for field in dataclasses.fields(obj):          # type: ignore[arg-type]
+            value = getattr(obj, field.name)
+            path = f"{prefix}{field.name}"
+            if dataclasses.is_dataclass(value) and not isinstance(value, type):
+                walk(value, path + ".")
+            else:
+                out.append((path, type(value).__name__, value))
+
+    walk(root, "")
+    return out
+
+
+def format_override_help(cfg: V3Config | None = None) -> str:
+    """Human-readable list of every ``--override`` key, grouped by block.
+
+    Top-level fields come first, then one section per nested configuration
+    block.  Each line shows the current value and its Python type, so the
+    output doubles as a description of the default configuration.
+    """
+    paths = override_paths(cfg)
+    top = [row for row in paths if "." not in row[0]]
+    blocks: dict[str, list[tuple[str, str, object]]] = {}
+    for row in paths:
+        if "." in row[0]:
+            head = row[0].split(".", 1)[0]
+            blocks.setdefault(head, []).append(row)
+
+    def line(path: str, kind: str, value: object) -> str:
+        shown = repr(value)
+        if len(shown) > 48:
+            shown = shown[:45] + "..."
+        return f"  {path:<46} {shown:<50} ({kind})"
+
+    lines = ["--override keys (key=value; nested blocks use dots):", ""]
+    lines.append("top-level:")
+    lines += [line(*row) for row in top]
+    for head in sorted(blocks):
+        lines += ["", f"{head}:"]
+        lines += [line(*row) for row in blocks[head]]
+    lines += ["", f"{len(paths)} keys in total."]
+    return "\n".join(lines)
+
+
 def describe(cfg: V3Config) -> str:
     """Short human-readable summary used in logs and notebook output."""
     reg = cfg.state_regularization
@@ -1646,6 +1703,8 @@ __all__ = [
     "V3_ROOT",
     "REPO_ROOT",
     "describe",
+    "override_paths",
+    "format_override_help",
     "parameter_groups",
     "math",
 ]
