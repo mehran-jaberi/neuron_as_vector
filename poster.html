@@ -1,0 +1,637 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>What a neuron's internal state buys — A0 poster</title>
+<style>
+  @page { size: 841mm 1189mm; margin: 0; }
+
+  :root{
+    --paper:#F7F4EC;
+    --white:#FFFFFF;
+    --ink:#14242B;
+    --soft:#40565B;
+    --muted:#6E7E80;
+    --teal:#0E7C86;
+    --teal-dark:#0B4F57;
+    --teal-pale:#E3F0EF;
+    --ochre:#C46A2D;
+    --ochre-pale:#F4E7DA;
+    --red:#B23A2E;
+    --red-pale:#F5E3DF;
+    --border:#D8D1C0;
+    --rule:#C9C2B1;
+    --eq-bg:#F0ECE1;
+  }
+
+  *{ box-sizing:border-box; }
+  html, body{ margin:0; padding:0; background:#D8D2C5; }
+  body{
+    font-family: Arial, Helvetica, sans-serif;
+    color:var(--ink);
+    -webkit-print-color-adjust:exact;
+    print-color-adjust:exact;
+  }
+
+  .poster{
+    width:841mm;
+    height:1189mm;
+    margin:0 auto;
+    background:var(--paper);
+    padding:12mm 15mm 9mm;
+    position:relative;
+    display:flex;
+    flex-direction:column;
+  }
+
+  @media screen{
+    .poster{ zoom:.42; margin:10mm auto; box-shadow:0 8px 40px rgba(0,0,0,.22); }
+  }
+  @media print{
+    html, body{ background:var(--paper); }
+    .poster{ zoom:1; margin:0; box-shadow:none; }
+  }
+
+  /* ---------- masthead ---------- */
+  .masthead{
+    display:grid;
+    grid-template-columns: 1fr 205mm;
+    gap:10mm;
+    align-items:end;
+    border-bottom:2.6mm solid var(--teal);
+    padding-bottom:6mm;
+  }
+  .kicker{
+    font-size:10pt; letter-spacing:.13em; font-weight:700;
+    color:var(--teal); text-transform:uppercase;
+    display:flex; align-items:center; gap:3mm;
+  }
+  .kicker .dot{ width:3.4mm; height:3.4mm; background:var(--teal); display:inline-block; }
+  h1{
+    font-family:Georgia, 'Times New Roman', serif;
+    font-size:64pt; line-height:.96; letter-spacing:-.025em;
+    margin:5mm 0 3mm; max-width:565mm;
+  }
+  .subtitle{
+    font-family:Georgia, 'Times New Roman', serif;
+    font-size:23pt; line-height:1.18; color:var(--soft);
+    max-width:565mm;
+  }
+  .byline{
+    margin-top:5mm; font-size:14pt; color:var(--ink);
+    display:flex; align-items:center; gap:4mm;
+  }
+  .byline .sep{ width:20mm; height:.5mm; background:var(--rule); display:inline-block; }
+  .byline .role{ color:var(--muted); font-size:11.5pt; }
+
+  .hero{
+    border-left:1.2mm solid var(--border);
+    padding-left:9mm;
+  }
+  .hero-value{
+    font-family:Georgia, 'Times New Roman', serif;
+    font-size:82pt; line-height:.82; color:var(--teal);
+    letter-spacing:-.03em;
+  }
+  .hero-value span{ font-size:36pt; }
+  .hero-label{
+    font-size:12.5pt; font-weight:700; color:var(--ink);
+    margin-top:2.5mm;
+  }
+  .hero-meta{
+    font-size:10.5pt; color:var(--muted); line-height:1.4;
+    margin-top:2.5mm;
+  }
+
+  /* ---------- body ---------- */
+  .body{
+    display:grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap:8mm;
+    margin-top:8mm;
+  }
+  .col{ display:flex; flex-direction:column; gap:7mm; min-width:0; }
+  .col-label{
+    font-size:9pt; letter-spacing:.14em; font-weight:700;
+    color:var(--muted); text-transform:uppercase;
+    padding-bottom:1.4mm; border-bottom:.4mm solid var(--rule);
+  }
+  .col-label b{ color:var(--teal); }
+
+  .block{ break-inside:avoid; }
+  .sec-head{
+    display:flex; align-items:baseline; gap:3mm;
+    border-bottom:.45mm solid var(--border);
+    padding-bottom:1.6mm; margin-bottom:2.8mm;
+  }
+  .num{
+    font-family:Georgia, 'Times New Roman', serif;
+    font-size:12pt; font-weight:700; color:var(--ochre);
+    min-width:8mm;
+  }
+  h2{
+    font-family:Georgia, 'Times New Roman', serif;
+    font-size:28pt; line-height:1.06; letter-spacing:-.01em;
+    margin:0;
+  }
+  h3{
+    font-family:Georgia, 'Times New Roman', serif;
+    font-size:14pt; line-height:1.2; color:var(--teal-dark);
+    margin:0 0 1.4mm;
+  }
+  p{
+    font-size:21pt; line-height:1.34; margin:0 0 2.4mm;
+  }
+  .lead{ font-size:22.5pt; line-height:1.3; }
+  .small{ font-size:16pt; line-height:1.34; color:var(--muted); margin:0; }
+  .tiny{ font-size:13.8pt; line-height:1.3; color:var(--muted); }
+  b, strong{ font-weight:700; }
+
+  /* ---------- equations ---------- */
+  .eq{
+    background:var(--eq-bg);
+    border-left:2mm solid var(--teal);
+    padding:2.8mm 4.5mm;
+    margin:2.8mm 0;
+    font-family:'Cambria Math', 'STIX Two Math', Georgia, serif;
+    font-size:20.5pt; line-height:1.55;
+    overflow-wrap:anywhere;
+  }
+  .eq div + div{ margin-top:1.6mm; }
+  .eq.light{
+    background:rgba(255,255,255,.10);
+    border-left-color:#8CC7C9;
+  }
+
+  /* ---------- figure cards ---------- */
+  figure{
+    margin:0;
+    background:var(--white);
+    border:.45mm solid var(--border);
+    border-radius:2.4mm;
+    padding:3mm;
+  }
+  figure img{ width:100%; height:auto; display:block; border-radius:1.2mm; }
+  figure.narrow img{ width:88%; margin:0 auto; }
+  figcaption{
+    font-size:14pt; line-height:1.3; color:var(--muted);
+    margin-top:2.2mm;
+  }
+  figcaption b{ color:var(--ink); }
+
+  /* ---------- entries ---------- */
+  .entries{ list-style:none; margin:0; padding:0; counter-reset:entry; }
+  .entries li{
+    counter-increment:entry;
+    display:grid;
+    grid-template-columns:8mm 1fr;
+    gap:2.4mm;
+    padding:2.6mm 0;
+    border-top:.4mm solid var(--border);
+  }
+  .entries li:first-child{ border-top:0; padding-top:0; }
+  .entries li::before{
+    content:counter(entry);
+    font-family:Georgia, 'Times New Roman', serif;
+    font-size:21pt; font-weight:700; color:var(--teal);
+    line-height:1;
+    padding-top:.6mm;
+  }
+  .entry-eq{
+    font-family:'Cambria Math', 'STIX Two Math', Georgia, serif;
+    font-size:20pt; line-height:1.45; overflow-wrap:anywhere;
+  }
+  .entry-note{ font-size:13.8pt; color:var(--muted); line-height:1.3; margin-top:1mm; }
+
+  /* ---------- mini tables ---------- */
+  table.mini{
+    width:100%; border-collapse:collapse;
+    font-size:15.5pt; line-height:1.25;
+    margin:1.8mm 0 0;
+  }
+  table.mini td{
+    padding:1.8mm 1.4mm;
+    border-bottom:.35mm solid var(--border);
+    vertical-align:top;
+  }
+  table.mini td:first-child{ color:var(--soft); }
+  table.mini td:last-child{ text-align:right; font-weight:700; white-space:nowrap; }
+  table.mini tr:last-child td{ border-bottom:0; }
+  table.mini .wide{ text-align:left; font-weight:400; }
+
+  /* ---------- stats ---------- */
+  .stat-grid{ display:grid; grid-template-columns:1fr 1fr; gap:2.6mm; margin-top:2.8mm; }
+  .stat{
+    background:var(--white);
+    border:.4mm solid var(--border);
+    border-radius:2mm;
+    padding:3mm 3.4mm;
+  }
+  .stat .v{
+    font-family:Georgia, 'Times New Roman', serif;
+    font-size:34pt; line-height:1; color:var(--teal);
+    letter-spacing:-.02em;
+  }
+  .stat .l{
+    font-size:10.5pt; letter-spacing:.06em; font-weight:700;
+    color:var(--muted); text-transform:uppercase; margin-top:1.6mm;
+  }
+  .stat .s{ font-size:10.5pt; color:var(--muted); margin-top:.9mm; }
+
+  /* ---------- sanity comparison ---------- */
+  .sanity{
+    display:grid; grid-template-columns:1fr 1fr; gap:2.6mm;
+    margin-top:2.8mm;
+  }
+  .sanity-card{
+    background:var(--white); border:.4mm solid var(--border);
+    border-radius:2mm; padding:3.4mm;
+  }
+  .sanity-card.scalar{ border-top:2.6mm solid var(--red); }
+  .sanity-card.vector{ border-top:2.6mm solid var(--teal); }
+  .sanity-card .tag{
+    font-size:10pt; letter-spacing:.05em; font-weight:700;
+    text-transform:uppercase; color:var(--muted);
+  }
+  .sanity-card .big{
+    font-family:Georgia, 'Times New Roman', serif;
+    font-size:37pt; line-height:1; margin-top:1.4mm;
+  }
+  .sanity-card .meta{ font-size:11.2pt; color:var(--muted); line-height:1.35; margin-top:1.6mm; }
+
+  /* ---------- callout ---------- */
+  .callout{
+    background:var(--teal-dark);
+    color:var(--white);
+    border-radius:2.4mm;
+    padding:5mm 5.5mm;
+  }
+  .callout .k{
+    font-size:9.5pt; letter-spacing:.14em; font-weight:700;
+    color:#A9D3D2; text-transform:uppercase;
+  }
+  .callout p{
+    color:var(--white); font-size:17pt; line-height:1.36;
+    margin:2mm 0 0;
+  }
+  .callout .big{
+    font-family:Georgia, 'Times New Roman', serif;
+    font-size:23pt; line-height:1.16; margin-top:1.8mm;
+  }
+  .tint{
+    background:var(--teal-pale);
+    border:.4mm solid #C7E1DF;
+    border-radius:2.2mm;
+    padding:3.8mm 4.4mm;
+  }
+  .warn{
+    background:var(--ochre-pale);
+    border:.4mm solid #E7C9AC;
+    border-radius:2.2mm;
+    padding:3.8mm 4.4mm;
+  }
+
+  /* ---------- bottom band ---------- */
+  .bottom-band{
+    margin-top:7mm;
+    border-top:1.4mm solid var(--teal);
+    padding-top:5mm;
+  }
+  .band-head{
+    display:flex; align-items:baseline; justify-content:space-between;
+    gap:8mm; margin-bottom:4mm;
+  }
+  .band-head .left{ display:flex; align-items:baseline; gap:3mm; }
+  .band-head h2{ font-size:25pt; }
+  .band-note{ font-size:11.5pt; color:var(--muted); }
+  .band-grid{ display:grid; grid-template-columns:1fr 1fr 1fr; gap:4mm; }
+  .band-card{
+    background:var(--white);
+    border:.45mm solid var(--border);
+    border-radius:2.2mm;
+    padding:4.6mm 5mm;
+  }
+  .band-card h3{ font-size:15.5pt; margin-bottom:1.8mm; }
+  .band-card p{ font-size:13.5pt; line-height:1.35; margin:0; }
+  .band-card .eq{
+    font-size:14.5pt; padding:2.2mm 3.2mm; margin:2mm 0;
+    line-height:1.45;
+  }
+  .band-card .eq div + div{ margin-top:.8mm; }
+
+  /* ---------- footer ---------- */
+  .footer{
+    margin-top:6mm;
+    border-top:.6mm solid var(--rule);
+    padding-top:3.2mm;
+    display:grid;
+    grid-template-columns:1.3fr 1fr;
+    gap:10mm;
+  }
+  .footer p{ font-size:10.5pt; line-height:1.34; color:var(--muted); margin:0 0 1.2mm; }
+  .footer b{ color:var(--ink); }
+  .refs{ font-size:9.8pt; line-height:1.36; color:var(--muted); }
+  .refs b{ color:var(--ink); }
+
+  .fig-row{ display:grid; grid-template-columns:1fr 1fr; gap:2.6mm; }
+  .fig-row figure{ padding:2.6mm; }
+  .fig-row figcaption{ font-size:11.5pt; }
+</style>
+</head>
+<body>
+<main class="poster">
+
+  <header class="masthead">
+    <div>
+      <div class="kicker"><span class="dot"></span> Spiking neural networks · Spiking Heidelberg Digits</div>
+      <h1>What a neuron's internal state buys</h1>
+      <div class="subtitle">A vector-valued spiking neuron on a standard event-based benchmark</div>
+      <div class="byline">
+        <span>Mehran Jaberinezhad</span>
+        <span class="sep"></span>
+        <span class="role">Project overview · November 2026</span>
+      </div>
+    </div>
+    <div class="hero">
+      <div class="hero-value">88.07<span>%</span></div>
+      <div class="hero-label">official TEST · 1,994 / 2,264</div>
+      <div class="hero-meta">100 neurons · D = 1,000 · 3,069,201 parameters<br>30 epochs · seed 0 · FIT 99.78%</div>
+    </div>
+  </header>
+
+  <div class="body">
+
+    <!-- ================= COLUMN 1 ================= -->
+    <div class="col">
+      <div class="col-label"><b>Methods</b> · what the model is</div>
+
+      <section class="block">
+        <div class="sec-head"><span class="num">01</span><h2>The question</h2></div>
+        <p class="lead">A scalar spiking neuron carries one number. Can making that number a vector buy computation — and does the gain survive a standard benchmark?</p>
+        <div class="eq">
+          τ dV/dt = −V + I(t), &nbsp; s<sub>t</sub> = H(V<sub>t</sub> − θ)
+        </div>
+        <p>The scalar abstraction is the default in event-based networks. We keep the spike, the leak, the threshold and the count readout, and replace only the state: each of N = 100 neurons carries <b>z<sub>i,t</sub> ∈ ℝ<sup>D</sup></b>, with D = 1,000.</p>
+        <p>The spike remains one bit. The state that produces it is 1,000-dimensional.</p>
+      </section>
+
+      <section class="block">
+        <div class="sec-head"><span class="num">02</span><h2>The model</h2></div>
+        <figure>
+          <img src="figures/manuscript/panels/fig01_schematic.png" alt="Architecture of the vector-valued spiking neuron">
+          <figcaption><b>Figure 1.</b> Schematic: input projection, vector states, shared emission and count readout. The rank-64 mixing runs inside each state (Section 05).</figcaption>
+        </figure>
+        <p>All coordinates of <b>z<sub>i</sub></b> participate in the dynamics. The model is not a scalar neuron with a vector appended to its input.</p>
+      </section>
+
+      <section class="block">
+        <div class="sec-head"><span class="num">03</span><h2>Where the vector enters</h2></div>
+        <ol class="entries">
+          <li>
+            <div>
+              <div class="entry-eq">a<sub>t</sub> = x<sub>t</sub>W<sub>in</sub>, &nbsp; d<sup>in</sup><sub>i,t</sub> = g<sub>i</sub> ⊙ a<sub>t</sub></div>
+              <div class="entry-note">Input projection: 1,400 × 1,000. The gate g<sub>i</sub> ∈ ℝ<sup>D</sup> selects coordinates.</div>
+            </div>
+          </li>
+          <li>
+            <div>
+              <div class="entry-eq">m<sub>t</sub> = (z<sub>t</sub>W<sub>down</sub>)W<sub>up</sub></div>
+              <div class="entry-note">Intrinsic mixing, rank R = 64: 128,000 parameters, not N × D × D.</div>
+            </div>
+          </li>
+          <li>
+            <div>
+              <div class="entry-eq">c<sub>t</sub> = s<sub>t</sub>W<sub>rec</sub>, &nbsp; h<sub>t</sub> = (1/√N)(Σ<sub>j</sub> s<sub>j,t</sub>z<sub>j,t</sub>)W<sub>emit</sub></div>
+              <div class="entry-eq">d<sup>rec</sup><sub>t</sub> = c<sub>t</sub> h<sub>t</sub></div>
+              <div class="entry-note">Recurrent coupling and shared emission. A spike at neuron j gates the whole state vector z<sub>j</sub>.</div>
+            </div>
+          </li>
+          <li>
+            <div>
+              <div class="entry-eq">z<sub>t+1</sub> = (1 − α<sub>i</sub>)z<sub>t</sub> + α<sub>i</sub> z̃<sub>t</sub></div>
+              <div class="entry-note">Leaky vector state. α<sub>i</sub> = σ(raw<sub>i</sub>) is learned; the reported initialisation is α ≈ 0.1.</div>
+            </div>
+          </li>
+          <li>
+            <div>
+              <div class="entry-eq">o<sub>i,t</sub> = ⟨z<sub>i,t</sub>, w<sub>out,i</sub>⟩ + θ<sub>i</sub> − w<sub>ad</sub>b<sub>i,t</sub></div>
+              <div class="entry-eq">s<sub>i,t</sub> = H(o<sub>i,t</sub>)</div>
+              <div class="entry-note">The spike is a learned hyperplane through the whole state, not a scalar membrane potential.</div>
+            </div>
+          </li>
+        </ol>
+        <p class="small">The readout is unchanged: counts over time, then a linear classifier. Nothing about the spike is vector-valued — only the state behind it.</p>
+      </section>
+
+      <section class="block">
+        <div class="sec-head"><span class="num">04</span><h2>Parameter budget</h2></div>
+        <table class="mini">
+          <tr><td>Input + delay line</td><td>1,400,000</td></tr>
+          <tr><td>Emission matrix</td><td>1,000,000</td></tr>
+          <tr><td>Rank-64 mixing (×2 stages)</td><td>256,000</td></tr>
+          <tr><td>Recurrent, gate, bias, readout, z<sub>0</sub>, classifier</td><td>412,000</td></tr>
+          <tr><td>Scalars and delays</td><td>1,201</td></tr>
+          <tr><td><b>Total</b></td><td><b>3,069,201</b></td></tr>
+        </table>
+      </section>
+
+      <section class="block">
+        <div class="sec-head"><span class="num">05</span><h2>The full update</h2></div>
+        <div class="eq">
+          <div>d<sub>t</sub> = g<sub>i</sub> ⊙ a<sub>t</sub> + c<sub>t</sub>h<sub>t</sub> + β<sub>i</sub></div>
+          <div>m<sub>t</sub> = (z<sub>t</sub>W<sub>down</sub>)W<sub>up</sub></div>
+          <div>m2<sub>t</sub> = (z<sub>t</sub>W<sub>down2</sub>)W<sub>up2</sub></div>
+          <div>z̃<sub>t</sub> = tanh( m<sub>t</sub> + λ tanh( m2<sub>t</sub> + d<sub>t</sub> ) )</div>
+          <div>z<sub>t+1</sub> = (1 − α<sub>i</sub>)z<sub>t</sub> + α<sub>i</sub>z̃<sub>t</sub></div>
+          <div>o<sub>i,t</sub> = ⟨z<sub>i,t</sub>,w<sub>out,i</sub>⟩ + θ<sub>i</sub> − w<sub>ad</sub>b<sub>i,t</sub></div>
+          <div>b<sub>i,t+1</sub> = ρb<sub>i,t</sub> + s<sub>i,t</sub>, &nbsp; s<sub>i,t</sub> = H(o<sub>i,t</sub>)</div>
+        </div>
+        <p class="small">λ = 0.1 + 1.9 σ(λ<sub>raw</sub>), initialised at 1.0. The reported model is the two-stage path with adaptation; the adLIF current block is present in the config but inert under two-stage mixing, so it is not shown.</p>
+      </section>
+    </div>
+
+    <!-- ================= COLUMN 2 ================= -->
+    <div class="col">
+      <div class="col-label"><b>Methods</b> · protocol and controls</div>
+
+      <section class="block">
+        <div class="sec-head"><span class="num">06</span><h2>Training</h2></div>
+        <div class="eq">
+          <div>L = CE + 10<sup>−4</sup> · mean<sub>i</sub>(r<sub>i</sub> − 10 Hz)<sup>2</sup></div>
+        </div>
+        <table class="mini">
+          <tr><td class="wide">SHD split</td><td>8,156 train / 2,264 test</td></tr>
+          <tr><td class="wide">Input</td><td>700 channels · 2 ms bins</td></tr>
+          <tr><td class="wide">Sequence</td><td>T = 500 + 50-bin tail</td></tr>
+          <tr><td class="wide">Optimiser</td><td>Adam · 10<sup>−3</sup> · cosine</td></tr>
+          <tr><td class="wide">Batch / epochs</td><td>96 / 30</td></tr>
+          <tr><td class="wide">Precision</td><td>fp16 state · fp32 masters</td></tr>
+          <tr><td class="wide">Thresholds</td><td>10 Hz calibration</td></tr>
+        </table>
+        <p class="small">BPTT with 10 gradient-checkpoint chunks; gradients clipped at 1.0. Thresholds are calibrated for three fixed-point iterations and stay trainable.</p>
+      </section>
+
+      <section class="block">
+        <div class="sec-head"><span class="num">07</span><h2>Augmentation</h2></div>
+        <div class="tint">
+          <h3>Same-class blend</h3>
+          <p class="small">Two raw event lists of the same class are centre-of-mass aligned; each event is kept independently with p = 0.5, then merged and sorted. This is a mixup variant for event trains, applied before binning.</p>
+        </div>
+        <div class="warn" style="margin-top:2.4mm">
+          <h3>Event dropout</h3>
+          <p class="small">Each event is removed independently with p = 0.1. This is the only other augmentation active in the reported run. Both are training-only; validation and test events are byte-identical.</p>
+        </div>
+      </section>
+
+      <section class="block">
+        <div class="sec-head"><span class="num">08</span><h2>Controls</h2></div>
+        <table class="mini">
+          <tr><td class="wide">Scalar at D = 1</td><td>isolates state width</td></tr>
+          <tr><td class="wide">Capacity-matched scalar, N = 1,411</td><td>isolates parameters</td></tr>
+          <tr><td class="wide">Broadcast, E = 1,000</td><td>isolates transmission width</td></tr>
+          <tr><td class="wide">Width sweep, D = 4…1,000</td><td>dose–response</td></tr>
+        </table>
+        <p class="small">All controls use the same data, readout, optimiser and epoch budget. They are the reason the headline is not just a parameter-count story.</p>
+      </section>
+
+      <section class="block">
+        <div class="sec-head"><span class="num">09</span><h2>It learns SHD</h2></div>
+        <figure class="narrow">
+          <img src="figures/manuscript/panels/fig05_training_curves.png" alt="Training curves">
+          <figcaption><b>Figure 2.</b> FIT, VAL and official TEST over 30 epochs. Best TEST 88.74%; final-epoch 88.07%.</figcaption>
+        </figure>
+        <div class="stat-grid">
+          <div class="stat"><div class="v">88.07%</div><div class="l">TEST</div><div class="s">1,994 / 2,264</div></div>
+          <div class="stat"><div class="v">99.78%</div><div class="l">FIT</div><div class="s">7,340 trials</div></div>
+          <div class="stat"><div class="v">97.67%</div><div class="l">VAL</div><div class="s">816 trials</div></div>
+          <div class="stat"><div class="v">85.87%</div><div class="l">UNSEEN</div><div class="s">speakers 4 &amp; 5</div></div>
+        </div>
+      </section>
+
+      <section class="block">
+        <div class="sec-head"><span class="num">10</span><h2>Width, not parameters</h2></div>
+        <figure class="narrow">
+          <img src="figures/manuscript/panels/fig04_controls.png" alt="Controls">
+          <figcaption><b>Figure 3.</b> Scalar, capacity-matched scalar, broadcast and vector controls at the same readout.</figcaption>
+        </figure>
+        <table class="mini">
+          <tr><td class="wide">D = 4 / 16 / 64</td><td>57.20 / 63.74 / 68.60</td></tr>
+          <tr><td class="wide">D = 256 / 1,000</td><td>77.61 / 76.15</td></tr>
+          <tr><td class="wide">Scalar, N = 100, 5 ep</td><td>35.91</td></tr>
+          <tr><td class="wide">Capacity-matched scalar</td><td>33.13</td></tr>
+          <tr><td class="wide">Broadcast, E = 1,000</td><td>65.42</td></tr>
+          <tr><td class="wide">Vector, N = 100, 5 ep</td><td>79.64</td></tr>
+        </table>
+        <p class="small">D = 4 → 256 buys +20.4 pp; D = 1,000 is not better than D = 256 at this budget. A 2M-parameter scalar reaches 33.13%.</p>
+      </section>
+    </div>
+
+    <!-- ================= COLUMN 3 ================= -->
+    <div class="col">
+      <div class="col-label"><b>Results</b> · what the state does</div>
+
+      <section class="block">
+        <div class="sec-head"><span class="num">11</span><h2>Sanity check: 1,000 scalar neurons</h2></div>
+        <div class="sanity">
+          <div class="sanity-card scalar">
+            <div class="tag">N = 1,000 · D = 1 · 30 ep</div>
+            <div class="big">43.6%</div>
+            <div class="meta">TEST 987 / 2,264<br>FIT 49.6% · VAL 42.7%<br>1.02M params · 34 min</div>
+          </div>
+          <div class="sanity-card vector">
+            <div class="tag">N = 100 · D = 1,000 · 5 ep</div>
+            <div class="big">76.7%</div>
+            <div class="meta">TEST 1,736 / 2,264<br>FIT 96.4% · VAL 93.5%<br>2.14M params · 31 min</div>
+          </div>
+        </div>
+        <p style="margin-top:2.8mm"><b>49.6% on FIT</b> is the tell: the 1,000-neuron scalar does not fit the training split, so this is not a generalisation gap. In the same half-hour the vector gets 5 passes instead of 30 and still gains 33 points of TEST.</p>
+        <p class="tiny">Not parameter-matched: 1.02M scalar vs 2.14M vector. The scalar spends 1M weights on a full recurrent matrix. The 30-epoch vector reaches 88.1% TEST / 99.8% FIT.</p>
+      </section>
+
+      <section class="block">
+        <div class="sec-head"><span class="num">12</span><h2>Probes</h2></div>
+        <figure class="narrow">
+          <img src="figures/manuscript/panels/fig08_probe.png" alt="Linear probes on frozen states">
+          <figcaption><b>Figure 4.</b> Linear probes on frozen states. Spike counts 87.81%; trial-mean state 84.67%; final state 27.61%.</figcaption>
+        </figure>
+        <p>The code is in the trajectory, not the endpoint. The population mean uses only <b>7.49 effective dimensions</b> out of 100,000.</p>
+        <figure class="narrow">
+          <img src="figures/manuscript/panels/fig09_effective_dim.png" alt="Effective dimension">
+          <figcaption><b>Figure 5.</b> Effective dimension of the population state: 7.49 of 100,000; 21 components to 90%, 58 to 95%.</figcaption>
+        </figure>
+      </section>
+
+      <section class="block">
+        <div class="sec-head"><span class="num">13</span><h2>A distributed code</h2></div>
+        <figure class="narrow">
+          <img src="figures/manuscript/panels/fig11_mi_distribution.png" alt="Mutual information per neuron">
+          <figcaption><b>Figure 6.</b> Mutual information per neuron: median 0.502 bits; 91 of 100 neurons informative.</figcaption>
+        </figure>
+        <p>Silencing one neuron costs <b>0.30 ± 0.63 pp</b> on average. No single unit is necessary: the code is redundant and distributed, which is what a vector state predicts and a dedicated scalar detector does not.</p>
+      </section>
+
+      <section class="block">
+        <div class="sec-head"><span class="num">14</span><h2>Limitations</h2></div>
+        <ul class="small" style="margin:0; padding-left:5.5mm; line-height:1.45">
+          <li>Single seed; no seed variance.</li>
+          <li>Blocks and augmentations selected on 5-epoch TEST.</li>
+          <li>No 30-epoch N = 100 all-off baseline.</li>
+          <li>VAL is speaker-overlapping; the held-out pilot overstates.</li>
+          <li>Scalar controls are untuned; the TEST set was read repeatedly.</li>
+          <li>The 5-epoch vector is the earlier 2.14M configuration, not the final 3.07M model.</li>
+        </ul>
+      </section>
+
+      <section class="block">
+        <div class="callout">
+          <div class="k">Takeaway</div>
+          <div class="big">Width of the state, not neuron count, is the variable that buys computation on SHD.</div>
+          <p>100 vector neurons reach 88.07%. A 1,000-neuron scalar does not even fit the training split.</p>
+        </div>
+      </section>
+    </div>
+
+  </div>
+
+  <!-- ================= BOTTOM BAND ================= -->
+  <section class="bottom-band">
+    <div class="band-head">
+      <div class="left"><span class="num">15</span><h2>What comes next</h2></div>
+      <div class="band-note">Design sketches, not measured results</div>
+    </div>
+    <div class="band-grid">
+      <div class="band-card">
+        <h3>Smaller footprint</h3>
+        <div class="eq">
+          <div>W<sub>emit</sub> ≈ D + U V<sup>T</sup></div>
+        </div>
+        <p>A rank-16 emitter is about 33k parameters instead of 1M; factorising the input projection brings 1.4M down to about 38k.</p>
+      </div>
+      <div class="band-card">
+        <h3>Per-neuron embedding</h3>
+        <div class="eq">
+          <div>g<sub>i</sub> = W<sub>g</sub>e<sub>i</sub>, &nbsp; β<sub>i</sub> = W<sub>β</sub>e<sub>i</sub>, &nbsp; w<sub>out,i</sub> = W<sub>o</sub>e<sub>i</sub></div>
+        </div>
+        <p>With e<sub>i</sub> ∈ ℝ<sup>8</sup>, the per-neuron heads cost about 8.8k for 1,000-D states, compared with 100k.</p>
+      </div>
+      <div class="band-card">
+        <h3>What would falsify it</h3>
+        <p>If the SHD gain disappears at matched parameter budget, or under 30-epoch drop-one ablations, the claim is about parameters and training, not state width.</p>
+      </div>
+    </div>
+  </section>
+
+  <footer class="footer">
+    <div>
+      <p><b>Provenance.</b> Final: N = 100, D = 1,000, 30 epochs, seed 0, 3,069,201 parameters, official TEST n = 2,264. Controls: 5 epochs unless noted. Sanity check: N = 1,000, D = 1, 30 epochs, 1,024,703 parameters. All accuracy figures are on the official SHD test split; FIT and VAL are shown to separate fitting from generalisation.</p>
+      <p><b>Code and figures.</b> <span style="color:var(--ochre)">[ repository URL ]</span> · figure panels from the manuscript. Architecture and equations follow the reported configuration in <i>neuron_as_vector</i>.</p>
+    </div>
+    <div class="refs">
+      <b>Key references.</b> Cramer et al. (2022), <i>IEEE TNNLS</i> 33(7):2744–2757, doi:10.1109/TNNLS.2020.3044364. Neftci et al. (2019), <i>IEEE Signal Processing Magazine</i>, doi:10.1109/MSP.2019.2931595. Zenke &amp; Ganguli (2018), <i>Neural Computation</i> 30(6):1514–1541, doi:10.1162/neco_a_01086. Gu et al. (2021), <i>IJCAI</i>, doi:10.24963/ijcai.2021/97.
+    </div>
+  </footer>
+
+</main>
+</body>
+</html>

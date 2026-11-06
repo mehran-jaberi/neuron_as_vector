@@ -22,6 +22,15 @@ figures/
 *.pt
 *.ckpt
 
+# Deck QA artefacts (local render/contact files, not deliverables)
+deck_render_*/
+deck_v*_render*/
+deck_v*_check/
+deck_*_contact_*.png
+figures_contact_sheet.png
+panels_*.log
+~$*.pptx
+
 # Editor / OS
 .vscode/
 .idea/

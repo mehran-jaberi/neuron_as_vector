@@ -140,6 +140,24 @@ attention:
   enabled: false
   temperature: 1.0              # a = softmax(attn_logits / temperature)
 
+# ---- default sender: scalar input current (design A′, PI directive) ----
+# One learned 700-vector per neuron dotted with the binary frame produces a
+# SCALAR current added to that neuron's spike potential, instead of the shared
+# 700x1000 projection + per-coordinate gate (removes ~830k parameters at N=200).
+# `bias_init_std` must stay > 0: with bias = z0 = 0 every state-forcing term is
+# proportional to z, so |z| stays exactly 0 (the dead fixed point).
+input_current:
+  enabled: true
+  bias_init_std: 0.5
+
+# ---- default readout: R2 learning-matrix readout (PI directive) ----
+# The emission matrix is removed entirely (h_t = the pooled state vector) and the
+# readout reads the (T, D) learning matrix L through per-class temporal profiles
+# v_c: logits_c = sum_t a_{c,t} (L_t . v_c).
+learning_matrix:
+  enabled: true
+  readout: r2
+
 # ---- io ----
 out_dir: results
 ckpt_dir: checkpoints

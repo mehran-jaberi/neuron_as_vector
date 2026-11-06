@@ -652,6 +652,27 @@ exactly (maxdiff 0.0 in fp32). Merged into `main` as `7848247` (branch `v3.1`).
 
 ## 12. Current experimental reference
 
+### Defaults since 2026-11-06 (PI directive)
+
+`V3/configs/v3_default.yaml` now ships **design A′** and the **R2 readout** on by
+default, so a bare `run_experiment.py` invocation runs them:
+
+```yaml
+input_current:   {enabled: true, bias_init_std: 0.5}   # A′: scalar current into the potential
+learning_matrix: {enabled: true, readout: r2}          # R2: L(t) readout, no emission matrix
+```
+
+With these the model has 334,960 parameters at N=64 and 738,200 at N=200.
+`bias_init_std` must stay > 0 — with bias = z0 = 0 the state sits on a dead zero
+fixed point — and R2 removes the emission matrix entirely (a diagonal emission is
+inert under R2 until a diagonal broadcast gain exists; it does not).
+
+To reproduce the pre-2026-11-06 model (shared `W_in` + gate, `W_emit` readout):
+
+```
+--override input_current.enabled=false --override learning_matrix.enabled=false
+```
+
 The **headline** is the final merged model (`RESULTS.md` §9):
 
 ```
